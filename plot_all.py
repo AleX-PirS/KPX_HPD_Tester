@@ -60,3 +60,5 @@ def plot_all_dac_scans(folder_path='./csv_data/', output_file=None,
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         print(f"График сохранён в {output_file}")
     plt.show()
+
+plot_all_dac_scans()
