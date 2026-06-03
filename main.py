@@ -1,4 +1,5 @@
 import time
+import csv
 
 from mgpd import MGPDClient
 from dac_cfg import DacConfiguration
@@ -42,10 +43,21 @@ def check_DAC(cfg: DacConfiguration, client: MGPDClient, logger: OscilloscopeDCL
         scan[code] = osc_data
     return scan
 
+
+def save_to_csv(scan_data: dict[int, float], dac_name: str) -> str:
+    with open(f"./csv_data/{dac_name}.csv", 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["DAC_code", "Measured_value, V"])
+        writer.writerows(scan_data)
+    
+    print(f"Saved scan data for {dac_name}.csv")
+    return f"{dac_name}.csv"
+
 with MGPDClient() as client:
     cfg = DacConfiguration()
     logger = OscilloscopeDCLevelLogger()
     
     for DAC_name in DAC_TO_TEST:
         data = check_DAC(cfg, client, logger, DAC_name)
+        save_to_csv(data, DAC_name)
 
