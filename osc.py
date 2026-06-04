@@ -5,7 +5,7 @@ class OscilloscopeDCLevelLogger:
     def __init__(
         self,
         osc_address: str | None = None,
-        idn_substring: str = "MSOS204A",
+        idn_substring: str = "DSO",
         avg_count: int = 16,
         timeout_ms: int = 5000,
         chunk_size: int = 1_000_000,
