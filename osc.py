@@ -94,6 +94,9 @@ class OscilloscopeDCLevelLogger:
         self._write(":WAV:FORM ASC")
         self._write(":ACQ:POIN:AUTO ON")
 
+        # Config timescale
+        self._write(":TIM:SCAL {50e9}")
+
         # Continuous acquisition
         self._write(":RUN")
 
