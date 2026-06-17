@@ -170,6 +170,7 @@ def prepare_oscilloscope_frame(
     trigger_slope: str = "POS",
     average_count: int = 1,
     time_scale_s: float = 20e-9,
+    time_offset_s: float = 0,
     voltage_scale_v: float = 0.1,
     voltage_offset_v: float = 0.0,
     input_modes: dict[int, str] | None = None,
@@ -267,7 +268,7 @@ def prepare_oscilloscope_frame(
 
     # Временная база
     write(osc, f":TIM:SCAL {time_scale_s}")
-    write(osc, ":TIM:POS 0")
+    write(osc, f":TIM:POS {time_offset_s}")
 
     # Усреднение
     if average_count > 1:
@@ -422,16 +423,18 @@ def save_oscilloscope_csv(
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
 
-        header = ["index", "time_s"]
-        for channel in channels:
-            header.append(f"channel_{channel}_v")
+        # header = ["index", "time_s"]
+        # header = ["time_s"]
+        # for channel in channels:
+        #     header.append(f"channel_{channel}_v")
 
-        writer.writerow(header)
+        # writer.writerow(header)
 
         for index in range(min_length):
             time_s = reference_x_origin + index * reference_x_increment
 
-            row = [index, time_s]
+            # row = [index, time_s]
+            row = [time_s]
             for channel in channels:
                 row.append(waveforms[channel][index])
 
@@ -447,43 +450,3 @@ def close_oscilloscope(rm, osc):
     osc.close()
     rm.close()
     print("Oscilloscope connection closed.")
-
-
-# ---------------- EXAMPLE ----------------
-
-if __name__ == "__main__":
-    rm, osc = prepare_oscilloscope_frame(
-        osc_address=None,
-        idn_substring="DSO9104H",
-
-        channels=(1, 2),
-
-        trigger_enabled=True,
-        trigger_source=1,
-        trigger_level_v=0.05,
-        trigger_slope="POS",
-
-        average_count=16,
-
-        time_scale_s=20e-9,
-
-        voltage_scale_v=0.1,
-        voltage_offset_v=0.0,
-
-        input_modes={
-            1: "DC50",
-            2: "DC",
-        },
-
-        waveform_points=10000,
-    )
-
-    try:
-        save_oscilloscope_csv(
-            osc=osc,
-            channels=(1, 2),
-            output_dir="osc_csv",
-        )
-
-    finally:
-        close_oscilloscope(rm, osc)

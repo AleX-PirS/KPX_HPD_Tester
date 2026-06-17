@@ -28,10 +28,10 @@ if __name__ == "__main__":
 
         trigger_enabled=True,
         trigger_source=3,
-        trigger_level_v=0.02,
-        trigger_slope="NEG",
+        trigger_level_v=0.5,
+        trigger_slope="POS",
 
-        average_count=4,
+        average_count=8,
 
         time_scale_s=1e-6,
 
@@ -48,68 +48,63 @@ if __name__ == "__main__":
     )
     
     gen = TwoChannelGenerator()   
-    gen.configure_channel(
-        channel=1,
-        shape='DC',
-        frequency_hz=1,
-        offset_v=0.5,
-        amplitude_v=0,
-        # perec=False,
-        enable_after_config=True
-    )
+    # gen.configure_channel(
+    #     channel=1,
+    #     shape='DC',
+    #     frequency_hz=1,
+    #     offset_v=0.3,
+    #     amplitude_v=0,
+    #     # perec=False,
+    #     enable_after_config=True
+    # )
+    # gen.configure_channel(
+    #     channel=2,
+    #     shape='SQU',
+    #     frequency_hz=100e3,
+    #     low_level_v=0,
+    #     high_level_v=0.15,
+    #     rise_time_s=1e-9,
+    #     fall_time_s=1e-9,
+    #     enable_after_config=True
+    # )
+
     gen.configure_channel(
         channel=2,
-        shape='SQU',
-        frequency_hz=50e3,
-        low_level_v=0,
-        high_level_v=0.05,
-        rise_time_s=1e-9,
-        fall_time_s=1e-9,
-        enable_after_config=True
-    )
-    gen.enable_channel(1)
-    gen.enable_channel(2)
-
-    #------------------------------------------------------------------------------------
-    # Начало теста
-    #------------------------------------------------------------------------------------
-    time.sleep(1)
-    for j in range(50, 230, 10):
-        gen.configure_channel(
-        channel=2,
-        shape='SQU',
-        frequency_hz=50e3,
-        low_level_v=0,
-        high_level_v=j/1000,
-        rise_time_s=1e-9,
-        fall_time_s=1e-9,
-        enable_after_config=True
-        )
-        time.sleep(0.1)
-        for i in range(280, 1000, 10):
-            # gen.disable_channel(1)
-            gen.configure_channel(
-            channel=1,
-            shape='DC',
-            frequency_hz=1,
-            offset_v=i/1000,
-            amplitude_v=0,
-            # perec=False,
-            enable_after_config=True
-        )
-            time.sleep(0.02)
-            osc_v2.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_GAIN_4_VC1_700_VB1_800/BUF_CSA_{j}', f'{i}.csv')
-
-        
-    gen.configure_channel(
-        channel=1,
-        shape='DC',
-        frequency_hz=1,
+        shape='PULS',
+        frequency_hz=100e3,
         offset_v=0,
-        amplitude_v=0,
-        # perec=False,
+        amplitude_v=1,
+        rise_time_s=1e-9,
+        fall_time_s=1e-9,
+        pulse_width_s=5e-9,
         enable_after_config=True
     )
+
+    time.sleep(10)
+
+    for i in range(1, 8000, 1):
+        # gen.disable_channel(1)
+        gen.configure_channel(
+            channel=2,
+            shape='PULS',
+            frequency_hz=10e3,
+            offset_v=0,
+            amplitude_v=1,
+            rise_time_s=1e-9,
+            fall_time_s=1e-9,
+            pulse_width_s=i*1e-9,
+            enable_after_config=True,
+        )
+        time.sleep(0.25)
+        # gen.disable_channel(1)
+        # time.sleep(0.5)
+        osc_v2.save_oscilloscope_csv(osc, [1, 3], './csv_data/BUF_PULSE', f'{i}.csv')
+        # time.sleep(0.01)
+
+    # if KeyboardInterrupt:
+    #     gen.disable_channel(1)
+    #     gen.disable_channel(2)
+
     # for i in range(0, 1000, 1):
     #     gen.disable_channel(1)
     #     gen.configure_channel(

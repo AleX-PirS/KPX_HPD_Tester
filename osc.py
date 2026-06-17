@@ -95,7 +95,7 @@ class OscilloscopeDCLevelLogger:
         self._write(":ACQ:POIN:AUTO ON")
 
         # Config timescale
-        self._write(":TIM:SCAL {50e9}")
+        self._write(f":TIM:SCAL {20e-9}")
 
         # Continuous acquisition
         self._write(":RUN")
@@ -149,7 +149,7 @@ class OscilloscopeDCLevelLogger:
 
         level_v = self.read_level()
 
-        print(f"Saved: CH1={level_v:.9g} V")
+        print(f"Saved: CH1={level_v:.3g} V")
         return level_v
 
     def close(self):
