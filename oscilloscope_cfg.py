@@ -4,17 +4,10 @@ from pathlib import Path
 
 import pyvisa as visa
 
-
-# ---------------- DEFAULT SETTINGS ----------------
-
 DEFAULT_OSC_IDN_SUBSTRING = "DSO9104H"
 DEFAULT_OSC_ADDRESS = None
-
 RESOURCE_TIMEOUT = 5000
 RESOURCE_CHUNK_SIZE = 1_000_000
-
-
-# ---------------- LOW LEVEL ----------------
 
 def configure_resource(resource):
     resource.timeout = RESOURCE_TIMEOUT
@@ -22,14 +15,11 @@ def configure_resource(resource):
     resource.read_termination = "\n"
     resource.write_termination = "\n"
 
-
 def write(resource, command: str):
     resource.write(command)
 
-
 def query(resource, command: str) -> str:
     return resource.query(command).strip()
-
 
 def find_oscilloscope(
     rm: visa.ResourceManager,
@@ -61,7 +51,6 @@ def find_oscilloscope(
         f"Oscilloscope with IDN substring '{idn_substring}' not found."
     )
 
-
 def open_oscilloscope(
     osc_address: str | None = DEFAULT_OSC_ADDRESS,
     idn_substring: str = DEFAULT_OSC_IDN_SUBSTRING,
@@ -88,11 +77,9 @@ def open_oscilloscope(
     print("Connected:", query(osc, "*IDN?"))
     return rm, osc
 
-
 def check_channel(channel: int):
     if channel not in (1, 2, 3, 4):
         raise ValueError("Oscilloscope channel must be 1, 2, 3 or 4.")
-
 
 def check_channels(channels: list[int] | tuple[int, ...]):
     if len(channels) == 0:
@@ -100,7 +87,6 @@ def check_channels(channels: list[int] | tuple[int, ...]):
 
     for channel in channels:
         check_channel(channel)
-
 
 def normalize_slope(trigger_slope: str) -> str:
     slope = trigger_slope.strip().upper()
@@ -121,7 +107,6 @@ def normalize_slope(trigger_slope: str) -> str:
 
     return aliases[slope]
 
-
 def normalize_input(input_mode: str) -> str:
     mode = input_mode.strip().upper()
 
@@ -140,7 +125,6 @@ def normalize_input(input_mode: str) -> str:
 
     return aliases[mode]
 
-
 def strip_scpi_block_header(data: str) -> str:
     data = data.strip()
 
@@ -156,9 +140,6 @@ def strip_scpi_block_header(data: str) -> str:
     payload_end = payload_start + data_length
 
     return data[payload_start:payload_end]
-
-
-# ---------------- FIRST MAIN FUNCTION ----------------
 
 def prepare_oscilloscope_frame(
     osc_address: str | None = DEFAULT_OSC_ADDRESS,
@@ -315,9 +296,6 @@ def prepare_oscilloscope_frame(
 
     return rm, osc
 
-
-# ---------------- WAVEFORM READOUT ----------------
-
 def read_waveform_from_channel(osc, channel: int):
     check_channel(channel)
 
@@ -350,7 +328,6 @@ def read_waveform_from_channel(osc, channel: int):
 
     return voltage, x_origin, x_increment
 
-
 def next_csv_path(directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -362,9 +339,6 @@ def next_csv_path(directory: Path) -> Path:
 
     next_index = max(indices, default=0) + 1
     return directory / f"{next_index}.csv"
-
-
-# ---------------- SECOND MAIN FUNCTION ----------------
 
 def save_oscilloscope_csv(
     osc,
@@ -381,7 +355,7 @@ def save_oscilloscope_csv(
         Она использует объект osc, который вернула prepare_oscilloscope_frame(...).
 
     CSV:
-        index, time_s, channel_1_v, channel_2_v, ...
+        time_s, channel_1_v, channel_2_v, ...
     """
 
     check_channels(channels)
@@ -423,17 +397,15 @@ def save_oscilloscope_csv(
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
 
-        # header = ["index", "time_s"]
-        # header = ["time_s"]
-        # for channel in channels:
-        #     header.append(f"channel_{channel}_v")
+        header = ["time_s"]
+        for channel in channels:
+            header.append(f"channel_{channel}_v")
 
-        # writer.writerow(header)
+        writer.writerow(header)
 
         for index in range(min_length):
             time_s = reference_x_origin + index * reference_x_increment
 
-            # row = [index, time_s]
             row = [time_s]
             for channel in channels:
                 row.append(waveforms[channel][index])
@@ -443,8 +415,15 @@ def save_oscilloscope_csv(
     print(f"Saved: {path}")
     return path
 
-
-# ---------------- CLOSE FUNCTION ----------------
+def read_dc_level(osc, channel: int = 1) -> float:
+    """
+    Читает постоянный уровень (среднее значение) с заданного канала,
+    используя уже открытое соединение osc.
+    """
+    voltage, _, _ = read_waveform_from_channel(osc, channel)
+    if not voltage:
+        raise RuntimeError(f"Empty waveform from CH{channel}")
+    return sum(voltage) / len(voltage)
 
 def close_oscilloscope(rm, osc):
     osc.close()

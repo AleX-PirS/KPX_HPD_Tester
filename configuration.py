@@ -36,7 +36,7 @@ class Configuration:
             mask = ((1 << width) - 1) << shift
             new_val = (current & ~mask) | ((part << shift) & mask)
             if new_val != current:
-                self.client.write_byte(addr, new_val)
+                self.client.write_byte(new_val, addr)
             remaining >>= width
         return True
     

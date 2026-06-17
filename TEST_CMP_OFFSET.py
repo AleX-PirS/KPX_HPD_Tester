@@ -1,26 +1,18 @@
 import time
 
+from configuration import Configuration
 from mgpd import MGPDClient
-import osc_v2
-from gen import TwoChannelGenerator
+import oscilloscope_cfg
+import MO_cfg
+from generator_cfg import TwoChannelGenerator
 
-def write_trim_code(val: int, client: MGPDClient):
-    low5 = val & 0x1F
-    high3 = (val >> 5) & 0x07
-
-    low_reg = low5 << 3
-    print(f"Value: {val:08b}", end='|')
-    print(f"low_reg: {low_reg:08b}", end='|')
-    print(f"high_reg: {high3:08b}")
-
-    client.write_byte(high3, 0x8021)
-    client.write_byte(low_reg, 0x8020)
-    return
-
+IS_ALT_CMP = False
+PREP_DELAY = 10
+AVG_DELAY = 6
 
 if __name__ == "__main__":
     with MGPDClient() as client:
-        rm, osc = osc_v2.prepare_oscilloscope_frame(
+        rm, osc = oscilloscope_cfg.prepare_oscilloscope_frame(
             osc_address=None,
             idn_substring="DSO9104H",
 
@@ -66,20 +58,20 @@ if __name__ == "__main__":
             enable_after_config=True
         )
 
-        # gen.disable_channel(1)
-        # gen.disable_channel(2)
+        cfg = Configuration(client, MO_cfg.DEFAULT_REGISTERS, MO_cfg.AMUX_SIGNALS, MO_cfg.REGS_FIELDS, MO_cfg.AMUX_MAP)
+        if IS_ALT_CMP:
+            cfg.set_amux("CMP1_OUT")
+        else:
+            cfg.set_amux("CMP0_OUT")
 
-        #------------------------------------------------------------------------------------
-        # Начало теста
-        #------------------------------------------------------------------------------------
-
-        client.write_byte(0b00000111, 0x8016)
-        # client.write_byte(0x10, 0x8017) # my CMP AMUX out
-        client.write_byte(0x20, 0x8017)   # alternative CMP AMUX out
-
-
-        time.sleep(10)
-        for i in range(0, 256):
-            write_trim_code(i, client)
-            time.sleep(6)
-            osc_v2.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP_v2/', f'{i}.csv')
+        time.sleep(PREP_DELAY)
+        
+        for code in range(0, 256):
+            cfg.set_data("CMPM_TR", code)
+            print(f"Sended trim code {code}")
+            time.sleep(AVG_DELAY)
+            
+            if IS_ALT_CMP:
+                oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP_ALT/', f'{code}.csv')
+            else:
+                oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP/', f'{code}.csv')            
