@@ -425,6 +425,142 @@ def read_dc_level(osc, channel: int = 1) -> float:
         raise RuntimeError(f"Empty waveform from CH{channel}")
     return sum(voltage) / len(voltage)
 
+def read_ieee_binary_block(resource) -> bytes:
+    """
+    Read IEEE 488.2 definite-length binary block.
+    
+    Format:
+        #<N><length><payload>
+    """
+
+    first_two = resource.read_bytes(
+        2,
+        break_on_termchar=False,
+    )
+
+    if not first_two.startswith(b"#"):
+        rest = resource.read_raw()
+        return first_two + rest
+
+    digits_count = int(first_two[1:2].decode("ascii"))
+
+    length_bytes = resource.read_bytes(
+        digits_count,
+        break_on_termchar=False,
+    )
+
+    payload_length = int(length_bytes.decode("ascii"))
+
+    payload = resource.read_bytes(
+        payload_length,
+        break_on_termchar=False,
+    )
+
+    old_timeout = resource.timeout
+
+    try:
+        resource.timeout = 500
+        _ = resource.read_bytes(
+            1,
+            break_on_termchar=False,
+        )
+    except Exception:
+        pass
+    finally:
+        resource.timeout = old_timeout
+
+    return payload
+
+def save_oscilloscope_screenshot(
+    osc,
+    output_path: str | Path,
+):
+    """
+    Save oscilloscope screen to PNG file.
+    """
+
+    output_path = Path(output_path)
+
+    if output_path.suffix.lower() != ".png":
+        output_path = output_path.with_suffix(".png")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old_timeout = osc.timeout
+    old_read_termination = osc.read_termination
+    old_chunk_size = osc.chunk_size
+
+    try:
+        osc.timeout = 30000
+        osc.chunk_size = 20_000_000
+        osc.read_termination = None
+
+        commands_to_try = [
+            ":DISP:DATA? PNG",
+            ":DISP:DATA? PNG,COLOR",
+            ":DISP:DATA? PNG, COLOR",
+            ":DISPLAY:DATA? PNG",
+            ":DISPLAY:DATA? PNG,COLOR",
+            ":DISPLAY:DATA? PNG, COLOR",
+        ]
+
+        last_error = None
+
+        for command in commands_to_try:
+            try:
+                print(f"Trying screenshot command: {command}", flush=True)
+
+                osc.write(command)
+
+                image_data = read_ieee_binary_block(osc)
+
+                if len(image_data) < 100:
+                    last_error = (
+                        f"Too small response from command {command}: "
+                        f"{image_data!r}"
+                    )
+                    print(last_error, flush=True)
+                    continue
+
+                if not image_data.startswith(b"\x89PNG"):
+                    last_error = (
+                        f"Response from {command} is not PNG. "
+                        f"First bytes: {image_data[:20]!r}"
+                    )
+                    print(last_error, flush=True)
+                    continue
+
+                with output_path.open("wb") as file:
+                    file.write(image_data)
+
+                print(f"Saved oscilloscope screenshot: {output_path}", flush=True)
+                return output_path
+
+            except Exception as error:
+                last_error = str(error)
+                print(f"Command failed: {command} | {error}", flush=True)
+
+                try:
+                    osc.read_termination = "\n"
+                    osc.timeout = 1000
+                    err = osc.query(":SYST:ERR?").strip()
+                    print(f"SYST:ERR? -> {err}", flush=True)
+                except Exception:
+                    pass
+                finally:
+                    osc.read_termination = None
+                    osc.timeout = 30000
+
+        raise RuntimeError(
+            "Could not read oscilloscope screenshot. "
+            f"Last error: {last_error}"
+        )
+
+    finally:
+        osc.timeout = old_timeout
+        osc.read_termination = old_read_termination
+        osc.chunk_size = old_chunk_size
+
 def close_oscilloscope(rm, osc):
     osc.close()
     rm.close()

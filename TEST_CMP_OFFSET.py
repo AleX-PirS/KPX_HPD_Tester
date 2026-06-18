@@ -58,11 +58,20 @@ if __name__ == "__main__":
             enable_after_config=True
         )
 
+
         cfg = Configuration(client, MO_cfg.DEFAULT_REGISTERS, MO_cfg.AMUX_SIGNALS, MO_cfg.REGS_FIELDS, MO_cfg.AMUX_MAP)
         if IS_ALT_CMP:
             cfg.set_amux("CMP1_OUT")
         else:
             cfg.set_amux("CMP0_OUT")
+
+        cfg.set_data("DAC_CMP_BIAS_LSB", 350)
+        cfg.set_data("DAC_CMP_BIAS_P", 700)
+        cfg.set_data("DAC_CMP_VC5", 470)
+        cfg.set_data("DAC_BUF50_CALIB", 0)
+        cfg.set_data("CSYS_REF2_MUX", 0)
+
+        cfg.set_data("CMPM_TR", 135)
 
         time.sleep(PREP_DELAY)
         
