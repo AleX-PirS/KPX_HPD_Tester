@@ -49,3 +49,9 @@ class Configuration:
 
         return self.set_data("TEST_MUX", value)
     
+    def set_default(self):
+        for addr, value in self.default_registers.items():
+            self.client.write_byte(value, addr)
+
+        print(f"Default registers loaded: {len(self.default_registers)} registers written.")
+    

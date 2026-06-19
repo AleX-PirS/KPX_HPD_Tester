@@ -611,6 +611,37 @@ class TwoChannelGenerator:
             f"source {channel} voltage amplitude",
         )
 
+    # def _configure_square_with_levels(
+    #     self,
+    #     channel: int,
+    #     frequency_hz: float,
+    #     low_level_v: float,
+    #     high_level_v: float,
+    # ):
+    #     self._send_param(
+    #         channel,
+    #         "FUNC SQU",
+    #         f"source {channel} square function",
+    #     )
+
+    #     self._send_param(
+    #         channel,
+    #         f"FREQ {frequency_hz}",
+    #         f"source {channel} frequency",
+    #     )
+
+    #     self._send_param(
+    #         channel,
+    #         f"VOLT:HIGH {high_level_v}",
+    #         f"source {channel} square high level",
+    #     )
+
+    #     self._send_param(
+    #         channel,
+    #         f"VOLT:LOW {low_level_v}",
+    #         f"source {channel} square low level",
+    #     )
+
     def _configure_square_with_levels(
         self,
         channel: int,
@@ -618,6 +649,17 @@ class TwoChannelGenerator:
         low_level_v: float,
         high_level_v: float,
     ):
+        """
+        Configure square signal using low/high levels.
+
+        Internal conversion:
+            amplitude_v = high_level_v - low_level_v
+            offset_v    = (high_level_v + low_level_v) / 2
+        """
+
+        amplitude_v = high_level_v - low_level_v
+        offset_v = 0.5 * (high_level_v + low_level_v)
+
         self._send_param(
             channel,
             "FUNC SQU",
@@ -632,14 +674,14 @@ class TwoChannelGenerator:
 
         self._send_param(
             channel,
-            f"VOLT:HIGH {high_level_v}",
-            f"source {channel} square high level",
+            f"VOLT:OFFS {offset_v}",
+            f"source {channel} square offset",
         )
 
         self._send_param(
             channel,
-            f"VOLT:LOW {low_level_v}",
-            f"source {channel} square low level",
+            f"VOLT {amplitude_v}",
+            f"source {channel} square amplitude",
         )
 
     def _configure_pulse(
