@@ -6,9 +6,6 @@ import oscilloscope_cfg
 import MO_cfg
 from generator_cfg import TwoChannelGenerator
 
-IS_ALT_CMP = False
-PREP_DELAY = 10
-AVG_DELAY = 6
 
 def TEST_CMP_OFFSET(
         client: MGPDClient,
@@ -25,6 +22,11 @@ def TEST_CMP_OFFSET(
         DAC_CMP_BIAS_LSB: int = 350,
         DAC_CMP_BIAS_P: int = 700,
         DAC_CMP_VC5: int = 470,
+        TRIM_CODE: list[int] = [0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0],
+
+        IS_ALT_CMP: bool = False,
+        PREP_DELAY: float = 10,
+        AVG_DELAY: float = 6,
 ):  
     rm, osc = oscilloscope_cfg.prepare_oscilloscope_frame(
         osc_address=None,
@@ -89,22 +91,12 @@ def TEST_CMP_OFFSET(
 
     time.sleep(PREP_DELAY)
     
-    for code in range(0, 256):
+    for code in TRIM_CODE:
         cfg.set_data("CMPM_TR", code)
         print(f"Sended trim code {code}")
         time.sleep(AVG_DELAY)
         
         if IS_ALT_CMP:
-            oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP_ALT_VB5{DAC_CMP_BIAS_P}_LSB{DAC_CMP_BIAS_LSB}_VC5{DAC_CMP_VC5}/', f'{code}.csv')
+            oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP_ALT_VB5_{DAC_CMP_BIAS_P}_LSB_{DAC_CMP_BIAS_LSB}_VC5_{DAC_CMP_VC5}/', f'{code}.csv')
         else:
-            oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP_VB5{DAC_CMP_BIAS_P}_LSB{DAC_CMP_BIAS_LSB}_VC5{DAC_CMP_VC5}/', f'{code}.csv')
-
-if __name__ == "__main__":
-    with MGPDClient() as client:
-        TEST_CMP_OFFSET(
-            client=client,
-            DAC_CMP_BIAS_P=700,
-            DAC_CMP_BIAS_LSB=350,
-            DAC_CMP_VC5=470,
-            average_count=4,
-        )
+            oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP_VB5_{DAC_CMP_BIAS_P}_LSB_{DAC_CMP_BIAS_LSB}_VC5_{DAC_CMP_VC5}/', f'{code}.csv')

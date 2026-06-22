@@ -8,7 +8,7 @@ __pycache__/
 
 # Fiels
 *.csv
-
+test.py
 # Distribution / packaging
 .Python
 build/

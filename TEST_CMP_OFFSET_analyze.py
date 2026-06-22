@@ -1,11 +1,18 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+from typing import Union, List
+import csv
+import concurrent.futures
 
-def load_file(code, directory='./csv_data_CMP'):
+def load_file(code, directory: str):
     fname = os.path.join(directory, f"{code}.csv")
-    data = np.loadtxt(fname, delimiter=',')
-    return data[:, 0], data[:, 1], data[:, 2], data[:, 3]
+    try:
+        data = np.loadtxt(fname, delimiter=',', skiprows=1)
+        return data[:, 0], data[:, 1], data[:, 2], data[:, 3]
+    except ValueError:
+        data = np.loadtxt(fname, delimiter=',')
+        return data[:, 0], data[:, 1], data[:, 2], data[:, 3]
 
 def find_switches(out, min_amplitude=0.2):
     low = np.median(out[out < np.median(out)])
@@ -34,104 +41,157 @@ def compute_offset(time, out, thd, inp, edge='both', min_amplitude=0.2):
     diffs = thd[switches] - inp[switches]
     return np.mean(diffs)
 
-def plot_offset_curve(directory='./csv_data_CMP', edge='both', min_amplitude=0.2):
-    codes = []
-    offsets = []
-    for code in range(256):
-        try:
-            t, out, thd, inp = load_file(code, directory)
-            off = compute_offset(t, out, thd, inp, edge=edge, min_amplitude=min_amplitude)
-            if not np.isnan(off):
-                codes.append(code)
-                offsets.append(off)
-        except Exception:
-            continue
-    if codes:
-        plt.figure(figsize=(10, 5))
-        plt.plot(codes, offsets, 'o-', markersize=3, linewidth=1)
-        plt.xlabel('Код подстройки')
-        plt.ylabel('Напряжение смещения (В)')
-        plt.title(f'Калибровочная характеристика (edge={edge})')
-        plt.grid(True)
-        plt.show()
-        return codes, offsets
-    else:
-        print("Не найдено ни одного кода с переключениями")
-        return [], []
+def process_code(args):
+    """Вспомогательная функция для параллельной обработки одного кода."""
+    folder, code, edge, min_amplitude = args
+    try:
+        t, out, thd, inp = load_file(code, folder)
+        off = compute_offset(t, out, thd, inp, edge=edge, min_amplitude=min_amplitude)
+        if not np.isnan(off):
+            return (code, off)
+    except Exception:
+        pass
+    return None
 
-def plot_offset_sorted(directory='./csv_data_CMP', edge='both', min_amplitude=0.2, label_every=1):
-    pairs = []
-    for code in range(256):
-        try:
-            t, out, thd, inp = load_file(code, directory)
-            off = compute_offset(t, out, thd, inp, edge=edge, min_amplitude=min_amplitude)
-            if not np.isnan(off):
-                pairs.append((code, off))
-        except Exception:
-            continue
-    if not pairs:
+def collect_data_from_folders(directories, edge, min_amplitude, max_workers=None):
+    """
+    Параллельно обрабатывает все коды для каждой папки.
+    Возвращает словарь {folder: list of (code, offset)}.
+    """
+    if isinstance(directories, str):
+        directories = [directories]
+    
+    results = {}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_folder = {}
+        for folder in directories:
+            for code in range(256):
+                args = (folder, code, edge, min_amplitude)
+                future = executor.submit(process_code, args)
+                future_to_folder[future] = folder
+        
+        # Собираем результаты
+        for future in concurrent.futures.as_completed(future_to_folder):
+            folder = future_to_folder[future]
+            result = future.result()
+            if result is not None:
+                if folder not in results:
+                    results[folder] = []
+                results[folder].append(result)
+    return results
+
+def plot_offset_curve(directories: Union[str, List[str]] = './csv_data_CMP', edge='both', min_amplitude=0.2):
+    """
+    Строит калибровочные кривые для каждой папки на одном графике.
+    Использует параллельную обработку.
+    """
+    data = collect_data_from_folders(directories, edge, min_amplitude)
+    if not data:
         print("Нет данных для построения")
         return
-    pairs.sort(key=lambda x: x[1])
-    sorted_codes = [p[0] for p in pairs]
-    sorted_offsets = [p[1] for p in pairs]
-    print("Отсортированные по смещению коды (смещение в В):")
-    for code, off in pairs:
-        print(f"Код {code}: {off:.6f}")
+    
+    plt.figure(figsize=(10, 5))
+    for folder, pairs in data.items():
+        pairs.sort(key=lambda x: x[0])
+        codes = [p[0] for p in pairs]
+        offsets = [p[1] for p in pairs]
+        plt.plot(codes, offsets, 'o-', markersize=3, linewidth=1, label=os.path.basename(folder))
+    
+    plt.xlabel('Код подстройки')
+    plt.ylabel('Напряжение смещения (В)')
+    plt.title(f'Калибровочная характеристика (edge={edge})')
+    plt.grid(True)
+    if len(data) > 1:
+        plt.legend()
+    plt.show()
+
+def plot_offset_sorted(directories: Union[str, List[str]] = './csv_data_CMP', edge='both', min_amplitude=0.2, label_every=1):
+    """
+    Строит отсортированные калибровочные кривые для каждой папки на одном графике.
+    """
+    data = collect_data_from_folders(directories, edge, min_amplitude)
+    if not data:
+        print("Нет данных для построения")
+        return
+    
     plt.figure(figsize=(12, 6))
-    plt.plot(range(1, len(sorted_offsets)+1), sorted_offsets, 'o-', markersize=3, linewidth=1)
-    # Добавляем подписи к точкам (код)
-    for i, (code, off) in enumerate(pairs, start=1):
-        if label_every > 0 and (i-1) % label_every == 0:
-            plt.text(i, off, f' {code}', fontsize=8, ha='center', va='top')
+    for folder, pairs in data.items():
+        pairs.sort(key=lambda x: x[1])
+        sorted_offsets = [p[1] for p in pairs]
+        x_vals = range(1, len(sorted_offsets)+1)
+        plt.plot(x_vals, sorted_offsets, 'o-', markersize=3, linewidth=1, label=os.path.basename(folder))
+        if label_every > 0:
+            for i, (code, off) in enumerate(pairs, start=1):
+                if (i-1) % label_every == 0:
+                    plt.text(i, off, f' {code}', fontsize=8, ha='center', va='top')
+    
     plt.xlabel('Порядковый номер (от min смещения к max)')
     plt.ylabel('Напряжение смещения (В)')
     plt.title(f'Отсортированная калибровочная характеристика (edge={edge})')
     plt.grid(True)
+    if len(data) > 1:
+        plt.legend()
     plt.tight_layout()
     plt.show()
-    return pairs
 
-def plot_offset_histogram(code, directory='./csv_data_CMP', edge='both', min_amplitude=0.2, bins=20):
-    t, out, thd, inp = load_file(code, directory)
-    rise, fall = find_switches(out, min_amplitude)
-    switches = []
-    if edge in ('rise', 'both'):
-        switches.extend(rise)
-    if edge in ('fall', 'both'):
-        switches.extend(fall)
-    if len(switches) == 0:
-        print(f"Код {code}: переключений не найдено")
-        return
-    switches = np.sort(switches)
-    diffs = thd[switches] - inp[switches]
+def plot_offset_histogram(code, directories: Union[str, List[str]] = './csv_data_CMP', edge='both', min_amplitude=0.2, bins=20):
+    """
+    Строит гистограммы смещений для заданного кода из всех папок на одном графике.
+    Здесь параллельная обработка не даст выигрыша (всего несколько папок), но можно сделать.
+    """
+    if isinstance(directories, str):
+        directories = [directories]
+    
     plt.figure()
-    plt.hist(diffs, bins=bins, alpha=0.7, edgecolor='black')
+    # Для простоты оставим последовательную обработку (или можно распараллелить по папкам, но не критично)
+    for folder in directories:
+        try:
+            t, out, thd, inp = load_file(code, folder)
+        except FileNotFoundError:
+            print(f"Файл {code}.csv не найден в {folder}")
+            continue
+        rise, fall = find_switches(out, min_amplitude)
+        switches = []
+        if edge in ('rise', 'both'):
+            switches.extend(rise)
+        if edge in ('fall', 'both'):
+            switches.extend(fall)
+        if len(switches) == 0:
+            print(f"Код {code} в {folder}: переключений не найдено")
+            continue
+        switches = np.sort(switches)
+        diffs = thd[switches] - inp[switches]
+        plt.hist(diffs, bins=bins, alpha=0.5, edgecolor='black', label=os.path.basename(folder))
+    
     plt.xlabel('THD - IN (В)')
     plt.ylabel('Частота')
     plt.title(f'Гистограмма смещений для кода {code} (edge={edge})')
     plt.grid(True, alpha=0.3)
+    if len(directories) > 1:
+        plt.legend()
     plt.show()
 
-def plot_offset_histogram_all(directory='./csv_data_CMP', edge='both', min_amplitude=0.2, bins=20):
-    offsets = []
-    for code in range(256):
-        try:
-            t, out, thd, inp = load_file(code, directory)
-            off = compute_offset(t, out, thd, inp, edge=edge, min_amplitude=min_amplitude)
-            if not np.isnan(off):
-                offsets.append(off)
-        except Exception:
-            continue
-    if not offsets:
+def plot_offset_histogram_all(directories: Union[str, List[str]] = './csv_data_CMP', edge='both', min_amplitude=0.2, bins=20):
+    """
+    Строит распределение смещений по всем кодам для каждой папки на одном графике.
+    Использует параллельную обработку.
+    """
+    data = collect_data_from_folders(directories, edge, min_amplitude)
+    if not data:
         print("Нет данных для построения гистограммы")
         return
+    
     plt.figure(figsize=(8, 5))
-    plt.hist(offsets, bins=bins, alpha=0.7, edgecolor='black', color='skyblue')
+    for folder, pairs in data.items():
+        offsets = [p[1] for p in pairs]
+        plt.hist(offsets, bins=bins, alpha=0.5, edgecolor='black', label=os.path.basename(folder))
+    
     plt.xlabel('Напряжение смещения (В)')
     plt.ylabel('Количество кодов')
     plt.title(f'Распределение смещений по всем кодам (edge={edge})')
     plt.grid(True, alpha=0.3)
+    if len(data) > 1:
+        plt.legend()
     plt.show()
 
 def plot_overlay(codes, directory='./csv_data_CMP', t_lim=None, decimate=1, alpha=1.0):
@@ -187,21 +247,83 @@ def plot_overlay(codes, directory='./csv_data_CMP', t_lim=None, decimate=1, alph
     plt.tight_layout()
     plt.show()
 
+    import csv
 
-DIRECTORY = 'csv_data_CMP_alt_more_stat'
+def save_offset_data_to_csv(directories, output_filename, edge='both', min_amplitude=0.2):
+    """
+    Сохраняет в CSV‑файл смещения для всех кодов, для которых есть данные хотя бы в одной папке.
+    Первый столбец – trim_code, остальные – имена папок.
+    Если для какого‑то кода в папке нет данных, ячейка остаётся пустой.
+    """
+    data = collect_data_from_folders(directories, edge, min_amplitude)
+    if not data:
+        print("Нет данных для сохранения")
+        return
+
+    # Преобразуем в словарь {folder: {code: offset}}
+    folder_offsets = {}
+    all_codes = set()
+    for folder, pairs in data.items():
+        d = {code: off for code, off in pairs}
+        folder_offsets[folder] = d
+        all_codes.update(d.keys())
+
+    # Сортируем коды по возрастанию
+    sorted_codes = sorted(all_codes)
+    headers = ['trim_code'] + [os.path.basename(f) for f in folder_offsets.keys()]
+
+    with open(output_filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for code in sorted_codes:
+            row = [code]
+            for folder in folder_offsets.keys():
+                off = folder_offsets[folder].get(code)
+                row.append('' if off is None else f"{off:.6f}")
+            writer.writerow(row)
+
+    print(f"Сохранено {len(sorted_codes)} кодов в {output_filename}")
+
+
+# DIRECTORY = 'csv_data_CMP_VB5700_LSB100_VC5470'
+DIRECTORY = [
+    'csv_data_CMP_ALT_VB5_700_LSB_100_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_200_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_300_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_400_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_500_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_600_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_700_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_800_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_900_VC5_470',
+    'csv_data_CMP_ALT_VB5_700_LSB_1000_VC5_470',
+]
+# DIRECTORY = [
+#     'csv_data_CMP_VB5_700_LSB_100_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_200_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_300_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_400_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_500_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_600_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_700_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_800_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_900_VC5_470',
+#     'csv_data_CMP_VB5_700_LSB_1000_VC5_470',
+# ]
 EDGE = 'rise'
 
 if __name__ == "__main__":
     # 1) Калибровочная кривая
-    # plot_offset_curve(directory=DIRECTORY, edge=EDGE)
-    plot_offset_sorted(directory=DIRECTORY, edge=EDGE, label_every=0)
+    plot_offset_curve(directories=DIRECTORY, edge=EDGE, min_amplitude=0.1)
+    # plot_offset_sorted(directories=DIRECTORY, edge=EDGE, label_every=0)
     
     # 2) Гистограмма распределения смещений по всем кодам
-    # plot_offset_histogram_all(directory=DIRECTORY, edge=EDGE, bins=30)
+    # plot_offset_histogram_all(directories=DIRECTORY, edge=EDGE, bins=30)
     
     # 3) Гистограмма для одного кода (например, 100)
-    # plot_offset_histogram(directory=DIRECTORY, 135, edge=EDGE)
+    # plot_offset_histogram(directories=DIRECTORY, 135, edge=EDGE)
     
     # 4) Наложение выходов для визуального сравнения
     # plot_overlay(directory=DIRECTORY, codes='all')
     # plot_overlay(directory=DIRECTORY, codes=[0, 135, 160, 240, 255])
+    # save_offset_data_to_csv(directories=DIRECTORY, output_filename="offset_pixel_CMP_ALT.csv", edge=EDGE, min_amplitude=0.1)
