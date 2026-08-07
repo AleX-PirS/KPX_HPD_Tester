@@ -25,6 +25,7 @@ def TEST_CMP_OFFSET(
         TRIM_CODE: list[int] = [0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0],
 
         IS_ALT_CMP: bool = False,
+        TEST_NAME: str = "CMP",
         PREP_DELAY: float = 10,
         AVG_DELAY: float = 6,
 ):  
@@ -97,6 +98,9 @@ def TEST_CMP_OFFSET(
         time.sleep(AVG_DELAY)
         
         if IS_ALT_CMP:
-            oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP_ALT_VB5_{DAC_CMP_BIAS_P}_LSB_{DAC_CMP_BIAS_LSB}_VC5_{DAC_CMP_VC5}/', f'{code}.csv')
+            oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_{TEST_NAME}_ALT_VB5_{DAC_CMP_BIAS_P}_LSB_{DAC_CMP_BIAS_LSB}_VC5_{DAC_CMP_VC5}/', f'{code}.csv')
         else:
-            oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_CMP_VB5_{DAC_CMP_BIAS_P}_LSB_{DAC_CMP_BIAS_LSB}_VC5_{DAC_CMP_VC5}/', f'{code}.csv')
+            oscilloscope_cfg.save_oscilloscope_csv(osc, [1,2,3], f'./csv_data_{TEST_NAME}_VB5_{DAC_CMP_BIAS_P}_LSB_{DAC_CMP_BIAS_LSB}_VC5_{DAC_CMP_VC5}/', f'{code}.csv')
+
+    gen.disable_channel(1)
+    gen.disable_channel(2)

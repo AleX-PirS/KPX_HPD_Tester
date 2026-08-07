@@ -287,16 +287,16 @@ def save_offset_data_to_csv(directories, output_filename, edge='both', min_ampli
 
 # DIRECTORY = 'csv_data_CMP_VB5700_LSB100_VC5470'
 DIRECTORY = [
-    'csv_data_CMP_ALT_VB5_700_LSB_100_VC5_470',
-    'csv_data_CMP_ALT_VB5_700_LSB_200_VC5_470',
-    'csv_data_CMP_ALT_VB5_700_LSB_300_VC5_470',
-    'csv_data_CMP_ALT_VB5_700_LSB_400_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_100_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_200_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_300_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_400_VC5_470',
     'csv_data_CMP_ALT_VB5_700_LSB_500_VC5_470',
-    'csv_data_CMP_ALT_VB5_700_LSB_600_VC5_470',
-    'csv_data_CMP_ALT_VB5_700_LSB_700_VC5_470',
-    'csv_data_CMP_ALT_VB5_700_LSB_800_VC5_470',
-    'csv_data_CMP_ALT_VB5_700_LSB_900_VC5_470',
-    'csv_data_CMP_ALT_VB5_700_LSB_1000_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_600_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_700_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_800_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_900_VC5_470',
+    # 'csv_data_CMP_ALT_VB5_700_LSB_1000_VC5_470',
 ]
 # DIRECTORY = [
 #     'csv_data_CMP_VB5_700_LSB_100_VC5_470',
@@ -314,8 +314,8 @@ EDGE = 'rise'
 
 if __name__ == "__main__":
     # 1) Калибровочная кривая
-    plot_offset_curve(directories=DIRECTORY, edge=EDGE, min_amplitude=0.1)
-    # plot_offset_sorted(directories=DIRECTORY, edge=EDGE, label_every=0)
+    # plot_offset_curve(directories=DIRECTORY, edge=EDGE, min_amplitude=0.1)
+    plot_offset_sorted(directories=DIRECTORY, edge=EDGE, label_every=0)
     
     # 2) Гистограмма распределения смещений по всем кодам
     # plot_offset_histogram_all(directories=DIRECTORY, edge=EDGE, bins=30)

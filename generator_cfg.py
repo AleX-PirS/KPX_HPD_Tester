@@ -830,3 +830,9 @@ class TwoChannelGenerator:
         self.gen.close()
         self.rm.close()
         print("Generator connection closed.")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()

@@ -2,6 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
+EDM_vis.py
 
 # C extensions
 *.so
