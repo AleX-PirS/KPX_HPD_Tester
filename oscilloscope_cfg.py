@@ -234,11 +234,14 @@ class Oscilloscope:
         average_count: int = 1,
         time_scale_s: float = 20e-9,
         time_offset_s: float = 0,
-        voltage_scale_v: float = 0.1,
+        voltage_scale_v: float = 0.25,
         voltage_offset_v: float = 0.0,
         input_modes: dict[int, str] | None = None,
         waveform_points: int = 10000,
         run_after_config: bool = True,
+        averaging_enabled: bool = True,
+        voltage_scale_dict: dict[int, float] | None = None,
+        voltage_offset_dict: dict[int, float] | None = None,
     ):
         """Настроить кадр осциллографа без повторного подключения."""
         self._check_channels(channels)
@@ -259,6 +262,22 @@ class Oscilloscope:
         if input_modes is None:
             input_modes = {}
 
+        if voltage_scale_dict is None:
+            voltage_scale_dict = {}
+
+        if voltage_offset_dict is None:
+            voltage_offset_dict = {}
+
+        for channel, scale in voltage_scale_dict.items():
+            self._check_channel(channel)
+            if scale <= 0:
+                raise ValueError(
+                    f"voltage_scale_dict[{channel}] must be positive."
+                )
+
+        for channel in voltage_offset_dict:
+            self._check_channel(channel)
+
         trigger_slope = self._normalize_slope(trigger_slope)
 
         selected_channels = set(channels)
@@ -272,14 +291,18 @@ class Oscilloscope:
         for channel in channels:
             input_mode = self._normalize_input(input_modes.get(channel, "DC"))
 
+            channel_scale_v = voltage_scale_dict.get(channel, voltage_scale_v)
+            channel_offset_v = voltage_offset_dict.get(
+                channel, voltage_offset_v)
+
             self._write(f":CHAN{channel}:INP {input_mode}")
-            self._write(f":CHAN{channel}:SCAL {voltage_scale_v}")
-            self._write(f":CHAN{channel}:OFFS {voltage_offset_v}")
+            self._write(f":CHAN{channel}:SCAL {channel_scale_v}")
+            self._write(f":CHAN{channel}:OFFS {channel_offset_v}")
 
         self._write(f":TIM:SCAL {time_scale_s}")
         self._write(f":TIM:POS {time_offset_s}")
 
-        if average_count > 1:
+        if averaging_enabled:
             self._write(f":ACQ:AVER:COUN {average_count}")
             self._write(":ACQ:AVER ON")
             self._write(":ACQ:MODE AVER")
@@ -312,7 +335,8 @@ class Oscilloscope:
         print("Oscilloscope frame prepared.")
         print(f"Channels: {list(channels)}")
         print(f"Trigger enabled: {trigger_enabled}")
-        print(f"Averages: {average_count}")
+        print(f"Averaging enabled: {averaging_enabled}")
+        print(f"Averages: {average_count if averaging_enabled else 'OFF'}")
 
     def read_waveform_from_channel(self, channel: int):
         self._check_channel(channel)
