@@ -298,18 +298,6 @@ DIRECTORY = [
     # 'csv_data_CMP_ALT_VB5_700_LSB_900_VC5_470',
     # 'csv_data_CMP_ALT_VB5_700_LSB_1000_VC5_470',
 ]
-# DIRECTORY = [
-#     'csv_data_CMP_VB5_700_LSB_100_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_200_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_300_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_400_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_500_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_600_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_700_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_800_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_900_VC5_470',
-#     'csv_data_CMP_VB5_700_LSB_1000_VC5_470',
-# ]
 EDGE = 'rise'
 
 if __name__ == "__main__":
