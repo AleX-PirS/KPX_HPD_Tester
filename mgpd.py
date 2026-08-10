@@ -32,11 +32,13 @@ class MGPDClient:
         port: int = 0xBEEB,
         timeout: float = 5.0,
         auto_enable_kipix: bool = True,
+        trace_callback=None,
     ):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.auto_enable_kipix = auto_enable_kipix
+        self.trace_callback = trace_callback
         self._socket: socket.socket | None = None
         self._connected = False
 
@@ -91,8 +93,16 @@ class MGPDClient:
         if not self._connected or self._socket is None:
             raise RuntimeError("Not connected. Call connect() first.")
 
+        if self.trace_callback is not None:
+            self.trace_callback("TX", cmd.decode("ascii", errors="replace").strip())
+
         self._socket.sendall(cmd)
-        return self._socket.recv(1024)
+        response = self._socket.recv(1024)
+
+        if self.trace_callback is not None:
+            self.trace_callback("RX", self._decode_response(response))
+
+        return response
 
     @staticmethod
     def _decode_response(response: bytes) -> str:

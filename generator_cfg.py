@@ -28,6 +28,7 @@ class TwoChannelGenerator:
         timeout_ms: int = 5000,
         chunk_size: int = 1_000_000,
         use_source_prefix: bool = True,
+        trace_callback=None,
     ):
         """
         Generator structure:
@@ -46,6 +47,7 @@ class TwoChannelGenerator:
         self.max_amplitude_v = max_amplitude_v
         self.max_abs_level_v = max_abs_level_v
         self.use_source_prefix = use_source_prefix
+        self.trace_callback = trace_callback
 
         self.rm = visa.ResourceManager("@py")
         self.gen = self._connect_generator()
@@ -63,10 +65,17 @@ class TwoChannelGenerator:
 
     def _write(self, command: str):
         print("SCPI write:", command)
+        if self.trace_callback is not None:
+            self.trace_callback("TX", command)
         self.gen.write(command)
 
     def _query(self, command: str) -> str:
-        return self.gen.query(command).strip()
+        if self.trace_callback is not None:
+            self.trace_callback("TX", command)
+        response = self.gen.query(command).strip()
+        if self.trace_callback is not None:
+            self.trace_callback("RX", response)
+        return response
 
     # ---------------- connection ----------------
 

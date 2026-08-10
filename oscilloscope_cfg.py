@@ -18,11 +18,13 @@ class Oscilloscope:
         idn_substring: str = DEFAULT_OSC_IDN_SUBSTRING,
         timeout_ms: int = RESOURCE_TIMEOUT,
         chunk_size: int = RESOURCE_CHUNK_SIZE,
+        trace_callback=None,
     ):
         self.osc_address = osc_address
         self.idn_substring = idn_substring
         self.timeout_ms = timeout_ms
         self.chunk_size = chunk_size
+        self.trace_callback = trace_callback
 
         self.rm = visa.ResourceManager("@py")
         self.osc = self._connect_oscilloscope()
@@ -41,10 +43,17 @@ class Oscilloscope:
         resource.write_termination = "\n"
 
     def _write(self, command: str):
+        if self.trace_callback is not None:
+            self.trace_callback("TX", command)
         self.osc.write(command)
 
     def _query(self, command: str) -> str:
-        return self.osc.query(command).strip()
+        if self.trace_callback is not None:
+            self.trace_callback("TX", command)
+        response = self.osc.query(command).strip()
+        if self.trace_callback is not None:
+            self.trace_callback("RX", response)
+        return response
 
     # ---------------- connection ----------------
 
