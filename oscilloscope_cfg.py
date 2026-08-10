@@ -132,17 +132,39 @@ class Oscilloscope:
         mode = input_mode.strip().upper()
 
         aliases = {
+            # DC coupling, 1 Mohm input
             "DC": "DC",
             "1M": "DC",
             "1MOHM": "DC",
             "1MEG": "DC",
+            "DC1M": "DC",
+            "DC1MOHM": "DC",
+
+            # DC coupling, 50 ohm input
             "DC50": "DC50",
             "50": "DC50",
             "50OHM": "DC50",
+
+            # AC coupling, 1 Mohm input.
+            # On Keysight Infiniium 9000/9000H this is selected directly by
+            # :CHANnel<N>:INPut AC; AC+50 ohm is not a supported input mode.
+            "AC": "AC",
+            "AC1M": "AC",
+            "AC1MOHM": "AC",
+            "AC1MEG": "AC",
         }
 
+        if mode in ("AC50", "AC50OHM"):
+            raise ValueError(
+                "AC coupling is available only with 1 Mohm input impedance "
+                "on Infiniium 9000/9000H oscilloscopes. Use input mode 'AC'."
+            )
+
         if mode not in aliases:
-            raise ValueError("Input mode must be DC or DC50.")
+            raise ValueError(
+                "Input mode must be DC (1 Mohm), DC50 (50 ohm), "
+                "or AC (1 Mohm)."
+            )
 
         return aliases[mode]
 
@@ -261,6 +283,12 @@ class Oscilloscope:
 
         if input_modes is None:
             input_modes = {}
+
+        # input_modes is per-channel:
+        #   "DC"   -> DC coupling, 1 Mohm
+        #   "DC50" -> DC coupling, 50 ohm
+        #   "AC"   -> AC coupling, 1 Mohm
+        # Channels omitted from the dictionary keep the existing default "DC".
 
         if voltage_scale_dict is None:
             voltage_scale_dict = {}
@@ -575,8 +603,8 @@ class Oscilloscope:
 #     time_scale_s=20e-9,
 #     voltage_scale_v=0.1,
 #     input_modes={
-#         1: "DC50",
-#         2: "DC",
+#         1: "AC",      # AC coupling, 1 Mohm
+#         2: "DC50",    # DC coupling, 50 ohm
 #     },
 # )
 
