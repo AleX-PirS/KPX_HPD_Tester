@@ -29,6 +29,7 @@ class TwoChannelGenerator:
         chunk_size: int = 1_000_000,
         use_source_prefix: bool = True,
         trace_callback=None,
+        min_output_v: float = 0.0,
     ):
         """
         Generator structure:
@@ -48,6 +49,15 @@ class TwoChannelGenerator:
         self.max_abs_level_v = max_abs_level_v
         self.use_source_prefix = use_source_prefix
         self.trace_callback = trace_callback
+        self.min_output_v = float(min_output_v)
+
+        if self.min_output_v < 0:
+            raise ValueError("min_output_v must be >= 0 V.")
+
+        if self.min_output_v > self.max_abs_level_v:
+            raise ValueError(
+                "min_output_v cannot be greater than max_abs_level_v."
+            )
 
         self.rm = visa.ResourceManager("@py")
         self.gen = self._connect_generator()
@@ -187,6 +197,9 @@ class TwoChannelGenerator:
             low  = offset - amplitude / 2
             high = offset + amplitude / 2
 
+            Safety requirement:
+                low must be >= min_output_v (0 V by default)
+
         PULS:
             amplitude_v is high-low
             low  = offset
@@ -238,11 +251,24 @@ class TwoChannelGenerator:
                 f"{self.max_amplitude_v} V."
             )
 
-        if abs(low_v) > self.max_abs_level_v or abs(high_v) > self.max_abs_level_v:
+        # HARD CHIP-SAFETY LIMIT:
+        # Never allow a generator configuration that produces a voltage below
+        # min_output_v (0 V by default). This validation is executed before
+        # any SCPI configuration commands are sent to the generator.
+        if low_v < self.min_output_v:
+            raise ValueError(
+                "Unsafe generator configuration: calculated output contains "
+                f"a voltage below the allowed minimum. LOW={low_v:g} V, "
+                f"HIGH={high_v:g} V, minimum allowed={self.min_output_v:g} V. "
+                "Configuration was NOT sent to the generator."
+            )
+
+        if high_v > self.max_abs_level_v:
             raise ValueError(
                 "Output level limit exceeded: "
-                f"low={low_v} V, high={high_v} V, "
-                f"allowed range is +/-{self.max_abs_level_v} V."
+                f"LOW={low_v:g} V, HIGH={high_v:g} V, "
+                f"allowed range is {self.min_output_v:g}.."
+                f"{self.max_abs_level_v:g} V."
             )
 
     @staticmethod
@@ -619,37 +645,6 @@ class TwoChannelGenerator:
             f"VOLT {amplitude_v}",
             f"source {channel} voltage amplitude",
         )
-
-    # def _configure_square_with_levels(
-    #     self,
-    #     channel: int,
-    #     frequency_hz: float,
-    #     low_level_v: float,
-    #     high_level_v: float,
-    # ):
-    #     self._send_param(
-    #         channel,
-    #         "FUNC SQU",
-    #         f"source {channel} square function",
-    #     )
-
-    #     self._send_param(
-    #         channel,
-    #         f"FREQ {frequency_hz}",
-    #         f"source {channel} frequency",
-    #     )
-
-    #     self._send_param(
-    #         channel,
-    #         f"VOLT:HIGH {high_level_v}",
-    #         f"source {channel} square high level",
-    #     )
-
-    #     self._send_param(
-    #         channel,
-    #         f"VOLT:LOW {low_level_v}",
-    #         f"source {channel} square low level",
-    #     )
 
     def _configure_square_with_levels(
         self,

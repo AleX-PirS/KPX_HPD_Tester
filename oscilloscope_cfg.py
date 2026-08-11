@@ -19,12 +19,23 @@ class Oscilloscope:
         timeout_ms: int = RESOURCE_TIMEOUT,
         chunk_size: int = RESOURCE_CHUNK_SIZE,
         trace_callback=None,
+        waveform_timeout_s: float = 5.0,
+        waveform_poll_interval_s: float = 0.05,
     ):
         self.osc_address = osc_address
         self.idn_substring = idn_substring
         self.timeout_ms = timeout_ms
         self.chunk_size = chunk_size
         self.trace_callback = trace_callback
+
+        if waveform_timeout_s <= 0:
+            raise ValueError("waveform_timeout_s must be positive.")
+
+        if waveform_poll_interval_s <= 0:
+            raise ValueError("waveform_poll_interval_s must be positive.")
+
+        self.waveform_timeout_s = float(waveform_timeout_s)
+        self.waveform_poll_interval_s = float(waveform_poll_interval_s)
 
         self.rm = visa.ResourceManager("@py")
         self.osc = self._connect_oscilloscope()
@@ -375,45 +386,119 @@ class Oscilloscope:
         print(f"Averaging enabled: {averaging_enabled}")
         print(f"Averages: {average_count if averaging_enabled else 'OFF'}")
 
-    def read_waveform_from_channel(self, channel: int):
+    def read_waveform_from_channel(
+        self,
+        channel: int,
+        timeout_s: float | None = None,
+        poll_interval_s: float | None = None,
+    ):
+        """
+        Read waveform from one channel with readiness polling.
+
+        If the oscilloscope has not prepared waveform data yet, or DATA?
+        temporarily returns an empty response, the function retries until
+        timeout_s expires.
+
+        Defaults:
+            timeout_s = 5.0 s
+            poll_interval_s = 0.05 s
+
+        Existing calls such as:
+            osc.read_waveform_from_channel(1)
+        remain fully compatible.
+        """
         self._check_channel(channel)
+
+        if timeout_s is None:
+            timeout_s = self.waveform_timeout_s
+
+        if poll_interval_s is None:
+            poll_interval_s = self.waveform_poll_interval_s
+
+        timeout_s = float(timeout_s)
+        poll_interval_s = float(poll_interval_s)
+
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive.")
+
+        if poll_interval_s <= 0:
+            raise ValueError("poll_interval_s must be positive.")
 
         self._write(f":WAV:SOUR CHAN{channel}")
 
-        for _ in range(5000):
+        deadline = time.monotonic() + timeout_s
+        last_error = None
+
+        while True:
+            waveform_complete = False
+
             try:
                 complete = self._query(":WAV:COMP?")
-                if complete == "100":
-                    break
-            except Exception:
-                break
+                waveform_complete = (complete == "100")
+            except Exception as error:
+                # Some acquisition states/firmware may transiently reject
+                # WAV:COMP?. In that case try reading DATA? directly.
+                last_error = error
+                waveform_complete = True
 
-        x_origin = float(self._query(":WAV:XOR?"))
-        x_increment = float(self._query(":WAV:XINC?"))
+            if waveform_complete:
+                try:
+                    x_origin = float(self._query(":WAV:XOR?"))
+                    x_increment = float(self._query(":WAV:XINC?"))
 
-        raw = self._query(":WAV:DATA?")
-        raw = self._strip_scpi_block_header(raw)
+                    raw = self._query(":WAV:DATA?")
+                    raw = self._strip_scpi_block_header(raw)
 
-        voltage = [
-            float(item)
-            for item in raw.split(",")
-            if item.strip() != ""
-        ]
+                    voltage = [
+                        float(item)
+                        for item in raw.split(",")
+                        if item.strip() != ""
+                    ]
 
-        if len(voltage) == 0:
-            raise RuntimeError(f"Empty waveform from CH{channel}.")
+                    if voltage:
+                        return voltage, x_origin, x_increment
 
-        return voltage, x_origin, x_increment
+                    # DATA? is empty even though acquisition reported complete.
+                    # Keep polling instead of failing immediately.
+                    last_error = None
 
-    def read_waveform(self, channel: int):
-        """Короткий alias для read_waveform_from_channel()."""
-        return self.read_waveform_from_channel(channel)
+                except Exception as error:
+                    # A transient VISA/SCPI error while the acquisition buffer
+                    # is changing should not immediately abort the test.
+                    last_error = error
+
+            now = time.monotonic()
+
+            if now >= deadline:
+                error = RuntimeError(f"Empty waveform from CH{channel}.")
+
+                if last_error is not None:
+                    raise error from last_error
+
+                raise error
+
+            time.sleep(min(poll_interval_s, deadline - now))
+
+    def read_waveform(
+        self,
+        channel: int,
+        timeout_s: float | None = None,
+        poll_interval_s: float | None = None,
+    ):
+        """Short alias for read_waveform_from_channel()."""
+        return self.read_waveform_from_channel(
+            channel,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
 
     def save_csv(
         self,
         channels: list[int] | tuple[int, ...],
         output_dir: str | Path,
         filename: str | None = None,
+        waveform_timeout_s: float | None = None,
+        waveform_poll_interval_s: float | None = None,
     ):
         """Сохранить waveform выбранных каналов в CSV."""
         self._check_channels(channels)
@@ -426,7 +511,11 @@ class Oscilloscope:
         x_increments = {}
 
         for channel in channels:
-            voltage, x_origin, x_increment = self.read_waveform_from_channel(channel)
+            voltage, x_origin, x_increment = self.read_waveform_from_channel(
+                channel,
+                timeout_s=waveform_timeout_s,
+                poll_interval_s=waveform_poll_interval_s,
+            )
 
             waveforms[channel] = voltage
             x_origins[channel] = x_origin
@@ -476,16 +565,30 @@ class Oscilloscope:
         channels: list[int] | tuple[int, ...],
         output_dir: str | Path,
         filename: str | None = None,
+        waveform_timeout_s: float | None = None,
+        waveform_poll_interval_s: float | None = None,
     ):
         """Совместимое имя для save_csv()."""
-        return self.save_csv(channels, output_dir, filename)
+        return self.save_csv(
+            channels,
+            output_dir,
+            filename,
+            waveform_timeout_s=waveform_timeout_s,
+            waveform_poll_interval_s=waveform_poll_interval_s,
+        )
 
-    def read_dc_level(self, channel: int = 1) -> float:
+    def read_dc_level(
+        self,
+        channel: int = 1,
+        timeout_s: float | None = None,
+        poll_interval_s: float | None = None,
+    ) -> float:
         """Прочитать среднее значение waveform выбранного канала."""
-        voltage, _, _ = self.read_waveform_from_channel(channel)
-
-        if not voltage:
-            raise RuntimeError(f"Empty waveform from CH{channel}")
+        voltage, _, _ = self.read_waveform_from_channel(
+            channel,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
 
         return sum(voltage) / len(voltage)
 
@@ -595,39 +698,3 @@ class Oscilloscope:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-
-
-
-# from oscilloscope_cfg import Oscilloscope
-
-# osc = Oscilloscope()
-
-# osc.configure_frame(
-#     channels=(1, 2),
-#     trigger_enabled=True,
-#     trigger_source=1,
-#     trigger_level_v=0.05,
-#     trigger_slope="POS",
-#     average_count=16,
-#     time_scale_s=20e-9,
-#     voltage_scale_v=0.1,
-#     input_modes={
-#         1: "AC",      # AC coupling, 1 Mohm
-#         2: "DC50",    # DC coupling, 50 ohm
-#     },
-# )
-
-# voltage, x_origin, x_increment = osc.read_waveform(1)
-
-# dc = osc.read_dc_level(1)
-
-# osc.save_csv(
-#     channels=(1, 2),
-#     output_dir="measurements",
-# )
-
-# osc.save_screenshot(
-#     "measurements/scope.png"
-# )
-
-# osc.close()
