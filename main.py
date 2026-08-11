@@ -8,8 +8,7 @@ from gui.main_window import MainWindow
 from gui.styles import get_app_qss, normalize_theme
 
 
-# Change this value to "light" if the light neutral theme should be the default.
-APP_THEME = "dark"
+APP_THEME = "light"
 
 
 def _parse_theme(argv: list[str]) -> str:
