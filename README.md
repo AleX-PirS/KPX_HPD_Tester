@@ -77,3 +77,13 @@ editing of logical fields. Hardware writes still occur only through
 ## v5 table scrolling fix
 
 The register table contains an internal non-data bottom scroll guard. It is ignored by filtering, Apply, dirty-value detection and chip readback, but guarantees that the final real register row can be scrolled fully above the open Log panel.
+
+
+## Visualization page
+
+The GUI contains a **Visualize** page with two hardware-assisted tools:
+
+- **Oscilloscope screen** - captures the current display into `temp/oscilloscope_screen.png` and shows it directly in the GUI. The file is overwritten on every refresh.
+- **AMUX sweep** - switches only the selected `EO_cfg.AMUX_SIGNALS`, waits the configured settling delay, reads one selected oscilloscope channel without changing the oscilloscope setup, stores temporary raw CSV files under `temp/amux_sweep/`, and creates `combined.csv` plus an in-GUI plot. The previous AMUX state is restored after completion or failure.
+
+`temp/` is runtime-only and ignored by Git. The displayed screenshot/figure and the combined sweep CSV can be exported with Save dialogs.

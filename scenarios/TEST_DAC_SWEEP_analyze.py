@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import csv
 from pathlib import Path
 
-def plot_all_dac_scans(folder_path='./csv_data/', output_file=None,
+def plot_all_dac_scans(folder_path='D:\dev\KPX_HPD_Tester_venv\KPX_HPD_Tester\EO_scv_data\csv_data_DAC', output_file=None,
                        title="DAC Transfer Characteristics",
                        xlabel="DAC Code",
                        ylabel="Measured Value (V)",

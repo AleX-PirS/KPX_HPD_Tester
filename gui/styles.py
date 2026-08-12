@@ -389,6 +389,26 @@ QTextEdit {{
     font-size: 9pt;
 }}
 
+QLabel#PreviewArea, QStackedWidget#VisualizationPreview {{
+    background: {c['table']};
+    color: {c['muted']};
+    border: 1px solid {c['border_soft']};
+    border-radius: 8px;
+}}
+
+QProgressBar {{
+    background: {c['input']};
+    color: {c['text']};
+    border: 1px solid {c['input_border']};
+    border-radius: 6px;
+    min-height: 20px;
+    text-align: center;
+}}
+QProgressBar::chunk {{
+    background: {c['primary']};
+    border-radius: 5px;
+}}
+
 QScrollArea {{
     border: 0;
     background: transparent;

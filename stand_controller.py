@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import csv
+import math
+import shutil
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -23,6 +27,7 @@ class StandController(QObject):
     log_message = pyqtSignal(str, str, bool)  # level, message, low_level
     status_changed = pyqtSignal(str, bool, str)  # device, connected, detail
     generator_output_changed = pyqtSignal(int, bool)  # physical output 1..4, enabled
+    amux_sweep_progress = pyqtSignal(int, int, str)  # current, total, signal
 
     def __init__(self):
         super().__init__()
@@ -31,6 +36,7 @@ class StandController(QObject):
         self.osc: Oscilloscope | None = None
         self.gen: TwoChannelGenerator | None = None
         self._gen_output_states: dict[int, bool] = {1: False, 2: False, 3: False, 4: False}
+        self.temp_dir = Path(__file__).resolve().parent / "temp"
 
     # ------------------------------------------------------------------ logging
 
@@ -266,6 +272,189 @@ class StandController(QObject):
         path = osc.save_screenshot(output_path)
         self._log("INFO", f"OSC screenshot saved: {path}")
         return path
+
+    def capture_oscilloscope_screen_temp(self) -> Path:
+        """Capture the current oscilloscope display into the project temp folder."""
+        osc = self._require_osc()
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        path = self.temp_dir / "oscilloscope_screen.png"
+        path = osc.save_screenshot(path)
+        self._log("INFO", "Oscilloscope screen refreshed in GUI")
+        return Path(path)
+
+    def run_amux_sweep(
+        self,
+        signals_to_save: tuple[str, ...] | list[str],
+        osc_channel: int,
+        delay_s: float = 0.1,
+    ) -> dict:
+        """Capture one oscilloscope waveform for each selected AMUX signal.
+
+        The current oscilloscope configuration is intentionally left untouched.
+        The AMUX state present before the sweep is restored even if acquisition
+        fails part-way through the sequence.
+        """
+        cfg = self._require_chip()
+        osc = self._require_osc()
+
+        signals = tuple(signals_to_save)
+        if not signals:
+            raise ValueError("Select at least one AMUX signal")
+        if osc_channel not in (1, 2, 3, 4):
+            raise ValueError("Oscilloscope channel must be 1, 2, 3 or 4")
+        if delay_s < 0:
+            raise ValueError("AMUX settling delay must be >= 0 s")
+
+        unknown = [signal for signal in signals if signal not in EO_cfg.AMUX_SIGNALS]
+        if unknown:
+            raise KeyError(f"Unknown AMUX signal(s): {', '.join(unknown)}")
+
+        sweep_dir = self.temp_dir / "amux_sweep"
+        if sweep_dir.exists():
+            shutil.rmtree(sweep_dir)
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+
+        # Preserve the exact raw TEST_MUX state, not only the decoded one-hot
+        # signal. This lets us restore even a non-standard/invalid mux state.
+        mux_addresses = [addr for addr, _, _ in cfg.regs_fields["TEST_MUX"]]
+        mux_cache = cfg.read_registers(mux_addresses)
+        previous_amux_raw = cfg.get_data("TEST_MUX", register_cache=mux_cache)
+        previous_amux_name = cfg.get_amux(register_cache=mux_cache)
+
+        captured: dict[str, dict] = {}
+        primary_error: Exception | None = None
+        restore_error: Exception | None = None
+
+        try:
+            total = len(signals)
+            for index, signal in enumerate(signals, start=1):
+                self.amux_sweep_progress.emit(index, total, signal)
+
+                if not cfg.set_amux(signal):
+                    raise RuntimeError(f"Failed to set AMUX={signal}")
+                self._log("INFO", f"AMUX sweep {index}/{total}: {signal}")
+
+                if delay_s > 0:
+                    time.sleep(delay_s)
+
+                # read_waveform() already contains the 5 s waveform timeout and
+                # frequent readiness polling from the oscilloscope driver.
+                voltage, x_origin, x_increment = osc.read_waveform(osc_channel)
+                if not voltage:
+                    raise RuntimeError(f"Empty waveform from CH{osc_channel}.")
+
+                raw_path = sweep_dir / f"{signal}.csv"
+                with raw_path.open("w", newline="", encoding="utf-8") as file:
+                    writer = csv.writer(file)
+                    writer.writerow(["time_s", "voltage_v"])
+                    for point_index, value in enumerate(voltage):
+                        writer.writerow([x_origin + point_index * x_increment, value])
+
+                captured[signal] = {
+                    "voltage": voltage,
+                    "x_origin": x_origin,
+                    "x_increment": x_increment,
+                    "raw_csv": raw_path,
+                }
+                self._log(
+                    "INFO",
+                    f"AMUX {signal}: CH{osc_channel} captured {len(voltage)} points",
+                )
+
+        except Exception as error:
+            primary_error = error
+
+        finally:
+            try:
+                if not cfg.set_data("TEST_MUX", previous_amux_raw):
+                    raise RuntimeError("Failed to restore previous TEST_MUX state")
+                restored = previous_amux_name or f"raw 0x{previous_amux_raw:X}"
+                self._log("INFO", f"AMUX restored to {restored}")
+            except Exception as error:
+                restore_error = error
+                self._log("ERROR", f"AMUX restore failed: {error}")
+
+        if primary_error is not None:
+            if restore_error is not None:
+                raise RuntimeError(
+                    f"AMUX sweep failed: {primary_error}. "
+                    f"Additionally, previous AMUX state could not be restored: {restore_error}"
+                ) from primary_error
+            raise primary_error
+
+        if restore_error is not None:
+            raise restore_error
+
+        # Validate that the oscilloscope timebase stayed constant throughout the
+        # sweep. We do not interpolate silently, because that could hide a real
+        # acquisition/configuration change during a measurement.
+        reference_signal = signals[0]
+        reference = captured[reference_signal]
+        ref_origin = reference["x_origin"]
+        ref_increment = reference["x_increment"]
+        min_length = min(len(captured[signal]["voltage"]) for signal in signals)
+
+        if min_length <= 0:
+            raise RuntimeError("AMUX sweep produced no waveform samples")
+
+        for signal in signals[1:]:
+            item = captured[signal]
+            if not math.isclose(
+                item["x_increment"],
+                ref_increment,
+                rel_tol=1e-9,
+                abs_tol=1e-15,
+            ):
+                raise RuntimeError(
+                    "Oscilloscope time increment changed during AMUX sweep: "
+                    f"{reference_signal}={ref_increment:g} s, "
+                    f"{signal}={item['x_increment']:g} s."
+                )
+
+            origin_tolerance = max(abs(ref_increment) * 0.25, 1e-15)
+            if abs(item["x_origin"] - ref_origin) > origin_tolerance:
+                raise RuntimeError(
+                    "Oscilloscope time origin changed during AMUX sweep: "
+                    f"{reference_signal}={ref_origin:g} s, "
+                    f"{signal}={item['x_origin']:g} s."
+                )
+
+        lengths = {signal: len(captured[signal]["voltage"]) for signal in signals}
+        if len(set(lengths.values())) > 1:
+            self._log(
+                "WARNING",
+                f"AMUX waveform lengths differ {lengths}; using common first {min_length} points",
+            )
+
+        time_axis = [ref_origin + index * ref_increment for index in range(min_length)]
+        waveforms = {
+            signal: captured[signal]["voltage"][:min_length]
+            for signal in signals
+        }
+
+        combined_csv = sweep_dir / "combined.csv"
+        with combined_csv.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["time_s", *signals])
+            for index, time_value in enumerate(time_axis):
+                writer.writerow(
+                    [time_value, *[waveforms[signal][index] for signal in signals]]
+                )
+
+        self._log(
+            "INFO",
+            f"AMUX sweep completed: {len(signals)} signal(s), {min_length} points each",
+        )
+
+        return {
+            "signals": signals,
+            "osc_channel": osc_channel,
+            "delay_s": delay_s,
+            "time_s": time_axis,
+            "waveforms": waveforms,
+            "combined_csv": combined_csv,
+            "raw_dir": sweep_dir,
+        }
 
     # ---------------------------------------------------------------- generator
 

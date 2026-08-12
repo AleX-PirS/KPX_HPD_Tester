@@ -30,6 +30,7 @@ from stand_controller import StandController
 from workers import HardwareTaskRunner
 from .widgets import Card, FloatEdit, LogPanel, OutputStateButton, RegisterTable, StatusBadge
 from .styles import current_theme_colors
+from .visualization_page import VisualizationPage
 
 
 # =============================================================================
@@ -779,12 +780,14 @@ class MainWindow(QMainWindow):
         self.chip = ChipPage()
         self.osc = OscilloscopePage()
         self.gen = GeneratorPage()
+        self.visualize = VisualizationPage()
 
         self.pages = [
             ("Connections", self.connections),
             ("Chip", self.chip),
             ("Oscilloscope", self.osc),
             ("Generator", self.gen),
+            ("Visualize", self.visualize),
         ]
         self.nav_buttons = []
         for index, (name, page) in enumerate(self.pages):
@@ -797,7 +800,7 @@ class MainWindow(QMainWindow):
             # ChipPage contains a large QTableWidget with its own scrollbars.
             # Keeping it out of an outer QScrollArea makes wheel/scrollbar
             # interaction predictable and lets the table use all free height.
-            if isinstance(page, ChipPage):
+            if isinstance(page, (ChipPage, VisualizationPage)):
                 self.stack.addWidget(page)
             else:
                 self.stack.addWidget(_page_scroll(page))
@@ -829,6 +832,7 @@ class MainWindow(QMainWindow):
         self.controller.log_message.connect(self.log.append)
         self.controller.status_changed.connect(self._status_changed)
         self.controller.generator_output_changed.connect(self.gen.set_output_state)
+        self.controller.amux_sweep_progress.connect(self.visualize.set_sweep_progress)
 
         c = self.connections
         c.chip_connect.clicked.connect(self._connect_chip)
@@ -854,6 +858,11 @@ class MainWindow(QMainWindow):
                 lambda checked=False, ch=output_channel: self._toggle_gen_output(ch)
             )
 
+        self.visualize.refresh_screen.clicked.connect(self._refresh_visual_screen)
+        self.visualize.start_sweep.clicked.connect(self._start_amux_sweep)
+        self.visualize.save_figure.clicked.connect(self._save_visual_figure)
+        self.visualize.save_csv.clicked.connect(self._save_visual_csv)
+
     def _set_log_collapsed(self, collapsed: bool):
         # QSplitter sizes are content sizes and do not include the handle.
         # Use the real available height instead of an artificial 600 px floor;
@@ -878,10 +887,12 @@ class MainWindow(QMainWindow):
             self.connections.chip_connect.setEnabled(not connected)
             self.connections.chip_disconnect.setEnabled(connected)
             self.chip.set_connected(connected)
+            self.visualize.set_chip_connected(connected)
         elif device == "osc":
             self.connections.osc_connect.setEnabled(not connected)
             self.connections.osc_disconnect.setEnabled(connected)
             self.osc.set_connected(connected)
+            self.visualize.set_osc_connected(connected)
         elif device == "gen":
             self.connections.gen_connect.setEnabled(not connected)
             self.connections.gen_disconnect.setEnabled(connected)
@@ -889,7 +900,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ async helper
 
-    def _run(self, description: str, fn, on_result=None):
+    def _run(self, description: str, fn, on_result=None, on_finished=None):
         self.log.append("INFO", description)
 
         def error(message: str, tb: str):
@@ -898,11 +909,16 @@ class MainWindow(QMainWindow):
                 self.log.append("DEBUG", tb, True)
             QMessageBox.critical(self, "Hardware operation failed", message)
 
+        def finished():
+            self._worker_finished(worker)
+            if on_finished is not None:
+                on_finished()
+
         worker = self.runner.submit(
             fn,
             on_result=on_result,
             on_error=error,
-            on_finished=lambda: self._worker_finished(worker),
+            on_finished=finished,
         )
         self._active_workers.append(worker)
 
@@ -1059,6 +1075,101 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save oscilloscope screenshot", default, "PNG (*.png)")
         if path:
             self._run("Saving oscilloscope screenshot...", lambda: self.controller.save_osc_screenshot(path))
+
+    # --------------------------------------------------------------- visualize
+
+    def _refresh_visual_screen(self):
+        self.visualize.set_capture_busy(True)
+        self._run(
+            "Refreshing oscilloscope screen...",
+            self.controller.capture_oscilloscope_screen_temp,
+            on_result=self.visualize.show_screenshot,
+            on_finished=lambda: self.visualize.set_capture_busy(False),
+        )
+
+    def _start_amux_sweep(self):
+        signals = self.visualize.selected_signals()
+        if not signals:
+            QMessageBox.warning(
+                self,
+                "No AMUX signals",
+                "Select at least one AMUX signal to capture.",
+            )
+            return
+
+        try:
+            channel = self.visualize.selected_scope_channel()
+            delay_s = self.visualize.settling_delay_s()
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid AMUX sweep settings", str(error))
+            return
+
+        self.visualize.set_sweep_busy(True)
+        self._run(
+            f"Starting AMUX sweep: {len(signals)} signal(s) on CH{channel}...",
+            lambda: self.controller.run_amux_sweep(
+                signals,
+                osc_channel=channel,
+                delay_s=delay_s,
+            ),
+            on_result=self.visualize.show_amux_result,
+            on_finished=lambda: self.visualize.set_sweep_busy(False),
+        )
+
+    def _save_visual_figure(self):
+        mode = self.visualize.current_mode
+        if mode == "screenshot":
+            path, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save oscilloscope screen",
+                str(Path.cwd() / "oscilloscope_screen.png"),
+                "PNG image (*.png)",
+            )
+        elif mode == "amux":
+            path, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save AMUX sweep figure",
+                str(Path.cwd() / "amux_sweep.png"),
+                "PNG image (*.png);;PDF (*.pdf);;SVG (*.svg)",
+            )
+        else:
+            QMessageBox.information(self, "Nothing to save", "No visualization is currently displayed.")
+            return
+
+        if not path:
+            return
+
+        if not Path(path).suffix:
+            suffix = ".png"
+            if "PDF" in selected_filter:
+                suffix = ".pdf"
+            elif "SVG" in selected_filter:
+                suffix = ".svg"
+            path += suffix
+
+        try:
+            saved = self.visualize.save_current_figure(path)
+        except Exception as error:
+            QMessageBox.critical(self, "Save failed", str(error))
+            return
+        self.log.append("INFO", f"Visualization saved: {saved}")
+
+    def _save_visual_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save AMUX sweep CSV",
+            str(Path.cwd() / "amux_sweep.csv"),
+            "CSV (*.csv)",
+        )
+        if not path:
+            return
+
+        try:
+            saved = self.visualize.save_current_csv(path)
+        except Exception as error:
+            QMessageBox.critical(self, "Save failed", str(error))
+            return
+        self.log.append("INFO", f"AMUX sweep CSV saved: {saved}")
 
     # ---------------------------------------------------------------- generator
 
