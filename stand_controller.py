@@ -347,11 +347,19 @@ class StandController(QObject):
                 with raw_path.open("w", newline="", encoding="utf-8") as file:
                     writer = csv.writer(file)
                     writer.writerow(["time_s", "voltage_v"])
+                    # AMUX signals are acquired sequentially. The absolute
+                    # oscilloscope x_origin may vary slightly between
+                    # acquisitions even though the timebase itself is
+                    # unchanged. Store every temporary waveform on a relative
+                    # time axis starting at zero.
                     for point_index, value in enumerate(voltage):
-                        writer.writerow([x_origin + point_index * x_increment, value])
+                        writer.writerow([point_index * x_increment, value])
 
                 captured[signal] = {
                     "voltage": voltage,
+                    # Keep x_origin only as acquisition metadata for possible
+                    # diagnostics. It is intentionally NOT used to align or
+                    # validate AMUX sweep waveforms.
                     "x_origin": x_origin,
                     "x_increment": x_increment,
                     "raw_csv": raw_path,
@@ -385,12 +393,13 @@ class StandController(QObject):
         if restore_error is not None:
             raise restore_error
 
-        # Validate that the oscilloscope timebase stayed constant throughout the
-        # sweep. We do not interpolate silently, because that could hide a real
-        # acquisition/configuration change during a measurement.
+        # AMUX waveforms are acquired sequentially, therefore small changes of
+        # oscilloscope x_origin between acquisitions are expected and are
+        # intentionally ignored. Only the sampling interval must remain the
+        # same so that samples with the same index represent the same relative
+        # time. We do not interpolate a changed time grid silently.
         reference_signal = signals[0]
         reference = captured[reference_signal]
-        ref_origin = reference["x_origin"]
         ref_increment = reference["x_increment"]
         min_length = min(len(captured[signal]["voltage"]) for signal in signals)
 
@@ -411,14 +420,6 @@ class StandController(QObject):
                     f"{signal}={item['x_increment']:g} s."
                 )
 
-            origin_tolerance = max(abs(ref_increment) * 0.25, 1e-15)
-            if abs(item["x_origin"] - ref_origin) > origin_tolerance:
-                raise RuntimeError(
-                    "Oscilloscope time origin changed during AMUX sweep: "
-                    f"{reference_signal}={ref_origin:g} s, "
-                    f"{signal}={item['x_origin']:g} s."
-                )
-
         lengths = {signal: len(captured[signal]["voltage"]) for signal in signals}
         if len(set(lengths.values())) > 1:
             self._log(
@@ -426,7 +427,9 @@ class StandController(QObject):
                 f"AMUX waveform lengths differ {lengths}; using common first {min_length} points",
             )
 
-        time_axis = [ref_origin + index * ref_increment for index in range(min_length)]
+        # Relative AMUX sweep time axis. Absolute x_origin is deliberately
+        # discarded so independently acquired traces can be overlaid directly.
+        time_axis = [index * ref_increment for index in range(min_length)]
         waveforms = {
             signal: captured[signal]["voltage"][:min_length]
             for signal in signals
