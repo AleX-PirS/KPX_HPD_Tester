@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -34,6 +35,7 @@ class MatrixMap(QWidget):
         super().__init__(parent)
         self._selected = (0, min(OWNED_COLUMNS))
         self._state_provider = None
+        self._marker_provider = None
         self.setMinimumSize(470, 470)
         self.setMouseTracking(True)
         self.setToolTip(
@@ -42,6 +44,10 @@ class MatrixMap(QWidget):
 
     def set_state_provider(self, provider):
         self._state_provider = provider
+        self.update()
+
+    def set_marker_provider(self, provider):
+        self._marker_provider = provider
         self.update()
 
     def set_selected(self, row: int, col: int):
@@ -101,6 +107,38 @@ class MatrixMap(QWidget):
         for index in range(MATRIX_ROWS + 1):
             y = y0 + index * cell
             painter.drawLine(QPointF(x0, y), QPointF(x0 + grid_w, y))
+
+        # PX feature markers. T marks PX_TST_EN=1, B marks the active-low
+        # buffer setting PX_BUF_NEN=0. These describe the currently edited
+        # 32-bit matrix word and are independent of the state color.
+        if self._marker_provider is not None and cell >= 6.0:
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            marker_font = QFont(self.font())
+            marker_font.setPixelSize(max(5, min(8, int(cell * 0.52))))
+            marker_font.setBold(True)
+            painter.setFont(marker_font)
+            painter.setPen(QColor(c["text_strong"]))
+            for row in range(MATRIX_ROWS):
+                for col in OWNED_COLUMNS:
+                    tst_enabled, buf_enabled_marker = self._marker_provider(row, col)
+                    if not tst_enabled and not buf_enabled_marker:
+                        continue
+                    x = x0 + col * cell
+                    y = y0 + row * cell
+                    half = cell / 2.0
+                    if tst_enabled:
+                        painter.drawText(
+                            QRectF(x + 0.5, y, half, cell),
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                            "T",
+                        )
+                    if buf_enabled_marker:
+                        painter.drawText(
+                            QRectF(x + half - 0.5, y, half - 0.5, cell),
+                            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                            "B",
+                        )
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, False)
 
         # Strong separator between the two physical halves.
         sep_pen = QPen(QColor(c["text_strong"]))
@@ -229,6 +267,7 @@ class MatrixPage(QWidget):
 
         self.matrix_map = MatrixMap()
         self.matrix_map.set_state_provider(self.pixel_state)
+        self.matrix_map.set_marker_provider(self.pixel_markers)
         map_card.layout_.addWidget(self.matrix_map, 1)
 
         legend = QHBoxLayout()
@@ -243,6 +282,9 @@ class MatrixPage(QWidget):
         self.legend_written = QLabel("Written to chip")
         self.legend_written.setObjectName("MatrixLegendWritten")
         legend.addWidget(self.legend_written)
+        marker_legend = QLabel("T: PX_TST_EN=1   B: PX_BUF_NEN=0")
+        marker_legend.setObjectName("Muted")
+        legend.addWidget(marker_legend)
         legend.addStretch(1)
         map_card.layout_.addLayout(legend)
         body.addWidget(map_card, 0, 0, 2, 1)
@@ -279,10 +321,18 @@ class MatrixPage(QWidget):
 
         raw_row = QHBoxLayout()
         raw_row.addWidget(QLabel("Raw 32-bit value"))
-        self.raw_value = QLabel("0x00000000")
-        self.raw_value.setObjectName("SectionTitle")
-        raw_row.addWidget(self.raw_value)
-        raw_row.addStretch(1)
+        self.raw_value = QLineEdit("0x00000000")
+        self.raw_value.setPlaceholderText("0x00000000")
+        self.raw_value.setMaxLength(10)
+        self.raw_value.setToolTip(
+            "Enter the complete 32-bit PX word in hexadecimal, for example 0x1234ABCD."
+        )
+        self.send_raw = QPushButton("Send RAW to selected")
+        self.send_raw.setToolTip(
+            "Stage this exact 32-bit word for the selected pixel in MGPDLab virtual memory."
+        )
+        raw_row.addWidget(self.raw_value, 1)
+        raw_row.addWidget(self.send_raw)
         field_card.layout_.addLayout(raw_row)
 
         self.pixel_status = QLabel("Unknown - no pixel readback in protocol")
@@ -298,9 +348,14 @@ class MatrixPage(QWidget):
         )
         self.stage_selected = QPushButton("Update selected in UPO")
         self.stage_selected.setObjectName("PrimaryButton")
+        self.stage_local = QPushButton("Update all local edits in UPO")
+        self.stage_local.setToolTip(
+            "Stage every pixel currently marked Local edit, keeping each pixel's own PX value."
+        )
         editor_buttons.addWidget(self.load_defaults)
         editor_buttons.addWidget(self.clear_local)
         editor_buttons.addWidget(self.stage_selected)
+        editor_buttons.addWidget(self.stage_local)
         field_card.layout_.addLayout(editor_buttons)
         body.addWidget(field_card, 0, 1)
 
@@ -355,6 +410,8 @@ class MatrixPage(QWidget):
         self._connected = bool(connected)
         for widget in (
             self.stage_selected,
+            self.stage_local,
+            self.send_raw,
             self.stage_all,
             self.write_chip,
         ):
@@ -381,6 +438,38 @@ class MatrixPage(QWidget):
     def current_raw_value(self) -> int:
         values = {name: edit.value() for name, edit in self.field_edits.items()}
         return PIXEL_CODEC.pack(values)
+
+    def raw_input_value(self) -> int:
+        text = self.raw_value.text().strip().replace("_", "")
+        if not text:
+            raise ValueError("RAW pixel configuration is empty")
+        try:
+            if text.lower().startswith("0x"):
+                raw = int(text, 16)
+            else:
+                raw = int(text, 16)
+        except ValueError as error:
+            raise ValueError(
+                "RAW pixel configuration must be a 32-bit hexadecimal value "
+                "such as 0x1234ABCD"
+            ) from error
+        PIXEL_CODEC.validate_raw(raw)
+        return raw
+
+    def local_edits(self) -> dict[tuple[int, int], int]:
+        return {
+            coord: self._values[coord]
+            for coord in sorted(self._local_dirty)
+        }
+
+    def pixel_markers(self, row: int, col: int) -> tuple[bool, bool]:
+        if col not in OWNED_COLUMNS:
+            return False, False
+        raw = self._values.get((row, col), DEFAULT_PIXEL_CONFIG)
+        tst = PIXEL_CODEC.extract(raw, "PX_TST_EN") == 1
+        # BUF_NEN is active-low, therefore B is shown for value 0.
+        buf = PIXEL_CODEC.extract(raw, "PX_BUF_NEN") == 0
+        return tst, buf
 
     def pixel_state(self, row: int, col: int) -> str:
         coord = (row, col)
@@ -459,15 +548,14 @@ class MatrixPage(QWidget):
 
     def clear_local_edits(self):
         """Discard every PX edit not yet staged to MGPDLab virtual memory."""
-        if not self._local_dirty:
-            return
-
         for coord in tuple(self._local_dirty):
             self._values[coord] = self._local_baseline.get(
                 coord, DEFAULT_PIXEL_CONFIG
             )
 
         self._local_dirty.clear()
+        # Also refresh the RAW editor so an unsent manually typed word does not
+        # remain visible after Clear.
         self.select_pixel(*self.current_coordinate())
         self.matrix_map.update()
 
@@ -483,6 +571,8 @@ class MatrixPage(QWidget):
         busy = bool(busy)
         enabled = self._connected and not busy
         self.stage_selected.setEnabled(enabled)
+        self.stage_local.setEnabled(enabled)
+        self.send_raw.setEnabled(enabled)
         self.stage_all.setEnabled(enabled)
         self.write_chip.setEnabled(enabled)
         self.row_spin.setEnabled(not busy)
@@ -491,6 +581,7 @@ class MatrixPage(QWidget):
             edit.setEnabled(not busy)
         self.load_defaults.setEnabled(not busy)
         self.clear_local.setEnabled(not busy)
+        self.raw_value.setEnabled(not busy)
 
     def apply_selected_stage_result(self, result: dict):
         row = int(result["row"])
@@ -501,7 +592,27 @@ class MatrixPage(QWidget):
         self._upo_values[coord] = value
         self._local_baseline[coord] = value
         self._local_dirty.discard(coord)
-        self._refresh_selected_status()
+        if self.current_coordinate() == coord:
+            self.select_pixel(row, col)
+        else:
+            self._refresh_selected_status()
+        self.matrix_map.update()
+
+    def apply_local_stage_result(self, result: dict):
+        pixels = result.get("pixels", [])
+        for item in pixels:
+            row = int(item["row"])
+            col = int(item["col"])
+            value = int(item["value"])
+            coord = (row, col)
+            self._values[coord] = value
+            self._upo_values[coord] = value
+            self._local_baseline[coord] = value
+            self._local_dirty.discard(coord)
+        count = int(result.get("count", len(pixels)))
+        self.progress.setValue(count)
+        self.progress.setFormat(f"Staged {count} local edit(s) in UPO")
+        self.select_pixel(*self.current_coordinate())
         self.matrix_map.update()
 
     def apply_bulk_stage_result(self, result: dict):

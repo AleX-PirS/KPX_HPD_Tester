@@ -30,6 +30,8 @@ class StandController(QObject):
     generator_output_changed = pyqtSignal(int, bool)  # physical output 1..4, enabled
     amux_sweep_progress = pyqtSignal(int, int, str)  # current, total, signal
     pixel_matrix_progress = pyqtSignal(int, int, int, int)  # current, total, row, col
+    fclk_changed = pyqtSignal(object)  # int MHz or None when unknown/disconnected
+    ctrl_state_changed = pyqtSignal(object, object)  # static state 0/1/None, PWM enabled bool/None
 
     def __init__(self):
         super().__init__()
@@ -37,6 +39,8 @@ class StandController(QObject):
         self.cfg: Configuration | None = None
         self.matrix_cfg: PixelMatrixConfiguration | None = None
         self._fclk_mhz: int | None = None
+        self._ctrl_static_state: int | None = None
+        self._ctrl_pwm_enabled: bool | None = None
         self.osc: Oscilloscope | None = None
         self.gen: TwoChannelGenerator | None = None
         self._gen_output_states: dict[int, bool] = {1: False, 2: False, 3: False, 4: False}
@@ -84,6 +88,10 @@ class StandController(QObject):
         # The new protocol has SET_FCLK but no matching GET_FCLK command, so
         # the actual clock state is unknown immediately after connection.
         self._fclk_mhz = None
+        self._ctrl_static_state = None
+        self._ctrl_pwm_enabled = None
+        self.fclk_changed.emit(None)
+        self.ctrl_state_changed.emit(None, None)
 
         self.status_changed.emit("chip", True, f"{host}:{port}")
         self._log("INFO", f"Chip connected: {host}:{port}")
@@ -102,7 +110,11 @@ class StandController(QObject):
                 self.cfg = None
                 self.matrix_cfg = None
                 self._fclk_mhz = None
+                self._ctrl_static_state = None
+                self._ctrl_pwm_enabled = None
 
+        self.fclk_changed.emit(None)
+        self.ctrl_state_changed.emit(None, None)
         self.status_changed.emit("chip", False, "Disconnected")
         if not silent:
             self._log("INFO", "Chip disconnected")
@@ -205,6 +217,7 @@ class StandController(QObject):
         if not self.client.set_fclk(frequency_mhz):
             raise RuntimeError(f"Failed to set FCLK={frequency_mhz} MHz")
         self._fclk_mhz = int(frequency_mhz)
+        self.fclk_changed.emit(self._fclk_mhz)
         if frequency_mhz == 0:
             self._log(
                 "WARNING",
@@ -213,6 +226,18 @@ class StandController(QObject):
         else:
             self._log("INFO", f"FCLK <- {frequency_mhz} MHz OK")
         return self._fclk_mhz
+
+    def toggle_fclk(self, enable_frequency_mhz: int = 100) -> int:
+        """Toggle FCLK between 0 and the selected non-zero frequency.
+
+        If the current FCLK state is unknown, the first toggle establishes a
+        known ON state using enable_frequency_mhz.
+        """
+        if enable_frequency_mhz == 0:
+            raise ValueError("enable_frequency_mhz must be non-zero")
+        if self._fclk_mhz is not None and self._fclk_mhz > 0:
+            return self.set_fclk(0)
+        return self.set_fclk(int(enable_frequency_mhz))
 
     def stage_pixel_config(self, row: int, col: int, raw_config: int) -> dict:
         """Update one owned pixel in MGPDLab virtual memory only."""
@@ -232,6 +257,33 @@ class StandController(QObject):
             "MGPDLab GUI until UPO is restarted.",
         )
         return {"row": row, "col": col, "value": raw_config}
+
+    def stage_pixel_configs(self, pixel_configs: dict[tuple[int, int], int]) -> dict:
+        """Stage all supplied per-pixel PX values in MGPDLab virtual memory."""
+        self._require_fclk_for_configuration()
+        matrix = self._require_matrix()
+        pixel_configs = dict(pixel_configs)
+        if not pixel_configs:
+            return {"pixels": [], "count": 0}
+
+        def progress(current: int, total: int, row: int, col: int):
+            self.pixel_matrix_progress.emit(current, total, row, col)
+
+        count = matrix.set_pixels(pixel_configs, progress_callback=progress)
+        pixels = [
+            {"row": row, "col": col, "value": raw}
+            for (row, col), raw in sorted(pixel_configs.items())
+        ]
+        self._log(
+            "INFO",
+            f"Staged {count} locally edited matrix pixel(s) in UPO",
+        )
+        self._log(
+            "WARNING",
+            "Pixels changed through SET_PIXEL_CFG are no longer controlled by the "
+            "MGPDLab GUI until UPO is restarted.",
+        )
+        return {"pixels": pixels, "count": count}
 
     def stage_owned_matrix(self, raw_config: int) -> dict:
         """Load one config into every owned pixel (Rows 0..31, Cols 16..31)."""
@@ -320,23 +372,68 @@ class StandController(QObject):
 
     def set_ctrl_static(self, state: int) -> bool:
         cfg = self._require_chip()
-        ok = cfg.set_ctrl(state)
-        if not ok:
+        if not cfg.set_ctrl(state):
             raise RuntimeError(f"Failed to set CTRL={state}")
-        self._log("INFO", f"CTRL <- {state} OK")
+        self._ctrl_static_state = int(state)
+        self._ctrl_pwm_enabled = False
+        self.ctrl_state_changed.emit(self._ctrl_static_state, self._ctrl_pwm_enabled)
+        self._log("INFO", f"CTRL <- static {state} OK")
         return True
+
+    def toggle_ctrl_static(self) -> int:
+        """Toggle CTRL static state 0/1. Entering static mode disables PWM.
+
+        With an unknown initial state the first click establishes static 0;
+        subsequent clicks alternate 0 -> 1 -> 0.
+        """
+        if self._ctrl_static_state not in (0, 1):
+            target = 0
+        else:
+            target = 0 if self._ctrl_static_state == 1 else 1
+        self.set_ctrl_static(target)
+        return target
 
     def set_ctrl_pwm(self, frequency_khz: int, width_ns: int) -> float:
         cfg = self._require_chip()
         if not cfg.set_ctrl_pwm(frequency_khz, width_ns):
             raise RuntimeError("Failed to set CTRL PWM")
         real_frequency = MGPDClient.ctrl_pwm_real_frequency_khz(frequency_khz)
+        self._ctrl_pwm_enabled = True
+        self.ctrl_state_changed.emit(self._ctrl_static_state, self._ctrl_pwm_enabled)
         self._log(
             "INFO",
             f"CTRL PWM <- F={frequency_khz} kHz, W={width_ns} ns "
             f"(real F={real_frequency:g} kHz) OK",
         )
         return real_frequency
+
+    def disable_ctrl_pwm(self) -> int:
+        """Exit PWM mode by returning CTRL to the last known static state.
+
+        The protocol has no dedicated PWM-OFF command, so SET_CTRL_PIN 0/1 is
+        the only supported way to leave PWM. If no static state has been set in
+        this GUI session, 0 is used as the safe fallback.
+        """
+        fallback = self._ctrl_static_state if self._ctrl_static_state in (0, 1) else 0
+        self.set_ctrl_static(fallback)
+        self._log("INFO", f"CTRL PWM disabled -> static {fallback}")
+        return fallback
+
+    def toggle_ctrl_pwm(self, frequency_khz: int, width_ns: int) -> dict:
+        if self._ctrl_pwm_enabled is True:
+            static_state = self.disable_ctrl_pwm()
+            return {
+                "pwm_enabled": False,
+                "static_state": static_state,
+                "real_frequency_khz": None,
+            }
+
+        real_frequency = self.set_ctrl_pwm(frequency_khz, width_ns)
+        return {
+            "pwm_enabled": True,
+            "static_state": self._ctrl_static_state,
+            "real_frequency_khz": real_frequency,
+        }
 
     # --------------------------------------------------------------- oscilloscope
 
@@ -388,12 +485,15 @@ class StandController(QObject):
         signals_to_save: tuple[str, ...] | list[str],
         osc_channel: int,
         delay_s: float = 0.1,
+        disable_fclk_during_capture: bool = False,
     ) -> dict:
         """Capture one oscilloscope waveform for each selected AMUX signal.
 
         The current oscilloscope configuration is intentionally left untouched.
         The AMUX state present before the sweep is restored even if acquisition
-        fails part-way through the sequence.
+        fails part-way through the sequence. Optionally FCLK is forced to 0 for
+        the settling delay and waveform capture, then restored before the next
+        AMUX switch.
         """
         cfg = self._require_chip()
         self._require_fclk_for_configuration()
@@ -416,12 +516,32 @@ class StandController(QObject):
             shutil.rmtree(sweep_dir)
         sweep_dir.mkdir(parents=True, exist_ok=True)
 
+        if disable_fclk_during_capture and self._fclk_mhz is None:
+            # With no GET_FCLK command there is no way to recover an unknown
+            # frequency. Establish the requested deterministic 100 MHz fallback
+            # before the first AMUX switch, then use it for every restore.
+            self.set_fclk(100)
+            self._log(
+                "INFO",
+                "FCLK state was unknown; established 100 MHz before AMUX sweep",
+            )
+
         # Preserve the exact raw TEST_MUX state, not only the decoded one-hot
         # signal. This lets us restore even a non-standard/invalid mux state.
         mux_addresses = [addr for addr, _, _ in cfg.regs_fields["TEST_MUX"]]
         mux_cache = cfg.read_registers(mux_addresses)
         previous_amux_raw = cfg.get_data("TEST_MUX", register_cache=mux_cache)
         previous_amux_name = cfg.get_amux(register_cache=mux_cache)
+
+        # There is no GET_FCLK command. If this GUI knows the active non-zero
+        # frequency, restore that value after every capture. Otherwise use the
+        # requested project fallback of 100 MHz.
+        fclk_restore_mhz = (
+            self._fclk_mhz
+            if self._fclk_mhz is not None and self._fclk_mhz > 0
+            else 100
+        )
+        fclk_is_temporarily_off = False
 
         captured: dict[str, dict] = {}
         primary_error: Exception | None = None
@@ -436,6 +556,17 @@ class StandController(QObject):
                     raise RuntimeError(f"Failed to set AMUX={signal}")
                 self._log("INFO", f"AMUX sweep {index}/{total}: {signal}")
 
+                if disable_fclk_during_capture:
+                    # Required ordering: select AMUX while FCLK is running, then
+                    # force FCLK low, wait for analog settling, capture, and
+                    # restore FCLK before changing AMUX again.
+                    self.set_fclk(0)
+                    fclk_is_temporarily_off = True
+                    self._log(
+                        "INFO",
+                        f"AMUX {signal}: FCLK OFF for settling/capture",
+                    )
+
                 if delay_s > 0:
                     time.sleep(delay_s)
 
@@ -444,6 +575,14 @@ class StandController(QObject):
                 voltage, x_origin, x_increment = osc.read_waveform(osc_channel)
                 if not voltage:
                     raise RuntimeError(f"Empty waveform from CH{osc_channel}.")
+
+                if disable_fclk_during_capture:
+                    self.set_fclk(int(fclk_restore_mhz))
+                    fclk_is_temporarily_off = False
+                    self._log(
+                        "INFO",
+                        f"AMUX {signal}: FCLK restored to {fclk_restore_mhz} MHz",
+                    )
 
                 raw_path = sweep_dir / f"{signal}.csv"
                 with raw_path.open("w", newline="", encoding="utf-8") as file:
@@ -475,13 +614,32 @@ class StandController(QObject):
             primary_error = error
 
         finally:
+            # If acquisition failed while the clock was forced low, re-enable it
+            # before restoring TEST_MUX. AMUX/register writes require FCLK.
+            if disable_fclk_during_capture and fclk_is_temporarily_off:
+                try:
+                    self.set_fclk(int(fclk_restore_mhz))
+                    fclk_is_temporarily_off = False
+                    self._log(
+                        "INFO",
+                        f"FCLK restored to {fclk_restore_mhz} MHz after sweep interruption",
+                    )
+                except Exception as error:
+                    restore_error = error
+                    self._log("ERROR", f"FCLK restore failed: {error}")
+
             try:
                 if not cfg.set_data("TEST_MUX", previous_amux_raw):
                     raise RuntimeError("Failed to restore previous TEST_MUX state")
                 restored = previous_amux_name or f"raw 0x{previous_amux_raw:X}"
                 self._log("INFO", f"AMUX restored to {restored}")
             except Exception as error:
-                restore_error = error
+                if restore_error is None:
+                    restore_error = error
+                else:
+                    restore_error = RuntimeError(
+                        f"{restore_error}; AMUX restore also failed: {error}"
+                    )
                 self._log("ERROR", f"AMUX restore failed: {error}")
 
         if primary_error is not None:
@@ -555,6 +713,8 @@ class StandController(QObject):
             "signals": signals,
             "osc_channel": osc_channel,
             "delay_s": delay_s,
+            "disable_fclk_during_capture": bool(disable_fclk_during_capture),
+            "fclk_restore_mhz": int(fclk_restore_mhz) if disable_fclk_during_capture else None,
             "time_s": time_axis,
             "waveforms": waveforms,
             "combined_csv": combined_csv,

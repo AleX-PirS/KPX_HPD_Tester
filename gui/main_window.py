@@ -61,6 +61,31 @@ def _title_block(title: str, subtitle: str) -> QWidget:
     return widget
 
 
+def _set_state_button(
+    button: QPushButton,
+    state: bool | None,
+    text_on: str,
+    text_off: str,
+    text_unknown: str,
+):
+    """Reuse the generator output-state palette for other binary controls."""
+    if state is None:
+        prop = "unknown"
+        text = text_unknown
+    elif state:
+        prop = "on"
+        text = text_on
+    else:
+        prop = "off"
+        text = text_off
+    button.setProperty("outputState", prop)
+    button.setText(text)
+    style = button.style()
+    style.unpolish(button)
+    style.polish(button)
+    button.update()
+
+
 # =============================================================================
 # Connections page
 # =============================================================================
@@ -205,11 +230,31 @@ class ChipPage(QWidget):
         actions.layout_.addWidget(note)
         top.addWidget(actions, 0, 1)
 
-        # CTRL
+        # CTRL - static toggling and PWM are separate actions. The protocol has
+        # no dedicated PWM-OFF command, so disabling PWM returns to the last
+        # known static state (0 if none has been set in this GUI session).
         ctrl = Card("CTRL pin")
-        ctrl_row = QHBoxLayout()
-        self.ctrl_mode = QComboBox()
-        self.ctrl_mode.addItems(["Static 0", "Static 1", "PWM"])
+
+        static_row = QHBoxLayout()
+        static_row.addWidget(QLabel("Static"))
+        self.ctrl_static_toggle = QPushButton()
+        self.ctrl_static_toggle.setMinimumHeight(36)
+        _set_state_button(
+            self.ctrl_static_toggle,
+            None,
+            "CTRL static: 1",
+            "CTRL static: 0",
+            "CTRL static: unknown - toggle",
+        )
+        self.ctrl_static_note = QLabel("Click to switch 0 -> 1 -> 0. Static command exits PWM.")
+        self.ctrl_static_note.setObjectName("Muted")
+        static_row.addWidget(self.ctrl_static_toggle)
+        static_row.addWidget(self.ctrl_static_note)
+        static_row.addStretch(1)
+        ctrl.layout_.addLayout(static_row)
+
+        pwm_row = QHBoxLayout()
+        pwm_row.addWidget(QLabel("PWM"))
         self.ctrl_freq = QSpinBox()
         self.ctrl_freq.setRange(100, 50000)
         self.ctrl_freq.setSingleStep(10)
@@ -220,38 +265,56 @@ class ChipPage(QWidget):
         self.ctrl_width.setSingleStep(10)
         self.ctrl_width.setValue(70)
         self.ctrl_width.setSuffix(" ns")
-        self.ctrl_apply = QPushButton("Apply CTRL")
+        self.ctrl_pwm_toggle = QPushButton()
+        self.ctrl_pwm_toggle.setMinimumHeight(36)
+        _set_state_button(
+            self.ctrl_pwm_toggle,
+            None,
+            "PWM: ON",
+            "PWM: OFF",
+            "PWM: unknown - click ON",
+        )
         self.ctrl_real = QLabel("")
         self.ctrl_real.setObjectName("Muted")
-        ctrl_row.addWidget(self.ctrl_mode)
-        ctrl_row.addWidget(self.ctrl_freq)
-        ctrl_row.addWidget(self.ctrl_width)
-        ctrl_row.addWidget(self.ctrl_apply)
-        ctrl_row.addWidget(self.ctrl_real)
-        ctrl_row.addStretch(1)
-        ctrl.layout_.addLayout(ctrl_row)
+        pwm_row.addWidget(self.ctrl_freq)
+        pwm_row.addWidget(self.ctrl_width)
+        pwm_row.addWidget(self.ctrl_pwm_toggle)
+        pwm_row.addWidget(self.ctrl_real)
+        pwm_row.addStretch(1)
+        ctrl.layout_.addLayout(pwm_row)
         root.addWidget(ctrl)
 
-        # FCLK - MGPDLab v2.01 SET_FCLK command. There is no readback command,
-        # therefore the current value is known only after this GUI sets it.
+        # FCLK - non-zero frequencies live in the combo. FCLK=0 is a separate
+        # toggle action so turning the clock off never requires selecting 0 from
+        # the frequency list. There is no protocol readback after connection.
         fclk = Card("Chip FCLK")
         fclk_row = QHBoxLayout()
         self.fclk_value = QComboBox()
-        for frequency in (0, 1, 5, 10, 25, 50, 75, 100, 125, 150):
+        for frequency in (1, 5, 10, 25, 50, 75, 100, 125, 150):
             self.fclk_value.addItem(f"{frequency} MHz", frequency)
         self.fclk_value.setCurrentIndex(self.fclk_value.findData(100))
-        self.fclk_apply = QPushButton("Apply FCLK")
+        self.fclk_apply = QPushButton("Apply frequency")
         self.fclk_apply.setObjectName("PrimaryButton")
+        self.fclk_toggle = QPushButton()
+        self.fclk_toggle.setMinimumHeight(36)
+        _set_state_button(
+            self.fclk_toggle,
+            None,
+            "FCLK: ON",
+            "FCLK: OFF",
+            "FCLK: unknown - click ON",
+        )
         self.fclk_current = QLabel("Current: unknown")
         self.fclk_current.setObjectName("Muted")
         fclk_row.addWidget(self.fclk_value)
         fclk_row.addWidget(self.fclk_apply)
+        fclk_row.addWidget(self.fclk_toggle)
         fclk_row.addWidget(self.fclk_current)
         fclk_row.addStretch(1)
         fclk.layout_.addLayout(fclk_row)
         fclk_note = QLabel(
-            "0 MHz forces FCLK low. If FCLK is disabled, re-enable it before "
-            "changing chip registers or pixel configuration."
+            "FCLK OFF sends SET_FCLK 0. Turning it back ON uses the frequency selected above. "
+            "If the actual state is unknown after connection, the first ON establishes a known state."
         )
         fclk_note.setObjectName("Muted")
         fclk_note.setWordWrap(True)
@@ -278,9 +341,6 @@ class ChipPage(QWidget):
         self.amux_combo.currentIndexChanged.connect(self._update_amux_pending)
         self.search.textChanged.connect(self._apply_filter)
         self.group_filter.currentTextChanged.connect(self._apply_filter)
-        self.ctrl_mode.currentTextChanged.connect(self._ctrl_mode_changed)
-        self._ctrl_mode_changed(self.ctrl_mode.currentText())
-
         self.set_connected(False)
 
     def set_connected(self, connected: bool):
@@ -288,8 +348,10 @@ class ChipPage(QWidget):
             self.apply_changes,
             self.read_chip,
             self.load_defaults,
-            self.ctrl_apply,
+            self.ctrl_static_toggle,
+            self.ctrl_pwm_toggle,
             self.fclk_apply,
+            self.fclk_toggle,
             self.amux_combo,
         ):
             widget.setEnabled(connected)
@@ -304,10 +366,49 @@ class ChipPage(QWidget):
     def _apply_filter(self):
         self.table.filter_rows(self.search.text(), self.group_filter.currentText())
 
-    def _ctrl_mode_changed(self, text: str):
-        pwm = text == "PWM"
-        self.ctrl_freq.setEnabled(pwm)
-        self.ctrl_width.setEnabled(pwm)
+    def set_ctrl_state(self, static_state: int | None, pwm_enabled: bool | None):
+        static_bool = None if static_state not in (0, 1) else bool(static_state)
+        _set_state_button(
+            self.ctrl_static_toggle,
+            static_bool,
+            "CTRL static: 1",
+            "CTRL static: 0",
+            "CTRL static: unknown - toggle",
+        )
+        _set_state_button(
+            self.ctrl_pwm_toggle,
+            pwm_enabled,
+            "PWM: ON",
+            "PWM: OFF",
+            "PWM: unknown - click ON",
+        )
+        if pwm_enabled is False:
+            self.ctrl_real.setText("")
+
+    def set_fclk_state(self, frequency_mhz: int | None):
+        if frequency_mhz is None:
+            _set_state_button(
+                self.fclk_toggle, None, "FCLK: ON", "FCLK: OFF", "FCLK: unknown - click ON"
+            )
+            self.fclk_current.setText("Current: unknown")
+            return
+
+        frequency_mhz = int(frequency_mhz)
+        enabled = frequency_mhz > 0
+        _set_state_button(
+            self.fclk_toggle,
+            enabled,
+            "FCLK: ON",
+            "FCLK: OFF",
+            "FCLK: unknown - click ON",
+        )
+        self.fclk_current.setText(
+            f"Current: {frequency_mhz} MHz" if enabled else "Current: 0 MHz (OFF)"
+        )
+        if enabled:
+            index = self.fclk_value.findData(frequency_mhz)
+            if index >= 0:
+                self.fclk_value.setCurrentIndex(index)
 
     def set_snapshot(self, snapshot: dict):
         fields = snapshot["fields"]
@@ -382,15 +483,15 @@ class OscilloscopePage(QWidget):
         acq = Card("Acquisition")
         form = QFormLayout()
         self.avg_enabled = QCheckBox("Averaging enabled")
-        self.avg_enabled.setChecked(True)
+        self.avg_enabled.setChecked(False)
         self.avg_count = QSpinBox()
         self.avg_count.setRange(1, 65536)
         self.avg_count.setValue(2)
         self.waveform_points = QSpinBox()
         self.waveform_points.setRange(100, 10_000_000)
         self.waveform_points.setValue(20000)
-        self.common_scale = FloatEdit(0.25)
-        self.common_offset = FloatEdit(0.0)
+        self.common_scale = FloatEdit(0.2)
+        self.common_offset = FloatEdit(0.4)
         form.addRow("", self.avg_enabled)
         form.addRow("Average count", self.avg_count)
         form.addRow("Waveform points", self.waveform_points)
@@ -401,13 +502,13 @@ class OscilloscopePage(QWidget):
 
         time_card = Card("Timebase / trigger")
         form = QFormLayout()
-        self.time_scale = FloatEdit(20e-9)
+        self.time_scale = FloatEdit(250e-9)
         self.time_offset = FloatEdit(0.0)
         self.trigger_enabled = QCheckBox("Trigger enabled")
-        self.trigger_enabled.setChecked(True)
+        self.trigger_enabled.setChecked(False)
         self.trigger_source = QComboBox()
         self.trigger_source.addItems(["1", "2", "3", "4"])
-        self.trigger_level = FloatEdit(0.05)
+        self.trigger_level = FloatEdit(0.2)
         self.trigger_slope = QComboBox()
         self.trigger_slope.addItems(["POS", "NEG"])
         form.addRow("Time scale, s/div", self.time_scale)
@@ -431,17 +532,18 @@ class OscilloscopePage(QWidget):
         self.channel_widgets: dict[int, dict] = {}
         for row, channel in enumerate(range(1, 5), start=1):
             enabled = QCheckBox()
-            enabled.setChecked(channel in (1, 2, 3))
+            enabled.setChecked(channel == 1)
             ch_label = QLabel(f"CH{channel}")
             mode = QComboBox()
             mode.addItem("DC / 1 MΩ", "DC")
             mode.addItem("DC / 50 Ω", "DC50")
             mode.addItem("AC / 1 MΩ", "AC")
+            mode.setCurrentIndex(mode.findData("DC50"))
             scale_override = QCheckBox()
-            scale = FloatEdit(0.25)
+            scale = FloatEdit(0.2)
             scale.setEnabled(False)
             offset_override = QCheckBox()
-            offset = FloatEdit(0.0)
+            offset = FloatEdit(0.4)
             offset.setEnabled(False)
             scale_override.toggled.connect(scale.setEnabled)
             offset_override.toggled.connect(offset.setEnabled)
@@ -501,7 +603,7 @@ class OscilloscopePage(QWidget):
         save_channels.addWidget(QLabel("CSV channels"))
         for ch in range(1, 5):
             box = QCheckBox(f"CH{ch}")
-            box.setChecked(ch in (1, 2, 3))
+            box.setChecked(ch == 1)
             self.save_checks[ch] = box
             save_channels.addWidget(box)
         self.use_active_save = QPushButton("Use active")
@@ -606,7 +708,7 @@ class GeneratorChannelCard(Card):
         form = QFormLayout()
         self.shape = QComboBox()
         self.shape.addItems(["SIN", "SQU", "PULS", "RAMP", "NOIS", "USER", "DC"])
-        self.frequency = FloatEdit(1e6)
+        self.frequency = FloatEdit(100e3)
         self.amplitude = FloatEdit(0.5)
         self.offset = FloatEdit(0.0)
 
@@ -864,6 +966,8 @@ class MainWindow(QMainWindow):
         self.controller.generator_output_changed.connect(self.gen.set_output_state)
         self.controller.amux_sweep_progress.connect(self.visualize.set_sweep_progress)
         self.controller.pixel_matrix_progress.connect(self.matrix.set_matrix_progress)
+        self.controller.fclk_changed.connect(self.chip.set_fclk_state)
+        self.controller.ctrl_state_changed.connect(self.chip.set_ctrl_state)
 
         c = self.connections
         c.chip_connect.clicked.connect(self._connect_chip)
@@ -876,10 +980,14 @@ class MainWindow(QMainWindow):
         self.chip.read_chip.clicked.connect(self._read_chip)
         self.chip.apply_changes.clicked.connect(self._apply_chip)
         self.chip.load_defaults.clicked.connect(self._load_defaults)
-        self.chip.ctrl_apply.clicked.connect(self._apply_ctrl)
+        self.chip.ctrl_static_toggle.clicked.connect(self._toggle_ctrl_static)
+        self.chip.ctrl_pwm_toggle.clicked.connect(self._toggle_ctrl_pwm)
         self.chip.fclk_apply.clicked.connect(self._apply_fclk)
+        self.chip.fclk_toggle.clicked.connect(self._toggle_fclk)
 
         self.matrix.stage_selected.clicked.connect(self._stage_selected_pixel)
+        self.matrix.stage_local.clicked.connect(self._stage_local_pixels)
+        self.matrix.send_raw.clicked.connect(self._send_raw_pixel)
         self.matrix.stage_all.clicked.connect(self._stage_owned_matrix)
         self.matrix.write_chip.clicked.connect(self._write_pixel_matrix)
 
@@ -926,7 +1034,8 @@ class MainWindow(QMainWindow):
             self.matrix.set_connected(connected)
             self.visualize.set_chip_connected(connected)
             if not connected:
-                self.chip.fclk_current.setText("Current: unknown")
+                self.chip.set_fclk_state(None)
+                self.chip.set_ctrl_state(None, None)
         elif device == "osc":
             self.connections.osc_connect.setEnabled(not connected)
             self.connections.osc_disconnect.setEnabled(connected)
@@ -978,7 +1087,8 @@ class MainWindow(QMainWindow):
         def connected(snapshot):
             self.chip.set_snapshot(snapshot)
             self.matrix.reset_session()
-            self.chip.fclk_current.setText("Current: unknown")
+            self.chip.set_fclk_state(None)
+            self.chip.set_ctrl_state(None, None)
 
         self._run(
             "Connecting chip...",
@@ -1061,35 +1171,58 @@ class MainWindow(QMainWindow):
             return
         self._run("Loading default chip configuration...", self.controller.load_chip_defaults, self.chip.set_snapshot)
 
-    def _apply_ctrl(self):
-        mode = self.chip.ctrl_mode.currentText()
-        if mode == "Static 0":
-            self._run("Setting CTRL=0...", lambda: self.controller.set_ctrl_static(0))
-        elif mode == "Static 1":
-            self._run("Setting CTRL=1...", lambda: self.controller.set_ctrl_static(1))
-        else:
-            freq = self.chip.ctrl_freq.value()
-            width = self.chip.ctrl_width.value()
+    def _toggle_ctrl_static(self):
+        self.chip.ctrl_static_toggle.setEnabled(False)
 
-            def show_real(value):
-                self.chip.ctrl_real.setText(f"Real F: {value:g} kHz")
+        def finished():
+            self.chip.ctrl_static_toggle.setEnabled(self.controller.client is not None)
 
-            self._run(
-                "Setting CTRL PWM...",
-                lambda: self.controller.set_ctrl_pwm(freq, width),
-                show_real,
-            )
+        self._run(
+            "Toggling CTRL static state...",
+            self.controller.toggle_ctrl_static,
+            on_finished=finished,
+        )
+
+    def _toggle_ctrl_pwm(self):
+        freq = self.chip.ctrl_freq.value()
+        width = self.chip.ctrl_width.value()
+        self.chip.ctrl_pwm_toggle.setEnabled(False)
+
+        def show(result):
+            real = result.get("real_frequency_khz")
+            if result.get("pwm_enabled") and real is not None:
+                self.chip.ctrl_real.setText(f"Real F: {real:g} kHz")
+            elif not result.get("pwm_enabled"):
+                self.chip.ctrl_real.setText("")
+
+        def finished():
+            self.chip.ctrl_pwm_toggle.setEnabled(self.controller.client is not None)
+
+        self._run(
+            "Toggling CTRL PWM...",
+            lambda: self.controller.toggle_ctrl_pwm(freq, width),
+            on_result=show,
+            on_finished=finished,
+        )
 
     def _apply_fclk(self):
         frequency = int(self.chip.fclk_value.currentData())
-
-        def show(value):
-            self.chip.fclk_current.setText(f"Current: {int(value)} MHz")
-
         self._run(
             f"Setting chip FCLK={frequency} MHz...",
             lambda: self.controller.set_fclk(frequency),
-            show,
+        )
+
+    def _toggle_fclk(self):
+        frequency = int(self.chip.fclk_value.currentData())
+        self.chip.fclk_toggle.setEnabled(False)
+
+        def finished():
+            self.chip.fclk_toggle.setEnabled(self.controller.client is not None)
+
+        self._run(
+            "Toggling chip FCLK...",
+            lambda: self.controller.toggle_fclk(frequency),
+            on_finished=finished,
         )
 
     # ---------------------------------------------------------------- matrix
@@ -1100,6 +1233,39 @@ class MainWindow(QMainWindow):
         self.matrix.set_busy(True)
         self._run(
             f"Staging pixel Col={col} Row={row} value=0x{raw:08X} in UPO...",
+            lambda: self.controller.stage_pixel_config(row, col, raw),
+            on_result=self.matrix.apply_selected_stage_result,
+            on_finished=lambda: self.matrix.set_busy(False),
+        )
+
+    def _stage_local_pixels(self):
+        edits = self.matrix.local_edits()
+        if not edits:
+            self.log.append("INFO", "No local matrix edits to stage")
+            return
+
+        self.matrix.set_busy(True)
+        self.matrix.progress.setRange(0, len(edits))
+        self.matrix.progress.setValue(0)
+        self.matrix.progress.setFormat("Starting local-edit update...")
+        self._run(
+            f"Staging {len(edits)} local matrix edit(s) in UPO...",
+            lambda: self.controller.stage_pixel_configs(edits),
+            on_result=self.matrix.apply_local_stage_result,
+            on_finished=lambda: self.matrix.set_busy(False),
+        )
+
+    def _send_raw_pixel(self):
+        row, col = self.matrix.current_coordinate()
+        try:
+            raw = self.matrix.raw_input_value()
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid RAW pixel value", str(error))
+            return
+
+        self.matrix.set_busy(True)
+        self._run(
+            f"Staging RAW pixel Col={col} Row={row} value=0x{raw:08X} in UPO...",
             lambda: self.controller.stage_pixel_config(row, col, raw),
             on_result=self.matrix.apply_selected_stage_result,
             on_finished=lambda: self.matrix.set_busy(False),
@@ -1213,17 +1379,20 @@ class MainWindow(QMainWindow):
         try:
             channel = self.visualize.selected_scope_channel()
             delay_s = self.visualize.settling_delay_s()
+            fclk_off = self.visualize.disable_fclk_during_capture()
         except ValueError as error:
             QMessageBox.warning(self, "Invalid AMUX sweep settings", str(error))
             return
 
         self.visualize.set_sweep_busy(True)
         self._run(
-            f"Starting AMUX sweep: {len(signals)} signal(s) on CH{channel}...",
+            f"Starting AMUX sweep: {len(signals)} signal(s) on CH{channel}"
+            + (" with FCLK OFF during capture..." if fclk_off else "..."),
             lambda: self.controller.run_amux_sweep(
                 signals,
                 osc_channel=channel,
                 delay_s=delay_s,
+                disable_fclk_during_capture=fclk_off,
             ),
             on_result=self.visualize.show_amux_result,
             on_finished=lambda: self.visualize.set_sweep_busy(False),

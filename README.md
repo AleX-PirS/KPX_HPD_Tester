@@ -95,3 +95,20 @@ The GUI contains a **Visualize** page with two hardware-assisted tools:
 - `TEST_CONF_*` registers at `0x8038..0x803B` configure only the standalone test pixel.
 - Matrix code does not read, write, or derive its field definitions from those SPI registers.
 - `Clear local edits` discards GUI-only matrix edits that were not staged to MGPDLab virtual memory.
+
+## Matrix editing additions
+
+- `Update selected in UPO` stages one selected pixel.
+- `Update all local edits in UPO` stages every pixel currently marked `Local edit`, preserving each pixel's individual 32-bit PX word.
+- `Send RAW to selected` accepts a complete hexadecimal 32-bit PX word and stages it directly for the selected pixel.
+- Matrix cells show a small `T` marker when `PX_TST_EN=1` and `B` when the active-low `PX_BUF_NEN=0`.
+
+## FCLK / CTRL GUI controls
+
+- The FCLK frequency combo contains only non-zero supported frequencies. `FCLK` has a separate ON/OFF toggle; OFF sends `SET_FCLK 0` and ON uses the selected frequency.
+- CTRL static mode has a direct 0/1 toggle. PWM has a separate ON/OFF toggle. Because MGPDLab has no dedicated PWM-OFF command, turning PWM off returns CTRL to the last known static state (0 if unknown).
+- AMUX sweep can optionally use `FCLK OFF during capture`: AMUX is selected with clock running, FCLK is forced to 0, the settling delay is applied, the waveform is captured, then FCLK is restored before the next AMUX selection. Unknown FCLK is established/restored as 100 MHz.
+
+## GUI instrument defaults
+
+Oscilloscope GUI defaults: CH1 only, DC 50 ohm coupling selected for all channels, averaging OFF, trigger OFF, trigger level 0.2 V, time scale 250 ns/div, common vertical scale 0.2 V/div, common vertical offset 0.4 V. Generator channel frequency defaults to 100 kHz.

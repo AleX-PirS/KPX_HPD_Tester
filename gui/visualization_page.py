@@ -129,6 +129,15 @@ class VisualizationPage(QWidget):
         form.addRow("AMUX settling delay, s", self.delay_s)
         sweep_card.layout_.addLayout(form)
 
+        self.fclk_off_capture = QCheckBox("FCLK OFF during capture")
+        self.fclk_off_capture.setChecked(False)
+        self.fclk_off_capture.setToolTip(
+            "For each selected AMUX signal: set AMUX, force FCLK to 0, wait the "
+            "settling delay, capture the waveform, then restore FCLK before the next AMUX switch. "
+            "If the previous FCLK frequency is unknown, 100 MHz is used."
+        )
+        sweep_card.layout_.addWidget(self.fclk_off_capture)
+
         signal_actions = QHBoxLayout()
         self.select_all = QPushButton("Select all")
         self.clear_all = QPushButton("Clear")
@@ -294,6 +303,9 @@ class VisualizationPage(QWidget):
             raise ValueError("AMUX settling delay must be >= 0 s")
         return value
 
+    def disable_fclk_during_capture(self) -> bool:
+        return self.fclk_off_capture.isChecked()
+
     # --------------------------------------------------------------- connection
 
     def set_chip_connected(self, connected: bool):
@@ -321,6 +333,7 @@ class VisualizationPage(QWidget):
         self.clear_all.setEnabled(not busy)
         self.scope_channel.setEnabled(not busy)
         self.delay_s.setEnabled(not busy)
+        self.fclk_off_capture.setEnabled(not busy)
 
         if busy:
             self.progress.setRange(0, 0)

@@ -111,6 +111,14 @@ class PixelConfigCodec:
             raise KeyError(f"Unknown pixel field: {name}")
         return self.field_widths[name]
 
+    def extract(self, raw: int, name: str) -> int:
+        """Extract one PX field directly from a packed 32-bit word."""
+        self.validate_raw(raw)
+        if name not in PX_FIELDS:
+            raise KeyError(f"Unknown pixel field: {name}")
+        spec = PX_FIELDS[name]
+        return (raw >> spec.offset) & ((1 << spec.width) - 1)
+
     def default_fields(self) -> dict[str, int]:
         return dict(PX_DEFAULT_FIELD_VALUES)
 
@@ -209,6 +217,36 @@ class PixelMatrixConfiguration:
         self.validate_owned_pixel(row, col)
         PIXEL_CODEC.validate_raw(raw_config)
         return self.client.set_pixel_cfg(row=row, col=col, value=raw_config)
+
+    def set_pixels(
+        self,
+        pixel_configs: Mapping[tuple[int, int], int],
+        progress_callback: Callable[[int, int, int, int], None] | None = None,
+    ) -> int:
+        """Stage individual owned pixels, each with its own 32-bit PX word.
+
+        The operation updates MGPDLab virtual memory only. It deliberately does
+        not call WRITE_TO_CHIP. This is useful for applying a set of local GUI
+        edits without overwriting unchanged pixels with one common value.
+        """
+        items = sorted(
+            ((int(row), int(col), int(raw)) for (row, col), raw in pixel_configs.items()),
+            key=lambda item: (item[0], item[1]),
+        )
+        total = len(items)
+
+        for current, (row, col, raw_config) in enumerate(items, start=1):
+            self.validate_owned_pixel(row, col)
+            PIXEL_CODEC.validate_raw(raw_config)
+            if not self.client.set_pixel_cfg(row=row, col=col, value=raw_config):
+                raise RuntimeError(
+                    f"SET_PIXEL_CFG failed at Col={col} Row={row} "
+                    f"after {current - 1}/{total} successful pixel updates"
+                )
+            if progress_callback is not None:
+                progress_callback(current, total, row, col)
+
+        return total
 
     def set_owned_half(
         self,
