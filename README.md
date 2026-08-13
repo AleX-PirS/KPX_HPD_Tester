@@ -87,3 +87,11 @@ The GUI contains a **Visualize** page with two hardware-assisted tools:
 - **AMUX sweep** - switches only the selected `EO_cfg.AMUX_SIGNALS`, waits the configured settling delay, reads one selected oscilloscope channel without changing the oscilloscope setup, stores temporary raw CSV files under `temp/amux_sweep/`, and creates `combined.csv` plus an in-GUI plot. The previous AMUX state is restored after completion or failure.
 
 `temp/` is runtime-only and ignored by Git. The displayed screenshot/figure and the combined sweep CSV can be exported with Save dialogs.
+
+
+## Matrix / standalone test pixel separation
+
+- Matrix pixel configuration uses independent `PX_*` fields and `SET_PIXEL_CFG`.
+- `TEST_CONF_*` registers at `0x8038..0x803B` configure only the standalone test pixel.
+- Matrix code does not read, write, or derive its field definitions from those SPI registers.
+- `Clear local edits` discards GUI-only matrix edits that were not staged to MGPDLab virtual memory.

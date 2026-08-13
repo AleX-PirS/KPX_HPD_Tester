@@ -14,6 +14,7 @@ from configuration import Configuration
 from generator_cfg import TwoChannelGenerator
 from mgpd import MGPDClient
 from oscilloscope_cfg import Oscilloscope
+from pixel_matrix import PixelMatrixConfiguration
 
 
 class StandController(QObject):
@@ -28,11 +29,14 @@ class StandController(QObject):
     status_changed = pyqtSignal(str, bool, str)  # device, connected, detail
     generator_output_changed = pyqtSignal(int, bool)  # physical output 1..4, enabled
     amux_sweep_progress = pyqtSignal(int, int, str)  # current, total, signal
+    pixel_matrix_progress = pyqtSignal(int, int, int, int)  # current, total, row, col
 
     def __init__(self):
         super().__init__()
         self.client: MGPDClient | None = None
         self.cfg: Configuration | None = None
+        self.matrix_cfg: PixelMatrixConfiguration | None = None
+        self._fclk_mhz: int | None = None
         self.osc: Oscilloscope | None = None
         self.gen: TwoChannelGenerator | None = None
         self._gen_output_states: dict[int, bool] = {1: False, 2: False, 3: False, 4: False}
@@ -76,6 +80,10 @@ class StandController(QObject):
             EO_cfg.REGS_FIELDS,
             EO_cfg.AMUX_MAP,
         )
+        self.matrix_cfg = PixelMatrixConfiguration(client)
+        # The new protocol has SET_FCLK but no matching GET_FCLK command, so
+        # the actual clock state is unknown immediately after connection.
+        self._fclk_mhz = None
 
         self.status_changed.emit("chip", True, f"{host}:{port}")
         self._log("INFO", f"Chip connected: {host}:{port}")
@@ -92,6 +100,8 @@ class StandController(QObject):
             finally:
                 self.client = None
                 self.cfg = None
+                self.matrix_cfg = None
+                self._fclk_mhz = None
 
         self.status_changed.emit("chip", False, "Disconnected")
         if not silent:
@@ -174,6 +184,95 @@ class StandController(QObject):
             raise RuntimeError("Chip is not connected")
         return self.cfg
 
+    def _require_matrix(self) -> PixelMatrixConfiguration:
+        self._require_chip()
+        if self.matrix_cfg is None:
+            raise RuntimeError("Pixel matrix controller is not available")
+        return self.matrix_cfg
+
+    def _require_fclk_for_configuration(self):
+        # There is no GET_FCLK command. Only block operations when this GUI
+        # explicitly set FCLK=0 and therefore knows that the clock is disabled.
+        if self._fclk_mhz == 0:
+            raise RuntimeError(
+                "FCLK is disabled (0 MHz). Re-enable FCLK before changing "
+                "chip registers or pixel configuration."
+            )
+
+    def set_fclk(self, frequency_mhz: int) -> int:
+        self._require_chip()
+        assert self.client is not None
+        if not self.client.set_fclk(frequency_mhz):
+            raise RuntimeError(f"Failed to set FCLK={frequency_mhz} MHz")
+        self._fclk_mhz = int(frequency_mhz)
+        if frequency_mhz == 0:
+            self._log(
+                "WARNING",
+                "FCLK disabled. Re-enable it before changing registers or pixel settings.",
+            )
+        else:
+            self._log("INFO", f"FCLK <- {frequency_mhz} MHz OK")
+        return self._fclk_mhz
+
+    def stage_pixel_config(self, row: int, col: int, raw_config: int) -> dict:
+        """Update one owned pixel in MGPDLab virtual memory only."""
+        self._require_fclk_for_configuration()
+        matrix = self._require_matrix()
+        if not matrix.set_pixel(row=row, col=col, raw_config=raw_config):
+            raise RuntimeError(
+                f"Failed to stage pixel Col={col} Row={row} value=0x{raw_config:08X}"
+            )
+        self._log(
+            "INFO",
+            f"Pixel staged in UPO: Col={col} Row={row} <- 0x{raw_config:08X}",
+        )
+        self._log(
+            "WARNING",
+            "Pixels changed through SET_PIXEL_CFG are no longer controlled by the "
+            "MGPDLab GUI until UPO is restarted.",
+        )
+        return {"row": row, "col": col, "value": raw_config}
+
+    def stage_owned_matrix(self, raw_config: int) -> dict:
+        """Load one config into every owned pixel (Rows 0..31, Cols 16..31)."""
+        self._require_fclk_for_configuration()
+        matrix = self._require_matrix()
+
+        def progress(current: int, total: int, row: int, col: int):
+            self.pixel_matrix_progress.emit(current, total, row, col)
+
+        count = matrix.set_owned_half(raw_config, progress_callback=progress)
+        self._log(
+            "INFO",
+            f"Pixel config 0x{raw_config:08X} staged for owned half: "
+            f"{count} pixels (Cols 16..31)",
+        )
+        self._log(
+            "WARNING",
+            "The 512 pixels updated through SET_PIXEL_CFG are no longer controlled "
+            "by the MGPDLab GUI until UPO is restarted.",
+        )
+        return {"value": raw_config, "count": count}
+
+    def write_pixel_matrix_to_chip(self) -> bool:
+        """Commit MGPDLab's virtual matrix using SET_PIXEL_CFG WRITE_TO_CHIP."""
+        self._require_fclk_for_configuration()
+        matrix = self._require_matrix()
+        if not matrix.write_to_chip():
+            raise RuntimeError("Failed to send SET_PIXEL_CFG WRITE_TO_CHIP")
+        self._log(
+            "INFO",
+            "SET_PIXEL_CFG WRITE_TO_CHIP accepted by UPO. Our code only stages "
+            "Cols 16..31; the protocol-level commit itself writes the complete "
+            "virtual matrix.",
+        )
+        self._log(
+            "WARNING",
+            "MGPDLab reports only command acceptance here; lower-level matrix-load "
+            "errors may be shown in the UPO window.",
+        )
+        return True
+
     def read_chip_snapshot(self) -> dict:
         cfg = self._require_chip()
         register_cache = cfg.read_registers()
@@ -194,6 +293,7 @@ class StandController(QObject):
         amux_signal: str | None = None,
     ) -> dict:
         cfg = self._require_chip()
+        self._require_fclk_for_configuration()
 
         for name, value in changed_fields.items():
             if name == "TEST_MUX":
@@ -212,6 +312,7 @@ class StandController(QObject):
 
     def load_chip_defaults(self) -> dict:
         cfg = self._require_chip()
+        self._require_fclk_for_configuration()
         if not cfg.set_default():
             raise RuntimeError("Failed to load default registers")
         self._log("INFO", "Default chip configuration loaded")
@@ -295,6 +396,7 @@ class StandController(QObject):
         fails part-way through the sequence.
         """
         cfg = self._require_chip()
+        self._require_fclk_for_configuration()
         osc = self._require_osc()
 
         signals = tuple(signals_to_save)

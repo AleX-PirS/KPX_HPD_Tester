@@ -31,6 +31,7 @@ from workers import HardwareTaskRunner
 from .widgets import Card, FloatEdit, LogPanel, OutputStateButton, RegisterTable, StatusBadge
 from .styles import current_theme_colors
 from .visualization_page import VisualizationPage
+from .matrix_page import MatrixPage
 
 
 # =============================================================================
@@ -231,6 +232,32 @@ class ChipPage(QWidget):
         ctrl.layout_.addLayout(ctrl_row)
         root.addWidget(ctrl)
 
+        # FCLK - MGPDLab v2.01 SET_FCLK command. There is no readback command,
+        # therefore the current value is known only after this GUI sets it.
+        fclk = Card("Chip FCLK")
+        fclk_row = QHBoxLayout()
+        self.fclk_value = QComboBox()
+        for frequency in (0, 1, 5, 10, 25, 50, 75, 100, 125, 150):
+            self.fclk_value.addItem(f"{frequency} MHz", frequency)
+        self.fclk_value.setCurrentIndex(self.fclk_value.findData(100))
+        self.fclk_apply = QPushButton("Apply FCLK")
+        self.fclk_apply.setObjectName("PrimaryButton")
+        self.fclk_current = QLabel("Current: unknown")
+        self.fclk_current.setObjectName("Muted")
+        fclk_row.addWidget(self.fclk_value)
+        fclk_row.addWidget(self.fclk_apply)
+        fclk_row.addWidget(self.fclk_current)
+        fclk_row.addStretch(1)
+        fclk.layout_.addLayout(fclk_row)
+        fclk_note = QLabel(
+            "0 MHz forces FCLK low. If FCLK is disabled, re-enable it before "
+            "changing chip registers or pixel configuration."
+        )
+        fclk_note.setObjectName("Muted")
+        fclk_note.setWordWrap(True)
+        fclk.layout_.addWidget(fclk_note)
+        root.addWidget(fclk)
+
         # Table filters
         filter_row = QHBoxLayout()
         self.search = QLineEdit()
@@ -262,6 +289,7 @@ class ChipPage(QWidget):
             self.read_chip,
             self.load_defaults,
             self.ctrl_apply,
+            self.fclk_apply,
             self.amux_combo,
         ):
             widget.setEnabled(connected)
@@ -778,6 +806,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.connections = ConnectionsPage()
         self.chip = ChipPage()
+        self.matrix = MatrixPage()
         self.osc = OscilloscopePage()
         self.gen = GeneratorPage()
         self.visualize = VisualizationPage()
@@ -785,6 +814,7 @@ class MainWindow(QMainWindow):
         self.pages = [
             ("Connections", self.connections),
             ("Chip", self.chip),
+            ("Matrix", self.matrix),
             ("Oscilloscope", self.osc),
             ("Generator", self.gen),
             ("Visualize", self.visualize),
@@ -833,6 +863,7 @@ class MainWindow(QMainWindow):
         self.controller.status_changed.connect(self._status_changed)
         self.controller.generator_output_changed.connect(self.gen.set_output_state)
         self.controller.amux_sweep_progress.connect(self.visualize.set_sweep_progress)
+        self.controller.pixel_matrix_progress.connect(self.matrix.set_matrix_progress)
 
         c = self.connections
         c.chip_connect.clicked.connect(self._connect_chip)
@@ -846,6 +877,11 @@ class MainWindow(QMainWindow):
         self.chip.apply_changes.clicked.connect(self._apply_chip)
         self.chip.load_defaults.clicked.connect(self._load_defaults)
         self.chip.ctrl_apply.clicked.connect(self._apply_ctrl)
+        self.chip.fclk_apply.clicked.connect(self._apply_fclk)
+
+        self.matrix.stage_selected.clicked.connect(self._stage_selected_pixel)
+        self.matrix.stage_all.clicked.connect(self._stage_owned_matrix)
+        self.matrix.write_chip.clicked.connect(self._write_pixel_matrix)
 
         self.osc.apply_settings.clicked.connect(self._apply_osc)
         self.osc.dc_button.clicked.connect(self._measure_dc)
@@ -887,7 +923,10 @@ class MainWindow(QMainWindow):
             self.connections.chip_connect.setEnabled(not connected)
             self.connections.chip_disconnect.setEnabled(connected)
             self.chip.set_connected(connected)
+            self.matrix.set_connected(connected)
             self.visualize.set_chip_connected(connected)
+            if not connected:
+                self.chip.fclk_current.setText("Current: unknown")
         elif device == "osc":
             self.connections.osc_connect.setEnabled(not connected)
             self.connections.osc_disconnect.setEnabled(connected)
@@ -936,6 +975,11 @@ class MainWindow(QMainWindow):
             return
 
         self.badges["chip"].set_status("busy", "Connecting")
+        def connected(snapshot):
+            self.chip.set_snapshot(snapshot)
+            self.matrix.reset_session()
+            self.chip.fclk_current.setText("Current: unknown")
+
         self._run(
             "Connecting chip...",
             lambda: self.controller.connect_chip(
@@ -943,7 +987,7 @@ class MainWindow(QMainWindow):
                 port=port,
                 auto_enable_kipix=self.connections.chip_auto_enable.isChecked(),
             ),
-            on_result=self.chip.set_snapshot,
+            on_result=connected,
         )
 
     def _disconnect_chip(self):
@@ -1035,6 +1079,75 @@ class MainWindow(QMainWindow):
                 lambda: self.controller.set_ctrl_pwm(freq, width),
                 show_real,
             )
+
+    def _apply_fclk(self):
+        frequency = int(self.chip.fclk_value.currentData())
+
+        def show(value):
+            self.chip.fclk_current.setText(f"Current: {int(value)} MHz")
+
+        self._run(
+            f"Setting chip FCLK={frequency} MHz...",
+            lambda: self.controller.set_fclk(frequency),
+            show,
+        )
+
+    # ---------------------------------------------------------------- matrix
+
+    def _stage_selected_pixel(self):
+        row, col = self.matrix.current_coordinate()
+        raw = self.matrix.current_raw_value()
+        self.matrix.set_busy(True)
+        self._run(
+            f"Staging pixel Col={col} Row={row} value=0x{raw:08X} in UPO...",
+            lambda: self.controller.stage_pixel_config(row, col, raw),
+            on_result=self.matrix.apply_selected_stage_result,
+            on_finished=lambda: self.matrix.set_busy(False),
+        )
+
+    def _stage_owned_matrix(self):
+        raw = self.matrix.current_raw_value()
+        answer = QMessageBox.question(
+            self,
+            "Update owned matrix half",
+            "Send the current 32-bit pixel configuration to all 512 owned pixels "
+            "(Rows 0..31, Cols 16..31) in MGPDLab virtual memory?\n\n"
+            "This does not yet write the matrix to the chip, but these pixels will "
+            "stop being controlled by the MGPDLab GUI until UPO is restarted.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.matrix.set_busy(True)
+        self.matrix.progress.setRange(0, 32 * 16)
+        self.matrix.progress.setValue(0)
+        self.matrix.progress.setFormat("Starting bulk pixel update...")
+        self._run(
+            f"Staging 0x{raw:08X} to owned matrix half (512 pixels)...",
+            lambda: self.controller.stage_owned_matrix(raw),
+            on_result=self.matrix.apply_bulk_stage_result,
+            on_finished=lambda: self.matrix.set_busy(False),
+        )
+
+    def _write_pixel_matrix(self):
+        answer = QMessageBox.question(
+            self,
+            "Write matrix to chip",
+            "Send SET_PIXEL_CFG WRITE_TO_CHIP?\n\n"
+            "The protocol command writes the complete MGPDLab virtual matrix. "
+            "Our software changes only Cols 16..31; Cols 0..15 remain whatever "
+            "MGPDLab currently stores.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.matrix.set_busy(True)
+        self._run(
+            "Writing MGPDLab pixel matrix to chip...",
+            self.controller.write_pixel_matrix_to_chip,
+            on_result=self.matrix.apply_commit_result,
+            on_finished=lambda: self.matrix.set_busy(False),
+        )
 
     # ------------------------------------------------------------- oscilloscope
 

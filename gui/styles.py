@@ -455,6 +455,36 @@ QSplitter::handle {{
     height: 2px;
 }}
 
+QLabel#MatrixWarning {{
+    background: {c['badge_busy_bg']};
+    color: {c['badge_busy_fg']};
+    border: 1px solid {c['badge_busy_fg']};
+    border-radius: 7px;
+    padding: 8px 10px;
+}}
+
+QLabel#MatrixLegendLocal {{
+    background: {c['warning']};
+    color: {c['window']};
+    border-radius: 5px;
+    padding: 3px 7px;
+    font-weight: 600;
+}}
+QLabel#MatrixLegendStaged {{
+    background: {c['primary']};
+    color: white;
+    border-radius: 5px;
+    padding: 3px 7px;
+    font-weight: 600;
+}}
+QLabel#MatrixLegendWritten {{
+    background: {c['ok']};
+    color: white;
+    border-radius: 5px;
+    padding: 3px 7px;
+    font-weight: 600;
+}}
+
 QToolTip {{
     background: {c['tooltip']};
     color: {c['text_strong']};

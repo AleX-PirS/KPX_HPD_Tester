@@ -13,6 +13,9 @@ class MGPDClient:
         WRITE_BYTE 0xDD TO 0xAAAA
         SET_CTRL_PIN 0|1
         SET_CTRL_PIN F=<kHz> W=<ns>
+        SET_FCLK <MHz>
+        SET_PIXEL_CFG ROW=<row> COL=<col> 0xXXXXXXXX
+        SET_PIXEL_CFG WRITE_TO_CHIP
 
     При подключении может автоматически активировать KIPIX CONTROL
     записью 0xA5 по адресу 0x803C.
@@ -25,6 +28,10 @@ class MGPDClient:
     CTRL_PWM_MAX_FREQUENCY_KHZ = 50_000
     CTRL_PWM_FREQUENCY_STEP_KHZ = 10
     CTRL_PWM_WIDTH_STEP_NS = 10
+
+    FCLK_ALLOWED_MHZ = (0, 1, 5, 10, 25, 50, 75, 100, 125, 150)
+    PIXEL_MATRIX_ROWS = 32
+    PIXEL_MATRIX_COLS = 32
 
     def __init__(
         self,
@@ -206,6 +213,99 @@ class MGPDClient:
             return None
 
         return value
+
+    @classmethod
+    def _validate_pixel_coordinate(cls, row: int, col: int):
+        for name, value, limit in (
+            ("row", row, cls.PIXEL_MATRIX_ROWS),
+            ("col", col, cls.PIXEL_MATRIX_COLS),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be int")
+            if not 0 <= value < limit:
+                raise ValueError(f"{name} must be in range 0..{limit - 1}")
+
+    @staticmethod
+    def _validate_uint32(value: int):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("value must be int")
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError("value must be in range 0x00000000..0xFFFFFFFF")
+
+    def set_fclk(self, frequency_mhz: int) -> bool:
+        """Set chip FCLK using the MGPDLab SET_FCLK command.
+
+        Supported values are defined by MGPDLab v2.01:
+            0, 1, 5, 10, 25, 50, 75, 100, 125, 150 MHz.
+
+        A value of 0 forces the clock output low.
+        """
+        if not isinstance(frequency_mhz, int) or isinstance(frequency_mhz, bool):
+            raise TypeError("frequency_mhz must be int")
+        if frequency_mhz not in self.FCLK_ALLOWED_MHZ:
+            allowed = ", ".join(str(v) for v in self.FCLK_ALLOWED_MHZ)
+            raise ValueError(f"frequency_mhz must be one of [{allowed}]")
+
+        cmd = f"SET_FCLK {frequency_mhz}\r\n".encode("ascii")
+        response = self._send_command(cmd)
+
+        if not self._check_ok(response):
+            logger.error(
+                "SET_FCLK error: F=%d MHz, response=%r",
+                frequency_mhz,
+                response,
+            )
+            return False
+
+        logger.debug("FCLK=%d MHz", frequency_mhz)
+        return True
+
+    def set_pixel_cfg(self, row: int, col: int, value: int) -> bool:
+        """Update one pixel configuration in MGPDLab virtual memory.
+
+        This command does NOT write the matrix to the chip. Use
+        write_pixel_cfg_to_chip() for the separate commit operation.
+        """
+        self._validate_pixel_coordinate(row, col)
+        self._validate_uint32(value)
+
+        cmd = (
+            f"SET_PIXEL_CFG ROW={row} COL={col} 0x{value:08X}\r\n"
+        ).encode("ascii")
+        response = self._send_command(cmd)
+
+        if not self._check_ok(response):
+            logger.error(
+                "SET_PIXEL_CFG error: row=%d, col=%d, value=0x%08X, response=%r",
+                row,
+                col,
+                value,
+                response,
+            )
+            return False
+
+        logger.debug(
+            "Pixel staged in MGPDLab: row=%d, col=%d, value=0x%08X",
+            row,
+            col,
+            value,
+        )
+        return True
+
+    def write_pixel_cfg_to_chip(self) -> bool:
+        """Write MGPDLab's complete virtual pixel matrix to the chip."""
+        cmd = b"SET_PIXEL_CFG WRITE_TO_CHIP\r\n"
+        response = self._send_command(cmd)
+
+        if not self._check_ok(response):
+            logger.error(
+                "SET_PIXEL_CFG WRITE_TO_CHIP error: response=%r",
+                response,
+            )
+            return False
+
+        logger.debug("Pixel matrix WRITE_TO_CHIP command accepted")
+        return True
 
     def set_ctrl(self, state: int | bool) -> bool:
         """
