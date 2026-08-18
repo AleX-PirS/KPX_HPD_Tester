@@ -300,7 +300,6 @@ REGS_FIELDS = {
 DEFAULT_FIELD_VALUES = {
     # CSA
     "DAC_CSA_RES_FB": 100,
-    # "DAC_CSA_RES_FB": 400,
     "DAC_CSA_RES_FB_TR": 3,
     "DAC_CSA_VB1": 512,
     "DAC_CSA_VB1_TR": 3,
@@ -347,16 +346,14 @@ DEFAULT_FIELD_VALUES = {
     "DAC_BUF50_TST": 410,
     "DAC_BUF50_TST_TR": 3,
     "DAC_BUF50_MUX": 1023,
-    # "DAC_BUF50_MUX": 512,
     "DAC_BUF50_MUX_TR": 15,
-    # "DAC_BUF50_MUX_TR": 3,
 
     # Injection system
     "DAC_PFB": 512,
     "DAC_PFB_TR": 3,
-    "DAC_TST_REF1": 0,
+    "DAC_TST_REF1": 500,
     "DAC_TST_REF1_TR": 3,
-    "DAC_TST_REF2": 1023,
+    "DAC_TST_REF2": 700,
     "DAC_TST_REF2_TR": 3,
     "TST_REF1_MUX": 0,
     "TST_REF2_MUX": 0,
@@ -381,10 +378,6 @@ DEFAULT_FIELD_VALUES = {
     "TEST_CONF_CMPC_TR": 15,
     "TEST_CONF_CMPB_TR": 12,
     "TEST_CONF_CMPA_TR": 13,
-    # "TEST_CONF_CMPD_TR": 16,
-    # "TEST_CONF_CMPC_TR": 16,
-    # "TEST_CONF_CMPB_TR": 16,
-    # "TEST_CONF_CMPA_TR": 16,
 }
 
 

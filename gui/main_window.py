@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import traceback
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -985,7 +986,6 @@ class MainWindow(QMainWindow):
         self.chip.fclk_apply.clicked.connect(self._apply_fclk)
         self.chip.fclk_toggle.clicked.connect(self._toggle_fclk)
 
-        self.matrix.stage_selected.clicked.connect(self._stage_selected_pixel)
         self.matrix.stage_local.clicked.connect(self._stage_local_pixels)
         self.matrix.send_raw.clicked.connect(self._send_raw_pixel)
         self.matrix.stage_all.clicked.connect(self._stage_owned_matrix)
@@ -1227,17 +1227,6 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- matrix
 
-    def _stage_selected_pixel(self):
-        row, col = self.matrix.current_coordinate()
-        raw = self.matrix.current_raw_value()
-        self.matrix.set_busy(True)
-        self._run(
-            f"Staging pixel Col={col} Row={row} value=0x{raw:08X} in UPO...",
-            lambda: self.controller.stage_pixel_config(row, col, raw),
-            on_result=self.matrix.apply_selected_stage_result,
-            on_finished=lambda: self.matrix.set_busy(False),
-        )
-
     def _stage_local_pixels(self):
         edits = self.matrix.local_edits()
         if not edits:
@@ -1273,16 +1262,6 @@ class MainWindow(QMainWindow):
 
     def _stage_owned_matrix(self):
         raw = self.matrix.current_raw_value()
-        answer = QMessageBox.question(
-            self,
-            "Update owned matrix half",
-            "Send the current 32-bit pixel configuration to all 512 owned pixels "
-            "(Rows 0..31, Cols 16..31) in MGPDLab virtual memory?\n\n"
-            "This does not yet write the matrix to the chip, but these pixels will "
-            "stop being controlled by the MGPDLab GUI until UPO is restarted.",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
 
         self.matrix.set_busy(True)
         self.matrix.progress.setRange(0, 32 * 16)
@@ -1296,22 +1275,74 @@ class MainWindow(QMainWindow):
         )
 
     def _write_pixel_matrix(self):
-        answer = QMessageBox.question(
-            self,
-            "Write matrix to chip",
-            "Send SET_PIXEL_CFG WRITE_TO_CHIP?\n\n"
-            "The protocol command writes the complete MGPDLab virtual matrix. "
-            "Our software changes only Cols 16..31; Cols 0..15 remain whatever "
-            "MGPDLab currently stores.",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
+        # Write is intentionally a convenience transaction:
+        #   1) stage every current Local edit in MGPDLab virtual memory;
+        #   2) issue SET_PIXEL_CFG WRITE_TO_CHIP.
+        # No confirmation dialog is shown.
+        edits = self.matrix.local_edits()
 
         self.matrix.set_busy(True)
+        if edits:
+            self.matrix.progress.setRange(0, len(edits))
+            self.matrix.progress.setValue(0)
+            self.matrix.progress.setFormat("Updating local edits before Write...")
+        else:
+            self.matrix.progress.setRange(0, 1)
+            self.matrix.progress.setValue(0)
+            self.matrix.progress.setFormat("Writing matrix to chip...")
+
+        def operation():
+            stage_result = {"pixels": [], "count": 0}
+            if edits:
+                stage_result = self.controller.stage_pixel_configs(edits)
+
+            try:
+                commit_ok = self.controller.write_pixel_matrix_to_chip()
+            except Exception as error:
+                # Staging may already have succeeded. Return that information so
+                # GUI state does not incorrectly keep those pixels as Local edit.
+                return {
+                    "stage_result": stage_result,
+                    "commit_ok": False,
+                    "commit_error": str(error),
+                    "commit_traceback": traceback.format_exc(),
+                }
+
+            return {
+                "stage_result": stage_result,
+                "commit_ok": bool(commit_ok),
+                "commit_error": None,
+                "commit_traceback": None,
+            }
+
+        def applied(result: dict):
+            stage_result = result.get("stage_result", {})
+            if int(stage_result.get("count", 0)) > 0:
+                self.matrix.apply_local_stage_result(stage_result)
+
+            if result.get("commit_ok"):
+                self.matrix.apply_commit_result(True)
+                return
+
+            message = result.get("commit_error") or "SET_PIXEL_CFG WRITE_TO_CHIP failed"
+            self.matrix.progress.setFormat(
+                "WRITE_TO_CHIP failed - local edits remain staged in UPO"
+            )
+            self.log.append("ERROR", message)
+            tb = result.get("commit_traceback")
+            if tb and self.log.low_level.isChecked():
+                self.log.append("DEBUG", tb, True)
+            QMessageBox.critical(self, "Hardware operation failed", message)
+
+        description = (
+            f"Updating {len(edits)} local matrix edit(s) and writing matrix to chip..."
+            if edits
+            else "Writing MGPDLab pixel matrix to chip..."
+        )
         self._run(
-            "Writing MGPDLab pixel matrix to chip...",
-            self.controller.write_pixel_matrix_to_chip,
-            on_result=self.matrix.apply_commit_result,
+            description,
+            operation,
+            on_result=applied,
             on_finished=lambda: self.matrix.set_busy(False),
         )
 

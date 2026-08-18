@@ -341,20 +341,28 @@ class MatrixPage(QWidget):
         field_card.layout_.addWidget(self.pixel_status)
 
         editor_buttons = QHBoxLayout()
-        self.load_defaults = QPushButton("Load PX defaults to editor")
+        self.load_defaults = QPushButton("Load default")
+        self.load_defaults.setObjectName("NeutralButton")
+        self.load_defaults.setToolTip(
+            "Load the software PX default into the selected pixel editor."
+        )
+
         self.clear_local = QPushButton("Clear local edits")
+        self.clear_local.setObjectName("DangerButton")
         self.clear_local.setToolTip(
             "Discard all PX edits that have not been sent to MGPDLab virtual memory."
         )
-        self.stage_selected = QPushButton("Update selected in UPO")
-        self.stage_selected.setObjectName("PrimaryButton")
-        self.stage_local = QPushButton("Update all local edits in UPO")
+
+        # One normal Update action: stage every pixel currently marked Local edit.
+        # Per-pixel direct staging remains available only through Send RAW.
+        self.stage_local = QPushButton("Update")
+        self.stage_local.setObjectName("PrimaryButton")
         self.stage_local.setToolTip(
             "Stage every pixel currently marked Local edit, keeping each pixel's own PX value."
         )
+
         editor_buttons.addWidget(self.load_defaults)
         editor_buttons.addWidget(self.clear_local)
-        editor_buttons.addWidget(self.stage_selected)
         editor_buttons.addWidget(self.stage_local)
         field_card.layout_.addLayout(editor_buttons)
         body.addWidget(field_card, 0, 1)
@@ -370,8 +378,8 @@ class MatrixPage(QWidget):
         operations.layout_.addWidget(note)
 
         op_buttons = QHBoxLayout()
-        self.stage_all = QPushButton("Update owned half in UPO")
-        self.write_chip = QPushButton("Write matrix to chip")
+        self.stage_all = QPushButton("Update all")
+        self.write_chip = QPushButton("Write")
         self.write_chip.setObjectName("PrimaryButton")
         op_buttons.addWidget(self.stage_all)
         op_buttons.addWidget(self.write_chip)
@@ -409,7 +417,6 @@ class MatrixPage(QWidget):
     def set_connected(self, connected: bool):
         self._connected = bool(connected)
         for widget in (
-            self.stage_selected,
             self.stage_local,
             self.send_raw,
             self.stage_all,
@@ -570,7 +577,6 @@ class MatrixPage(QWidget):
     def set_busy(self, busy: bool):
         busy = bool(busy)
         enabled = self._connected and not busy
-        self.stage_selected.setEnabled(enabled)
         self.stage_local.setEnabled(enabled)
         self.send_raw.setEnabled(enabled)
         self.stage_all.setEnabled(enabled)

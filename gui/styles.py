@@ -22,6 +22,8 @@ THEMES = {
         "button": "#1b2734",
         "button_hover": "#223246",
         "button_pressed": "#192433",
+        "neutral_button": "#3b4652",
+        "neutral_button_hover": "#485563",
         "button_disabled": "#151b23",
         "disabled_text": "#627183",
         "primary": "#2563eb",
@@ -72,6 +74,8 @@ THEMES = {
         "button": "#f3f5f7",
         "button_hover": "#e9edf2",
         "button_pressed": "#dfe5ec",
+        "neutral_button": "#d4d9df",
+        "neutral_button_hover": "#c6cdd5",
         "button_disabled": "#f1f3f5",
         "disabled_text": "#9aa5b1",
         "primary": "#2563eb",
@@ -227,10 +231,25 @@ QPushButton#PrimaryButton:hover {{
     background: {c['primary_hover']};
 }}
 
+QPushButton#NeutralButton {{
+    background: {c['neutral_button']};
+    border-color: {c['input_border']};
+    color: {c['text_strong']};
+    font-weight: 600;
+}}
+QPushButton#NeutralButton:hover {{
+    background: {c['neutral_button_hover']};
+}}
+
 QPushButton#DangerButton {{
-    background: {c['badge_error_bg']};
-    border-color: {c['badge_error_fg']};
-    color: {c['badge_error_fg']};
+    background: {c['output_off_bg']};
+    border-color: {c['output_off_bg']};
+    color: white;
+    font-weight: 600;
+}}
+QPushButton#DangerButton:hover {{
+    background: {c['error']};
+    border-color: {c['error']};
 }}
 
 QPushButton#NavButton {{

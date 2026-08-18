@@ -98,8 +98,8 @@ The GUI contains a **Visualize** page with two hardware-assisted tools:
 
 ## Matrix editing additions
 
-- `Update selected in UPO` stages one selected pixel.
-- `Update all local edits in UPO` stages every pixel currently marked `Local edit`, preserving each pixel's individual 32-bit PX word.
+- `Update` stages one selected pixel.
+- `Update` stages every pixel currently marked `Local edit`, preserving each pixel's individual 32-bit PX word.
 - `Send RAW to selected` accepts a complete hexadecimal 32-bit PX word and stages it directly for the selected pixel.
 - Matrix cells show a small `T` marker when `PX_TST_EN=1` and `B` when the active-low `PX_BUF_NEN=0`.
 
@@ -112,3 +112,13 @@ The GUI contains a **Visualize** page with two hardware-assisted tools:
 ## GUI instrument defaults
 
 Oscilloscope GUI defaults: CH1 only, DC 50 ohm coupling selected for all channels, averaging OFF, trigger OFF, trigger level 0.2 V, time scale 250 ns/div, common vertical scale 0.2 V/div, common vertical offset 0.4 V. Generator channel frequency defaults to 100 kHz.
+
+
+### Matrix GUI action semantics (v4)
+
+- `Load default`: load PX software defaults into the selected editor only.
+- `Clear local edits`: discard all edits not yet staged in UPO.
+- `Update`: stage all pixels currently marked `Local edit` in UPO.
+- `Update all`: stage the current editor PX word into all 512 owned pixels (Cols 16..31).
+- `Write`: first stages all current `Local edit` pixels, then immediately sends `SET_PIXEL_CFG WRITE_TO_CHIP`.
+- `Update all` and `Write` execute immediately without confirmation dialogs.
