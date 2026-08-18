@@ -140,3 +140,31 @@ client.set_polarity(1)       # OMR[24] = 1, OMR[19] POL_CTRL = 1
 ```
 
 These functions are not called automatically by connection, GUI setup, or other configuration code. Each operation first reads the affected byte and then changes only its masked bit(s), preserving all unrelated OMR fields.
+
+## Matrix sweep GUI
+
+The `Matrix sweep` page is placed directly below `Visualize` in the sidebar.
+It contains independent `Global settings` and `Sweep settings` editors for the
+32-bit PX word, one oscilloscope-channel selector, a settling delay and the same
+optional `FCLK OFF during capture` behavior as AMUX sweep.
+
+Only project-owned pixels (Cols 16..31, Rows 0..31) can be selected. Selection
+uses desktop-style modifiers: normal click replaces the selection, Ctrl+click
+toggles individual pixels, Shift+click selects the rectangle between the anchor
+and clicked pixel, and Ctrl+Shift adds such a rectangle. An empty explicit
+selection means all 512 owned pixels.
+
+At sweep start the owned half is initialized once with Global settings and
+committed to the chip. For each captured pixel the previous sweep pixel is
+restored to Global settings and only the current pixel is changed to Sweep
+settings before the next commit. Thus each capture has exactly one Sweep pixel
+and all other owned pixels at Global settings without re-sending 512 identical
+SET_PIXEL_CFG commands for every point. After completion (or best-effort cleanup
+on error), the owned half is returned to Global settings.
+
+Matrix sweep temporarily selects `TST_IN` on AMUX and restores the exact previous
+TEST_MUX value afterward. Individual waveforms and `combined.csv` are stored in
+`temp/matrix_sweep/`; this directory is overwritten on each new sweep. As in
+AMUX sweep, waveform `x_origin` is ignored and a relative time axis is used;
+`x_increment` must remain unchanged. The resulting plot and combined CSV can be
+saved from the page with Save As dialogs.

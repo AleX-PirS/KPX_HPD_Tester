@@ -33,6 +33,7 @@ from .widgets import Card, FloatEdit, LogPanel, OutputStateButton, RegisterTable
 from .styles import current_theme_colors
 from .visualization_page import VisualizationPage
 from .matrix_page import MatrixPage
+from .matrix_sweep_page import MatrixSweepPage
 
 
 # =============================================================================
@@ -913,6 +914,7 @@ class MainWindow(QMainWindow):
         self.osc = OscilloscopePage()
         self.gen = GeneratorPage()
         self.visualize = VisualizationPage()
+        self.matrix_sweep = MatrixSweepPage()
 
         self.pages = [
             ("Connections", self.connections),
@@ -921,6 +923,7 @@ class MainWindow(QMainWindow):
             ("Oscilloscope", self.osc),
             ("Generator", self.gen),
             ("Visualize", self.visualize),
+            ("Matrix sweep", self.matrix_sweep),
         ]
         self.nav_buttons = []
         for index, (name, page) in enumerate(self.pages):
@@ -933,7 +936,7 @@ class MainWindow(QMainWindow):
             # ChipPage contains a large QTableWidget with its own scrollbars.
             # Keeping it out of an outer QScrollArea makes wheel/scrollbar
             # interaction predictable and lets the table use all free height.
-            if isinstance(page, (ChipPage, VisualizationPage)):
+            if isinstance(page, (ChipPage, VisualizationPage, MatrixSweepPage)):
                 self.stack.addWidget(page)
             else:
                 self.stack.addWidget(_page_scroll(page))
@@ -966,6 +969,7 @@ class MainWindow(QMainWindow):
         self.controller.status_changed.connect(self._status_changed)
         self.controller.generator_output_changed.connect(self.gen.set_output_state)
         self.controller.amux_sweep_progress.connect(self.visualize.set_sweep_progress)
+        self.controller.matrix_sweep_progress.connect(self.matrix_sweep.set_sweep_progress)
         self.controller.pixel_matrix_progress.connect(self.matrix.set_matrix_progress)
         self.controller.fclk_changed.connect(self.chip.set_fclk_state)
         self.controller.ctrl_state_changed.connect(self.chip.set_ctrl_state)
@@ -1007,6 +1011,10 @@ class MainWindow(QMainWindow):
         self.visualize.save_figure.clicked.connect(self._save_visual_figure)
         self.visualize.save_csv.clicked.connect(self._save_visual_csv)
 
+        self.matrix_sweep.start_sweep.clicked.connect(self._start_matrix_sweep)
+        self.matrix_sweep.save_figure.clicked.connect(self._save_matrix_sweep_figure)
+        self.matrix_sweep.save_csv.clicked.connect(self._save_matrix_sweep_csv)
+
     def _set_log_collapsed(self, collapsed: bool):
         # QSplitter sizes are content sizes and do not include the handle.
         # Use the real available height instead of an artificial 600 px floor;
@@ -1033,6 +1041,7 @@ class MainWindow(QMainWindow):
             self.chip.set_connected(connected)
             self.matrix.set_connected(connected)
             self.visualize.set_chip_connected(connected)
+            self.matrix_sweep.set_chip_connected(connected)
             if not connected:
                 self.chip.set_fclk_state(None)
                 self.chip.set_ctrl_state(None, None)
@@ -1041,6 +1050,7 @@ class MainWindow(QMainWindow):
             self.connections.osc_disconnect.setEnabled(connected)
             self.osc.set_connected(connected)
             self.visualize.set_osc_connected(connected)
+            self.matrix_sweep.set_osc_connected(connected)
         elif device == "gen":
             self.connections.gen_connect.setEnabled(not connected)
             self.connections.gen_disconnect.setEnabled(connected)
@@ -1483,6 +1493,87 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(error))
             return
         self.log.append("INFO", f"AMUX sweep CSV saved: {saved}")
+
+    # ------------------------------------------------------------ matrix sweep
+
+    def _start_matrix_sweep(self):
+        try:
+            pixels = self.matrix_sweep.sweep_pixels()
+            global_raw = self.matrix_sweep.global_raw()
+            sweep_raw = self.matrix_sweep.sweep_raw()
+            channel = self.matrix_sweep.selected_scope_channel()
+            delay_s = self.matrix_sweep.settling_delay_s()
+            fclk_off = self.matrix_sweep.disable_fclk_during_capture()
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid matrix sweep settings", str(error))
+            return
+
+        self.matrix_sweep.set_sweep_busy(True)
+
+        def applied(result: dict):
+            self.matrix_sweep.show_result(result)
+            # A successful matrix sweep deliberately leaves all owned pixels at
+            # Global settings, so keep the ordinary Matrix page session model
+            # synchronized with the hardware/UPO state.
+            self.matrix.apply_external_global_state(int(result["global_raw"]))
+
+        self._run(
+            f"Starting matrix sweep: {len(pixels)} pixel(s) on CH{channel}, "
+            f"Global=0x{global_raw:08X}, Sweep=0x{sweep_raw:08X}"
+            + (" with FCLK OFF during capture..." if fclk_off else "..."),
+            lambda: self.controller.run_matrix_sweep(
+                pixels,
+                global_raw=global_raw,
+                sweep_raw=sweep_raw,
+                osc_channel=channel,
+                delay_s=delay_s,
+                disable_fclk_during_capture=fclk_off,
+            ),
+            on_result=applied,
+            on_finished=lambda: self.matrix_sweep.set_sweep_busy(False),
+        )
+
+    def _save_matrix_sweep_figure(self):
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save matrix sweep figure",
+            str(Path.cwd() / "matrix_sweep.png"),
+            "PNG image (*.png);;PDF (*.pdf);;SVG (*.svg)",
+        )
+        if not path:
+            return
+
+        if not Path(path).suffix:
+            suffix = ".png"
+            if "PDF" in selected_filter:
+                suffix = ".pdf"
+            elif "SVG" in selected_filter:
+                suffix = ".svg"
+            path += suffix
+
+        try:
+            saved = self.matrix_sweep.save_current_figure(path)
+        except Exception as error:
+            QMessageBox.critical(self, "Save failed", str(error))
+            return
+        self.log.append("INFO", f"Matrix sweep figure saved: {saved}")
+
+    def _save_matrix_sweep_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save matrix sweep CSV",
+            str(Path.cwd() / "matrix_sweep.csv"),
+            "CSV (*.csv)",
+        )
+        if not path:
+            return
+
+        try:
+            saved = self.matrix_sweep.save_current_csv(path)
+        except Exception as error:
+            QMessageBox.critical(self, "Save failed", str(error))
+            return
+        self.log.append("INFO", f"Matrix sweep CSV saved: {saved}")
 
     # ---------------------------------------------------------------- generator
 

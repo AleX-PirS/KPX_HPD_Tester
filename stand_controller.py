@@ -14,7 +14,7 @@ from configuration import Configuration
 from generator_cfg import TwoChannelGenerator
 from mgpd import MGPDClient
 from oscilloscope_cfg import Oscilloscope
-from pixel_matrix import PixelMatrixConfiguration
+from pixel_matrix import PIXEL_CODEC, PixelMatrixConfiguration
 
 
 class StandController(QObject):
@@ -29,6 +29,7 @@ class StandController(QObject):
     status_changed = pyqtSignal(str, bool, str)  # device, connected, detail
     generator_output_changed = pyqtSignal(int, bool)  # physical output 1..4, enabled
     amux_sweep_progress = pyqtSignal(int, int, str)  # current, total, signal
+    matrix_sweep_progress = pyqtSignal(int, int, int, int)  # current, total, row, col
     pixel_matrix_progress = pyqtSignal(int, int, int, int)  # current, total, row, col
     fclk_changed = pyqtSignal(object)  # int MHz or None when unknown/disconnected
     ctrl_state_changed = pyqtSignal(object, object)  # static state 0/1/None, PWM enabled bool/None
@@ -715,6 +716,321 @@ class StandController(QObject):
             "delay_s": delay_s,
             "disable_fclk_during_capture": bool(disable_fclk_during_capture),
             "fclk_restore_mhz": int(fclk_restore_mhz) if disable_fclk_during_capture else None,
+            "time_s": time_axis,
+            "waveforms": waveforms,
+            "combined_csv": combined_csv,
+            "raw_dir": sweep_dir,
+        }
+
+    def run_matrix_sweep(
+        self,
+        pixels_to_sweep: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+        global_raw: int,
+        sweep_raw: int,
+        osc_channel: int,
+        delay_s: float = 0.1,
+        disable_fclk_during_capture: bool = False,
+    ) -> dict:
+        """Sweep owned matrix pixels and capture one waveform per pixel.
+
+        Hardware invariant during every capture:
+            * current pixel -> sweep_raw
+            * every other owned pixel (Cols 16..31) -> global_raw
+
+        To avoid re-sending 512 identical SET_PIXEL_CFG commands before every
+        single capture, the owned half is initialized to global_raw once. Then
+        the previously swept pixel is restored to global_raw and only the next
+        pixel is changed to sweep_raw before WRITE_TO_CHIP. The physical matrix
+        state at each capture is therefore identical to a full global reload,
+        with dramatically less MGPDLab traffic.
+
+        TST_IN is selected for the duration of the sweep. The exact previous
+        TEST_MUX raw value is restored afterward, including non-one-hot states.
+        The owned half is also returned to global_raw at the end of the sweep.
+        """
+        cfg = self._require_chip()
+        self._require_fclk_for_configuration()
+        matrix = self._require_matrix()
+        osc = self._require_osc()
+
+        PIXEL_CODEC.validate_raw(global_raw)
+        PIXEL_CODEC.validate_raw(sweep_raw)
+
+        pixels = tuple(
+            dict.fromkeys((int(row), int(col)) for row, col in pixels_to_sweep)
+        )
+        if not pixels:
+            raise ValueError("Select at least one matrix pixel to sweep")
+        for row, col in pixels:
+            matrix.validate_owned_pixel(row, col)
+
+        if osc_channel not in (1, 2, 3, 4):
+            raise ValueError("Oscilloscope channel must be 1, 2, 3 or 4")
+        if delay_s < 0:
+            raise ValueError("Matrix settling delay must be >= 0 s")
+        if "TST_IN" not in EO_cfg.AMUX_SIGNALS:
+            raise KeyError("TST_IN is not present in EO_cfg.AMUX_SIGNALS")
+
+        sweep_dir = self.temp_dir / "matrix_sweep"
+        if sweep_dir.exists():
+            shutil.rmtree(sweep_dir)
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+
+        # If the clock is going to be disabled during captures and its current
+        # value is unknown, establish the same deterministic fallback used by
+        # AMUX sweep so restoration is always well-defined.
+        if disable_fclk_during_capture and self._fclk_mhz is None:
+            self.set_fclk(100)
+            self._log(
+                "INFO",
+                "FCLK state was unknown; established 100 MHz before matrix sweep",
+            )
+
+        fclk_restore_mhz = (
+            self._fclk_mhz
+            if self._fclk_mhz is not None and self._fclk_mhz > 0
+            else 100
+        )
+        fclk_is_temporarily_off = False
+
+        # Preserve the complete TEST_MUX word, not only its decoded name.
+        mux_addresses = [addr for addr, _, _ in cfg.regs_fields["TEST_MUX"]]
+        mux_cache = cfg.read_registers(mux_addresses)
+        previous_amux_raw = cfg.get_data("TEST_MUX", register_cache=mux_cache)
+        previous_amux_name = cfg.get_amux(register_cache=mux_cache)
+        amux_changed = previous_amux_name != "TST_IN"
+
+        captured: dict[tuple[int, int], dict] = {}
+        active_sweep_pixel: tuple[int, int] | None = None
+        baseline_committed = False
+        primary_error: Exception | None = None
+        restore_errors: list[str] = []
+
+        try:
+            if amux_changed:
+                if not cfg.set_amux("TST_IN"):
+                    raise RuntimeError("Failed to set AMUX=TST_IN")
+                self._log("INFO", "Matrix sweep AMUX <- TST_IN")
+            else:
+                self._log("INFO", "Matrix sweep: AMUX is already TST_IN")
+
+            # Initial deterministic baseline: every owned pixel is Global.
+            self._log(
+                "INFO",
+                f"Matrix sweep: staging Global 0x{global_raw:08X} to all 512 owned pixels",
+            )
+            matrix.set_owned_half(global_raw)
+            if not matrix.write_to_chip():
+                raise RuntimeError("Failed to write initial Global matrix to chip")
+            baseline_committed = True
+            self._log("INFO", "Matrix sweep: Global baseline written to chip")
+
+            total = len(pixels)
+            for index, (row, col) in enumerate(pixels, start=1):
+                self.matrix_sweep_progress.emit(index, total, row, col)
+
+                # Restore the previous sweep pixel in UPO virtual memory. There
+                # is no need to commit it separately: the following commit also
+                # applies the new current sweep pixel in the same transaction.
+                if active_sweep_pixel is not None:
+                    prev_row, prev_col = active_sweep_pixel
+                    if not matrix.set_pixel(prev_row, prev_col, global_raw):
+                        raise RuntimeError(
+                            f"Failed to restore previous pixel Col={prev_col} Row={prev_row} "
+                            "to Global settings"
+                        )
+
+                if not matrix.set_pixel(row, col, sweep_raw):
+                    raise RuntimeError(
+                        f"Failed to stage Sweep settings at Col={col} Row={row}"
+                    )
+                # From this point cleanup must restore this pixel even if the
+                # subsequent WRITE_TO_CHIP or acquisition fails.
+                active_sweep_pixel = (row, col)
+
+                if not matrix.write_to_chip():
+                    raise RuntimeError(
+                        f"Failed to write matrix for Col={col} Row={row}"
+                    )
+                self._log(
+                    "INFO",
+                    f"Matrix sweep {index}/{total}: Col={col} Row={row} "
+                    f"Sweep=0x{sweep_raw:08X}, others Global=0x{global_raw:08X}",
+                )
+
+                if disable_fclk_during_capture:
+                    self.set_fclk(0)
+                    fclk_is_temporarily_off = True
+                    self._log(
+                        "INFO",
+                        f"Matrix Col={col} Row={row}: FCLK OFF for settling/capture",
+                    )
+
+                if delay_s > 0:
+                    time.sleep(delay_s)
+
+                voltage, x_origin, x_increment = osc.read_waveform(osc_channel)
+                if not voltage:
+                    raise RuntimeError(f"Empty waveform from CH{osc_channel}.")
+
+                if disable_fclk_during_capture:
+                    self.set_fclk(int(fclk_restore_mhz))
+                    fclk_is_temporarily_off = False
+                    self._log(
+                        "INFO",
+                        f"Matrix Col={col} Row={row}: FCLK restored to "
+                        f"{fclk_restore_mhz} MHz",
+                    )
+
+                raw_path = sweep_dir / f"col_{col:02d}_row_{row:02d}.csv"
+                with raw_path.open("w", newline="", encoding="utf-8") as file:
+                    writer = csv.writer(file)
+                    writer.writerow(["time_s", "voltage_v"])
+                    for point_index, value in enumerate(voltage):
+                        writer.writerow([point_index * x_increment, value])
+
+                captured[(row, col)] = {
+                    "voltage": voltage,
+                    "x_origin": x_origin,
+                    "x_increment": x_increment,
+                    "raw_csv": raw_path,
+                }
+                self._log(
+                    "INFO",
+                    f"Matrix Col={col} Row={row}: CH{osc_channel} captured "
+                    f"{len(voltage)} points",
+                )
+
+        except Exception as error:
+            primary_error = error
+
+        finally:
+            # Configuration writes require a running FCLK. If acquisition failed
+            # while the clock was forced low, restore it before any cleanup.
+            if disable_fclk_during_capture and fclk_is_temporarily_off:
+                try:
+                    self.set_fclk(int(fclk_restore_mhz))
+                    fclk_is_temporarily_off = False
+                    self._log(
+                        "INFO",
+                        f"FCLK restored to {fclk_restore_mhz} MHz after matrix-sweep interruption",
+                    )
+                except Exception as error:
+                    restore_errors.append(f"FCLK restore failed: {error}")
+                    self._log("ERROR", restore_errors[-1])
+
+            # Leave the project-owned half in the requested Global state. After
+            # the initial baseline only the last active sweep pixel can differ.
+            if baseline_committed and active_sweep_pixel is not None:
+                try:
+                    row, col = active_sweep_pixel
+                    if not matrix.set_pixel(row, col, global_raw):
+                        raise RuntimeError(
+                            f"failed to restore Col={col} Row={row} to Global settings"
+                        )
+                    if not matrix.write_to_chip():
+                        raise RuntimeError("failed to commit final Global matrix")
+                    self._log(
+                        "INFO",
+                        "Matrix sweep cleanup: owned half restored to Global settings",
+                    )
+                except Exception as error:
+                    restore_errors.append(f"Matrix restore failed: {error}")
+                    self._log("ERROR", restore_errors[-1])
+
+            if amux_changed:
+                try:
+                    if not cfg.set_data("TEST_MUX", previous_amux_raw):
+                        raise RuntimeError("Failed to restore previous TEST_MUX state")
+                    restored = previous_amux_name or f"raw 0x{previous_amux_raw:X}"
+                    self._log("INFO", f"AMUX restored to {restored}")
+                except Exception as error:
+                    restore_errors.append(f"AMUX restore failed: {error}")
+                    self._log("ERROR", restore_errors[-1])
+
+        if primary_error is not None:
+            if restore_errors:
+                raise RuntimeError(
+                    f"Matrix sweep failed: {primary_error}. Cleanup issue(s): "
+                    + "; ".join(restore_errors)
+                ) from primary_error
+            raise primary_error
+
+        if restore_errors:
+            raise RuntimeError("; ".join(restore_errors))
+
+        if not captured:
+            raise RuntimeError("Matrix sweep produced no waveform samples")
+
+        reference_pixel = pixels[0]
+        reference = captured[reference_pixel]
+        ref_increment = reference["x_increment"]
+        min_length = min(len(captured[pixel]["voltage"]) for pixel in pixels)
+        if min_length <= 0:
+            raise RuntimeError("Matrix sweep produced no waveform samples")
+
+        for pixel in pixels[1:]:
+            item = captured[pixel]
+            if not math.isclose(
+                item["x_increment"],
+                ref_increment,
+                rel_tol=1e-9,
+                abs_tol=1e-15,
+            ):
+                ref_row, ref_col = reference_pixel
+                row, col = pixel
+                raise RuntimeError(
+                    "Oscilloscope time increment changed during matrix sweep: "
+                    f"Col={ref_col} Row={ref_row}: {ref_increment:g} s, "
+                    f"Col={col} Row={row}: {item['x_increment']:g} s."
+                )
+
+        lengths = {pixel: len(captured[pixel]["voltage"]) for pixel in pixels}
+        if len(set(lengths.values())) > 1:
+            compact_lengths = {
+                f"C{col}R{row}": length
+                for (row, col), length in lengths.items()
+            }
+            self._log(
+                "WARNING",
+                f"Matrix waveform lengths differ {compact_lengths}; "
+                f"using common first {min_length} points",
+            )
+
+        # Same policy as AMUX sweep: absolute x_origin is intentionally ignored.
+        # Independently captured traces are overlaid by sample index on a
+        # relative time axis. A changed x_increment remains an error.
+        time_axis = [index * ref_increment for index in range(min_length)]
+        waveforms = {
+            pixel: captured[pixel]["voltage"][:min_length]
+            for pixel in pixels
+        }
+
+        headers = [f"Col{col}_Row{row}" for row, col in pixels]
+        combined_csv = sweep_dir / "combined.csv"
+        with combined_csv.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["time_s", *headers])
+            for index, time_value in enumerate(time_axis):
+                writer.writerow(
+                    [time_value, *[waveforms[pixel][index] for pixel in pixels]]
+                )
+
+        self._log(
+            "INFO",
+            f"Matrix sweep completed: {len(pixels)} pixel(s), {min_length} points each",
+        )
+
+        return {
+            "pixels": pixels,
+            "global_raw": int(global_raw),
+            "sweep_raw": int(sweep_raw),
+            "osc_channel": int(osc_channel),
+            "delay_s": float(delay_s),
+            "disable_fclk_during_capture": bool(disable_fclk_during_capture),
+            "fclk_restore_mhz": (
+                int(fclk_restore_mhz) if disable_fclk_during_capture else None
+            ),
             "time_s": time_axis,
             "waveforms": waveforms,
             "combined_csv": combined_csv,

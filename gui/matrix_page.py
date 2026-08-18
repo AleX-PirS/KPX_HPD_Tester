@@ -644,6 +644,25 @@ class MatrixPage(QWidget):
         self._refresh_selected_status()
         self.matrix_map.update()
 
+    def apply_external_global_state(self, raw_config: int):
+        """Synchronize this page after another GUI workflow rewrites the matrix.
+
+        Matrix Sweep intentionally finishes with every owned pixel set to its
+        Global settings. Because the supplied protocol has no pixel readback,
+        that successful operation is the best available session baseline.
+        """
+        PIXEL_CODEC.validate_raw(raw_config)
+        for row in range(MATRIX_ROWS):
+            for col in OWNED_COLUMNS:
+                coord = (row, col)
+                self._values[coord] = raw_config
+                self._upo_values[coord] = raw_config
+                self._chip_values[coord] = raw_config
+                self._local_baseline[coord] = raw_config
+        self._local_dirty.clear()
+        self.select_pixel(*self.current_coordinate())
+        self.matrix_map.update()
+
     def set_matrix_progress(self, current: int, total: int, row: int, col: int):
         self.progress.setRange(0, total)
         self.progress.setValue(current)
