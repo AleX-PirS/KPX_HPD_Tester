@@ -122,3 +122,21 @@ Oscilloscope GUI defaults: CH1 only, DC 50 ohm coupling selected for all channel
 - `Update all`: stage the current editor PX word into all 512 owned pixels (Cols 16..31).
 - `Write`: first stages all current `Local edit` pixels, then immediately sends `SET_PIXEL_CFG WRITE_TO_CHIP`.
 - `Update all` and `Write` execute immediately without confirmation dialogs.
+
+
+## OMR chip-control helpers
+
+`MGPDClient` includes opt-in read-modify-write helpers for selected Operation Mode Register bits:
+
+```python
+client.set_puf_mode(0)       # OMR[20]
+client.set_puf_mode(1)
+
+client.set_win_dis_mode(0)   # OMR[9]
+client.set_win_dis_mode(1)
+
+client.set_polarity(0)       # OMR[24] = 0, OMR[19] POL_CTRL = 1
+client.set_polarity(1)       # OMR[24] = 1, OMR[19] POL_CTRL = 1
+```
+
+These functions are not called automatically by connection, GUI setup, or other configuration code. Each operation first reads the affected byte and then changes only its masked bit(s), preserving all unrelated OMR fields.

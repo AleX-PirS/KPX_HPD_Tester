@@ -17,6 +17,12 @@ class MGPDClient:
         SET_PIXEL_CFG ROW=<row> COL=<col> 0xXXXXXXXX
         SET_PIXEL_CFG WRITE_TO_CHIP
 
+    Дополнительные chip-level helpers используют READ_BYTE/WRITE_BYTE
+    и меняют только выбранные биты регистра OMR:
+        set_puf_mode(0|1)
+        set_win_dis_mode(0|1)
+        set_polarity(0|1)
+
     При подключении может автоматически активировать KIPIX CONTROL
     записью 0xA5 по адресу 0x803C.
     """
@@ -32,6 +38,21 @@ class MGPDClient:
     FCLK_ALLOWED_MHZ = (0, 1, 5, 10, 25, 50, 75, 100, 125, 150)
     PIXEL_MATRIX_ROWS = 32
     PIXEL_MATRIX_COLS = 32
+
+    # Operation Mode Register (OMR[47:0]) byte addresses.
+    # OMR is byte-addressed little-endian in the register map:
+    #   0x0020 -> OMR[7:0]
+    #   0x0021 -> OMR[15:8]
+    #   0x0022 -> OMR[23:16]
+    #   0x0023 -> OMR[31:24]
+    OMR_BYTE_1_ADDRESS = 0x0021
+    OMR_BYTE_2_ADDRESS = 0x0022
+    OMR_BYTE_3_ADDRESS = 0x0023
+
+    OMR_WIN_DIS_MODE_MASK = 1 << 1   # OMR[9]
+    OMR_POL_CTRL_MASK = 1 << 3       # OMR[19]
+    OMR_PUF_MODE_MASK = 1 << 4       # OMR[20]
+    OMR_POL_SW_MASK = 1 << 0         # OMR[24]
 
     def __init__(
         self,
@@ -213,6 +234,115 @@ class MGPDClient:
             return None
 
         return value
+
+    @staticmethod
+    def _validate_bit_state(value: int | bool, name: str = "state") -> int:
+        """Normalize a binary control value to integer 0 or 1."""
+        if isinstance(value, bool):
+            return int(value)
+        if not isinstance(value, int) or value not in (0, 1):
+            raise ValueError(f"{name} must be 0 or 1")
+        return value
+
+    def _update_byte_bits(
+        self,
+        address: int,
+        mask: int,
+        value_bits: int,
+    ) -> bool:
+        """Read-modify-write one byte while preserving every unmasked bit.
+
+        No write is attempted if the read fails. If the requested bits already
+        have the required value, the method returns True without issuing an
+        unnecessary WRITE_BYTE.
+        """
+        self._validate_address(address)
+        self._validate_byte(mask)
+        self._validate_byte(value_bits)
+
+        if value_bits & ~mask:
+            raise ValueError("value_bits must not contain bits outside mask")
+
+        current = self.read_byte(address)
+        if current is None:
+            logger.error(
+                "Cannot update OMR byte: READ_BYTE failed at 0x%04X",
+                address,
+            )
+            return False
+
+        updated = (current & (~mask & 0xFF)) | (value_bits & mask)
+
+        if updated == current:
+            logger.debug(
+                "OMR byte unchanged: addr=0x%04X, value=0x%02X",
+                address,
+                current,
+            )
+            return True
+
+        return self.write_byte(updated, address)
+
+    def set_puf_mode(self, state: int | bool) -> bool:
+        """Set OMR[20] PUF_MODE without changing any other OMR bits.
+
+        state:
+            0 - PUF mode disabled
+            1 - PUF mode enabled
+
+        OMR[20] is bit 4 of byte address 0x0022.
+        """
+        state = self._validate_bit_state(state, "PUF_MODE")
+        return self._update_byte_bits(
+            self.OMR_BYTE_2_ADDRESS,
+            self.OMR_PUF_MODE_MASK,
+            self.OMR_PUF_MODE_MASK if state else 0,
+        )
+
+    def set_win_dis_mode(self, state: int | bool) -> bool:
+        """Set OMR[9] WIN_DIS_MODE without changing any other OMR bits.
+
+        state:
+            0 - window discrimination disabled
+            1 - window discrimination enabled
+
+        OMR[9] is bit 1 of byte address 0x0021.
+        """
+        state = self._validate_bit_state(state, "WIN_DIS_MODE")
+        return self._update_byte_bits(
+            self.OMR_BYTE_1_ADDRESS,
+            self.OMR_WIN_DIS_MODE_MASK,
+            self.OMR_WIN_DIS_MODE_MASK if state else 0,
+        )
+
+    def set_polarity(self, state: int | bool) -> bool:
+        """Select software polarity control and set OMR[24] POL_SW.
+
+        The function intentionally touches only two bits:
+            OMR[24] POL_SW   <- state
+            OMR[19] POL_CTRL <- 1
+
+        POL_SW is prepared first. POL_CTRL is then forced to 1 so that the
+        chip uses the software-controlled OMR[24] value rather than OMR[4].
+        Every byte is handled with READ_BYTE -> masked update -> WRITE_BYTE,
+        preserving all unrelated OMR fields.
+        """
+        state = self._validate_bit_state(state, "polarity")
+
+        # 1) Prepare OMR[24] POL_SW at address 0x0023.
+        if not self._update_byte_bits(
+            self.OMR_BYTE_3_ADDRESS,
+            self.OMR_POL_SW_MASK,
+            self.OMR_POL_SW_MASK if state else 0,
+        ):
+            return False
+
+        # 2) Force OMR[19] POL_CTRL=1 at address 0x0022.
+        return self._update_byte_bits(
+            self.OMR_BYTE_2_ADDRESS,
+            self.OMR_POL_CTRL_MASK,
+            self.OMR_POL_CTRL_MASK,
+        )
 
     @classmethod
     def _validate_pixel_coordinate(cls, row: int, col: int):
