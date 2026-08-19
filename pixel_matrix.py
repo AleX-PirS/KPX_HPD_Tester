@@ -8,7 +8,10 @@ from mgpd import MGPDClient
 
 MATRIX_ROWS = 32
 MATRIX_COLS = 32
-OWNED_COLUMN_START = 16
+# TEMPORARY diagnostic mode: expose the complete physical 32x32 matrix.
+# When the project-owned half is identified, restore these two bounds to the
+# required 16-column range; the GUI/backend derive their active columns here.
+OWNED_COLUMN_START = 0
 OWNED_COLUMN_STOP = 32
 OWNED_COLUMNS = tuple(range(OWNED_COLUMN_START, OWNED_COLUMN_STOP))
 
@@ -171,9 +174,10 @@ DEFAULT_PIXEL_CONFIG = PIXEL_CODEC.pack()
 class PixelMatrixConfiguration:
     """Project helper for the 32x32 physical pixel matrix.
 
-    Only project-owned columns Col=16..31 are exposed by the normal high-level
-    API. Matrix values are not mapped to chip SPI addresses: they are sent as
-    complete 32-bit words through MGPDLab SET_PIXEL_CFG.
+    The currently enabled matrix-column range is exposed by the normal high-level
+    API. In the present diagnostic build this is the complete Col=0..31 range.
+    Matrix values are not mapped to chip SPI addresses: they are sent as complete
+    32-bit words through MGPDLab SET_PIXEL_CFG.
     """
 
     def __init__(
@@ -207,7 +211,7 @@ class PixelMatrixConfiguration:
         self._validate_col(col)
         if col not in self.owned_columns:
             raise ValueError(
-                f"Col={col} is outside the project-owned matrix half. "
+                f"Col={col} is outside the currently enabled matrix range. "
                 f"Allowed columns: "
                 f"{min(self.owned_columns)}..{max(self.owned_columns)}"
             )
@@ -253,7 +257,12 @@ class PixelMatrixConfiguration:
         raw_config: int,
         progress_callback: Callable[[int, int, int, int], None] | None = None,
     ) -> int:
-        """Load one PX config into all owned matrix pixels in UPO memory."""
+        """Load one PX config into every currently enabled matrix pixel in UPO memory.
+
+        The method name is kept for backward compatibility. In the current
+        diagnostic build OWNED_COLUMNS spans Col=0..31, so this stages all 1024
+        physical pixels.
+        """
         PIXEL_CODEC.validate_raw(raw_config)
         total = MATRIX_ROWS * len(self.owned_columns)
         current = 0

@@ -102,7 +102,7 @@ class PixelSettingsEditor(Card):
 
 
 class SweepMatrixMap(QWidget):
-    """Selectable view of only the project-owned 16x32 matrix half.
+    """Selectable view of the currently enabled matrix range.
 
     Selection rules intentionally mimic ordinary desktop selection:
       * click: replace selection with one pixel;
@@ -110,7 +110,7 @@ class SweepMatrixMap(QWidget):
       * Shift+click: rectangle from anchor to clicked pixel;
       * Ctrl+Shift+click: add that rectangle to the existing selection.
 
-    An empty explicit selection means ALL owned pixels will be swept.
+    An empty explicit selection means ALL currently enabled pixels will be swept.
     """
 
     selection_changed = pyqtSignal()
@@ -119,11 +119,11 @@ class SweepMatrixMap(QWidget):
         super().__init__(parent)
         self._selection: set[tuple[int, int]] = set()
         self._anchor: tuple[int, int] | None = None
-        self.setMinimumSize(360, 500)
+        self.setMinimumSize(330, 380)
         self.setMouseTracking(True)
         self.setToolTip(
             "Click = one pixel; Ctrl+click = add/remove; Shift+click = rectangular range; "
-            "Ctrl+Shift = add rectangle. Empty selection means all 512 owned pixels."
+            "Ctrl+Shift = add rectangle. Empty selection means all 1024 matrix pixels."
         )
 
     def explicit_selection(self) -> tuple[tuple[int, int], ...]:
@@ -221,7 +221,13 @@ class SweepMatrixMap(QWidget):
         font = QFont(self.font())
         font.setPointSizeF(max(7.0, min(9.0, cell * 0.55)))
         painter.setFont(font)
-        column_tick_indices = (0, 4, 8, 12, len(OWNED_COLUMNS) - 1)
+        column_tick_indices = tuple(dict.fromkeys((
+            0,
+            len(OWNED_COLUMNS) // 4,
+            len(OWNED_COLUMNS) // 2,
+            (3 * len(OWNED_COLUMNS)) // 4,
+            len(OWNED_COLUMNS) - 1,
+        )))
         for local_col in column_tick_indices:
             col = OWNED_COLUMNS[local_col]
             center_x = x0 + (local_col + 0.5) * cell
@@ -306,8 +312,8 @@ class MatrixSweepPage(QWidget):
         title = QLabel("Matrix sweep")
         title.setObjectName("Title")
         subtitle = QLabel(
-            "Sweep selected pixels in Col=16..31. During each capture exactly one pixel uses "
-            "Sweep settings while every other owned pixel uses Global settings. Empty selection means all pixels."
+            "Sweep selected pixels in Col=0..31. During each capture exactly one pixel uses "
+            "Sweep settings while every other matrix pixel uses Global settings. Empty selection means all pixels."
         )
         subtitle.setObjectName("Muted")
         subtitle.setWordWrap(True)
@@ -356,7 +362,7 @@ class MatrixSweepPage(QWidget):
         selector = Card("Pixel selection")
         selection_note = QLabel(
             "Click: select one. Ctrl+click: add/remove. Shift+click: rectangle from the last anchor. "
-            "Ctrl+Shift: add a rectangle. No explicit selection = sweep all 512 pixels."
+            "Ctrl+Shift: add a rectangle. No explicit selection = sweep all 1024 pixels."
         )
         selection_note.setObjectName("Muted")
         selection_note.setWordWrap(True)
@@ -477,7 +483,7 @@ class MatrixSweepPage(QWidget):
         if explicit:
             self.selection_status.setText(f"Selected: {len(explicit)}")
         else:
-            self.selection_status.setText("Selected: ALL 512")
+            self.selection_status.setText("Selected: ALL 1024")
 
     # --------------------------------------------------------------- connection
 

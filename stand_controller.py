@@ -316,7 +316,10 @@ class StandController(QObject):
         return {"pixels": pixels, "count": count}
 
     def stage_owned_matrix(self, raw_config: int) -> dict:
-        """Load one config into every owned pixel (Rows 0..31, Cols 16..31)."""
+        """Load one config into every currently enabled matrix pixel.
+
+        In the current diagnostic build this means Rows 0..31, Cols 0..31.
+        """
         self._require_fclk_for_configuration()
         matrix = self._require_matrix()
 
@@ -326,12 +329,12 @@ class StandController(QObject):
         count = matrix.set_owned_half(raw_config, progress_callback=progress)
         self._log(
             "INFO",
-            f"Pixel config 0x{raw_config:08X} staged for owned half: "
-            f"{count} pixels (Cols 16..31)",
+            f"Pixel config 0x{raw_config:08X} staged for active matrix range: "
+            f"{count} pixels (Cols {min(matrix.owned_columns)}..{max(matrix.owned_columns)})",
         )
         self._log(
             "WARNING",
-            "The 512 pixels updated through SET_PIXEL_CFG are no longer controlled "
+            f"The {count} pixels updated through SET_PIXEL_CFG are no longer controlled "
             "by the MGPDLab GUI until UPO is restarted.",
         )
         return {"value": raw_config, "count": count}
@@ -365,10 +368,9 @@ class StandController(QObject):
             raise RuntimeError("Failed to send SET_PIXEL_CFG WRITE_TO_CHIP")
         self._log(
             "INFO",
-            "SET_PIXEL_CFG WRITE_TO_CHIP accepted by UPO. Normal Matrix operations "
-            "stage the project-owned Cols 16..31; the explicit full-matrix zero "
-            "operation can stage all 1024 pixels. The protocol-level commit "
-            "writes the complete virtual matrix.",
+            "SET_PIXEL_CFG WRITE_TO_CHIP accepted by UPO. Diagnostic Matrix operations "
+            "currently expose Cols 0..31, so they can stage all 1024 pixels. "
+            "The protocol-level commit writes the complete virtual matrix.",
         )
         self._log(
             "WARNING",
@@ -788,14 +790,14 @@ class StandController(QObject):
         delay_s: float = 0.1,
         disable_fclk_during_capture: bool = False,
     ) -> dict:
-        """Sweep owned matrix pixels and capture one waveform per pixel.
+        """Sweep currently enabled matrix pixels and capture one waveform per pixel.
 
         Hardware invariant during every capture:
             * current pixel -> sweep_raw
-            * every other owned pixel (Cols 16..31) -> global_raw
+            * every other enabled matrix pixel -> global_raw
 
-        To avoid re-sending 512 identical SET_PIXEL_CFG commands before every
-        single capture, the owned half is initialized to global_raw once. Then
+        To avoid re-sending the complete matrix before every single capture,
+        the enabled matrix range is initialized to global_raw once. Then
         the previously swept pixel is restored to global_raw and only the next
         pixel is changed to sweep_raw before WRITE_TO_CHIP. The physical matrix
         state at each capture is therefore identical to a full global reload,
@@ -803,7 +805,7 @@ class StandController(QObject):
 
         TST_IN is selected for the duration of the sweep. The exact previous
         TEST_MUX raw value is restored afterward, including non-one-hot states.
-        The owned half is also returned to global_raw at the end of the sweep.
+        The enabled matrix range is also returned to global_raw at the end of the sweep.
         """
         cfg = self._require_chip()
         self._require_fclk_for_configuration()
@@ -874,7 +876,8 @@ class StandController(QObject):
             # Initial deterministic baseline: every owned pixel is Global.
             self._log(
                 "INFO",
-                f"Matrix sweep: staging Global 0x{global_raw:08X} to all 512 owned pixels",
+                f"Matrix sweep: staging Global 0x{global_raw:08X} to all "
+                f"{MATRIX_ROWS * len(matrix.owned_columns)} enabled pixels",
             )
             matrix.set_owned_half(global_raw)
             if not matrix.write_to_chip():
@@ -976,7 +979,7 @@ class StandController(QObject):
                     restore_errors.append(f"FCLK restore failed: {error}")
                     self._log("ERROR", restore_errors[-1])
 
-            # Leave the project-owned half in the requested Global state. After
+            # Leave the enabled matrix range in the requested Global state. After
             # the initial baseline only the last active sweep pixel can differ.
             if baseline_committed and active_sweep_pixel is not None:
                 try:
@@ -989,7 +992,7 @@ class StandController(QObject):
                         raise RuntimeError("failed to commit final Global matrix")
                     self._log(
                         "INFO",
-                        "Matrix sweep cleanup: owned half restored to Global settings",
+                        "Matrix sweep cleanup: enabled matrix range restored to Global settings",
                     )
                 except Exception as error:
                     restore_errors.append(f"Matrix restore failed: {error}")

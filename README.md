@@ -119,7 +119,7 @@ Oscilloscope GUI defaults: CH1 only, DC 50 ohm coupling selected for all channel
 - `Load default`: load PX software defaults into the selected editor only.
 - `Clear local edits`: discard all edits not yet staged in UPO.
 - `Update`: stage all pixels currently marked `Local edit` in UPO.
-- `Update all`: stage the current editor PX word into all 512 owned pixels (Cols 16..31).
+- `Update all`: in the current diagnostic build, stage the current editor PX word into all 1024 pixels (Cols 0..31).
 - `Write zeros`: stage `0x00000000` into all 1024 physical pixel entries in UPO virtual memory, wait 0.1 s after the final update, then issue `SET_PIXEL_CFG WRITE_TO_CHIP`.
 - `Write`: first stages all current `Local edit` pixels, then immediately sends `SET_PIXEL_CFG WRITE_TO_CHIP`.
 - `Update all` and `Write` execute immediately without confirmation dialogs.
@@ -149,19 +149,19 @@ It contains independent `Global settings` and `Sweep settings` editors for the
 32-bit PX word, one oscilloscope-channel selector, a settling delay and the same
 optional `FCLK OFF during capture` behavior as AMUX sweep.
 
-Only project-owned pixels (Cols 16..31, Rows 0..31) can be selected. Selection
+In the current diagnostic build the complete matrix (Cols 0..31, Rows 0..31) can be selected. Selection
 uses desktop-style modifiers: normal click replaces the selection, Ctrl+click
 toggles individual pixels, Shift+click selects the rectangle between the anchor
 and clicked pixel, and Ctrl+Shift adds such a rectangle. An empty explicit
-selection means all 512 owned pixels.
+selection means all 1024 matrix pixels.
 
-At sweep start the owned half is initialized once with Global settings and
+At sweep start the complete enabled matrix is initialized once with Global settings and
 committed to the chip. For each captured pixel the previous sweep pixel is
 restored to Global settings and only the current pixel is changed to Sweep
 settings before the next commit. Thus each capture has exactly one Sweep pixel
-and all other owned pixels at Global settings without re-sending 512 identical
+and all other matrix pixels at Global settings without re-sending 1024 identical
 SET_PIXEL_CFG commands for every point. After completion (or best-effort cleanup
-on error), the owned half is returned to Global settings.
+on error), the complete enabled matrix is returned to Global settings.
 
 Matrix sweep temporarily selects `TST_IN` on AMUX and restores the exact previous
 TEST_MUX value afterward. Individual waveforms and `combined.csv` are stored in
@@ -172,7 +172,7 @@ saved from the page with Save As dialogs.
 
 ## Matrix grouped editing and parameter view
 
-The Matrix page shows only the project-owned Col=16..31 half. Both matrix views share desktop-style selection: click replaces the selection, Ctrl+click toggles pixels, Shift+click selects a rectangle from the anchor, and Ctrl+Shift+click adds a rectangle. `Apply local` copies the current editor value to the selected pixels locally; `Update` then stages all Local edits in UPO.
+The Matrix page currently shows the complete Col=0..31 matrix for diagnostic identification of the project half. Both matrix views share desktop-style selection: click replaces the selection, Ctrl+click toggles pixels, Shift+click selects a rectangle from the anchor, and Ctrl+Shift+click adds a rectangle. `Apply local` copies the current editor value to the selected pixels locally; `Update` then stages all Local edits in UPO.
 
 The left Parameter view can show `Groups` (complete 32-bit configuration groups) or one PX field as a dynamically normalized heatmap. Uniform fields are muted in the Field selector, varying fields are emphasized, and `Show only varying fields` hides uniform fields. Available continuous maps are Viridis, Cividis, Plasma, Turbo and Grayscale. Hold Alt while hovering either matrix to inspect a pixel without interfering with selection.
 

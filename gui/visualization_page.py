@@ -327,7 +327,7 @@ class VisualizationPage(QWidget):
         selector = Card("Pixel selection")
         selection_note = QLabel(
             "Click: select one. Ctrl+click: add/remove. Shift+click: rectangle from the last anchor. "
-            "Ctrl+Shift: add a rectangle. No explicit selection = sweep all 512 pixels."
+            "Ctrl+Shift: add a rectangle. No explicit selection = sweep all 1024 pixels."
         )
         selection_note.setObjectName("Muted")
         selection_note.setWordWrap(True)
@@ -418,7 +418,7 @@ class VisualizationPage(QWidget):
         if explicit:
             self.matrix_selection_status.setText(f"Selected: {len(explicit)}")
         else:
-            self.matrix_selection_status.setText("Selected: ALL 512")
+            self.matrix_selection_status.setText("Selected: ALL 1024")
 
     # ================================================================ connection
 

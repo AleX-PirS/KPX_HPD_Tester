@@ -158,7 +158,7 @@ class HeatmapScale(QWidget):
 
 
 class OwnedMatrixMap(QWidget):
-    """Interactive view of only the project-owned 16x32 matrix half."""
+    """Interactive view of the currently enabled matrix-column range."""
 
     pixel_clicked = pyqtSignal(int, int, object)  # row, col, keyboard modifiers
 
@@ -172,7 +172,7 @@ class OwnedMatrixMap(QWidget):
         self._hover_provider = None
         self._selection_provider = None
         self._active_provider = None
-        self.setMinimumSize(270, 460)
+        self.setMinimumSize(280, 380)
         self.setMouseTracking(True)
         self.setToolTip("")
 
@@ -345,7 +345,13 @@ class OwnedMatrixMap(QWidget):
         font = QFont(self.font())
         font.setPointSizeF(max(7.0, min(9.0, cell * 0.55)))
         painter.setFont(font)
-        column_tick_indices = (0, 4, 8, 12, len(OWNED_COLUMNS) - 1)
+        column_tick_indices = tuple(dict.fromkeys((
+            0,
+            len(OWNED_COLUMNS) // 4,
+            len(OWNED_COLUMNS) // 2,
+            (3 * len(OWNED_COLUMNS)) // 4,
+            len(OWNED_COLUMNS) - 1,
+        )))
         for local_col in column_tick_indices:
             col = OWNED_COLUMNS[local_col]
             center_x = x0 + (local_col + 0.5) * cell
@@ -396,7 +402,7 @@ class OwnedMatrixMap(QWidget):
 
 
 class MatrixPage(QWidget):
-    """Editor and visual analyser for project-owned Col=16..31 pixels."""
+    """Editor and visual analyser for the currently enabled matrix range."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -424,7 +430,7 @@ class MatrixPage(QWidget):
         root.addWidget(title)
 
         subtitle = QLabel(
-            "Project-owned matrix half, Col=16..31. Use Ctrl/Shift selection for grouped local edits; "
+            "Diagnostic full-matrix access, Col=0..31. Use Ctrl/Shift selection for grouped local edits; "
             "the two maps show parameter differences and write status independently."
         )
         subtitle.setObjectName("Muted")
@@ -482,7 +488,7 @@ class MatrixPage(QWidget):
         # All Parameter-view legends live beside the matrix. This keeps the
         # matrix height independent of the number of configuration groups.
         heat_legend_panel = QWidget()
-        heat_legend_panel.setFixedWidth(160)
+        heat_legend_panel.setFixedWidth(145)
         heat_legend_layout = QVBoxLayout(heat_legend_panel)
         heat_legend_layout.setContentsMargins(2, 0, 0, 0)
         heat_legend_layout.setSpacing(6)
@@ -519,7 +525,7 @@ class MatrixPage(QWidget):
         status_header_layout.setSpacing(6)
 
         selected_row = QHBoxLayout()
-        self.coord_label = QLabel("Col=16 Row=0")
+        self.coord_label = QLabel("Col=0 Row=0")
         self.coord_label.setObjectName("SectionTitle")
         self.selection_label = QLabel("Selected: 1")
         self.selection_label.setObjectName("Muted")
@@ -556,7 +562,7 @@ class MatrixPage(QWidget):
         status_body.addWidget(self.status_map, 1)
 
         status_legend_panel = QWidget()
-        status_legend_panel.setFixedWidth(160)
+        status_legend_panel.setFixedWidth(145)
         status_legend_layout = QVBoxLayout(status_legend_panel)
         status_legend_layout.setContentsMargins(2, 0, 0, 0)
         status_legend_layout.setSpacing(8)
@@ -672,7 +678,7 @@ class MatrixPage(QWidget):
 
         operations = Card("Matrix operations")
         note = QLabel(
-            "Update all sends the current editor value to all 512 owned pixels. "
+            "Update all sends the current editor value to all 1024 matrix pixels. "
             "Write first stages all Local edits, then commits the virtual matrix to the chip."
         )
         note.setObjectName("Muted")
@@ -702,9 +708,9 @@ class MatrixPage(QWidget):
         operations.layout_.addWidget(self.write_zeros)
 
         commit_note = QLabel(
-            "Normal Matrix operations modify only Col=16..31 in MGPDLab virtual memory. "
-            "Write zeros is the explicit exception: it stages zero into all 1024 virtual pixels, "
-            "waits 0.1 s, and then commits the complete virtual matrix to the chip."
+            "Diagnostic mode currently exposes Col=0..31, so normal Matrix operations can modify "
+            "the complete 1024-pixel MGPDLab virtual matrix. Write zeros stages zero into all 1024 "
+            "pixels, waits 0.1 s, and then commits the complete virtual matrix to the chip."
         )
         commit_note.setObjectName("Muted")
         commit_note.setWordWrap(True)
@@ -1024,7 +1030,7 @@ class MatrixPage(QWidget):
             self._build_group_cache()
             count = len(self._group_cache)
             self.heat_summary.setText(
-                f"{count} unique configuration{'s' if count != 1 else ''} across 512 working values"
+                f"{count} unique configuration{'s' if count != 1 else ''} across {len(self._values)} working values"
             )
             self._refresh_group_legend()
         else:

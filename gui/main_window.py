@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 import EO_cfg
+from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 from stand_controller import StandController
 from workers import HardwareTaskRunner
 from .widgets import Card, FloatEdit, LogPanel, OutputStateButton, RegisterTable, StatusBadge
@@ -1270,11 +1271,11 @@ class MainWindow(QMainWindow):
         raw = self.matrix.current_raw_value()
 
         self.matrix.set_busy(True)
-        self.matrix.progress.setRange(0, 32 * 16)
+        self.matrix.progress.setRange(0, MATRIX_ROWS * len(OWNED_COLUMNS))
         self.matrix.progress.setValue(0)
         self.matrix.progress.setFormat("Starting bulk pixel update...")
         self._run(
-            f"Staging 0x{raw:08X} to owned matrix half (512 pixels)...",
+            f"Staging 0x{raw:08X} to complete matrix ({MATRIX_ROWS * len(OWNED_COLUMNS)} pixels)...",
             lambda: self.controller.stage_owned_matrix(raw),
             on_result=self.matrix.apply_bulk_stage_result,
             on_finished=lambda: self.matrix.set_busy(False),
