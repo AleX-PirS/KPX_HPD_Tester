@@ -316,7 +316,7 @@ class StandController(QObject):
         return {"pixels": pixels, "count": count}
 
     def stage_owned_matrix(self, raw_config: int) -> dict:
-        """Load one config into every owned pixel (Rows 0..31, Cols 16..31)."""
+        """Load one config into every owned pixel (Rows 0..31, Cols 0..15)."""
         self._require_fclk_for_configuration()
         matrix = self._require_matrix()
 
@@ -327,12 +327,33 @@ class StandController(QObject):
         self._log(
             "INFO",
             f"Pixel config 0x{raw_config:08X} staged for owned half: "
-            f"{count} pixels (Cols 16..31)",
+            f"{count} pixels (Cols 0..15)",
         )
         self._log(
             "WARNING",
             "The 512 pixels updated through SET_PIXEL_CFG are no longer controlled "
             "by the MGPDLab GUI until UPO is restarted.",
+        )
+        return {"value": raw_config, "count": count}
+
+    def stage_full_matrix(self, raw_config: int) -> dict:
+        """Stage one 32-bit PX word into all 1024 pixels in UPO memory only."""
+        self._require_fclk_for_configuration()
+        matrix = self._require_matrix()
+
+        def progress(current: int, total: int, row: int, col: int):
+            self.pixel_matrix_progress.emit(current, total, row, col)
+
+        count = matrix.set_full_matrix(raw_config, progress_callback=progress)
+        self._log(
+            "INFO",
+            f"Pixel config 0x{raw_config:08X} staged for the complete 32x32 matrix: "
+            f"{count} pixels",
+        )
+        self._log(
+            "WARNING",
+            "All 1024 pixels changed through SET_PIXEL_CFG are no longer controlled "
+            "by the MGPDLab GUI until UPO is restarted. WRITE_TO_CHIP was not sent.",
         )
         return {"value": raw_config, "count": count}
 
@@ -344,9 +365,10 @@ class StandController(QObject):
             raise RuntimeError("Failed to send SET_PIXEL_CFG WRITE_TO_CHIP")
         self._log(
             "INFO",
-            "SET_PIXEL_CFG WRITE_TO_CHIP accepted by UPO. Our code only stages "
-            "Cols 16..31; the protocol-level commit itself writes the complete "
-            "virtual matrix.",
+            "SET_PIXEL_CFG WRITE_TO_CHIP accepted by UPO. Normal Matrix operations "
+            "stage the project-owned Cols 0..15; the explicit full-matrix zero "
+            "operation can stage all 1024 pixels. The protocol-level commit "
+            "writes the complete virtual matrix.",
         )
         self._log(
             "WARNING",
@@ -770,7 +792,7 @@ class StandController(QObject):
 
         Hardware invariant during every capture:
             * current pixel -> sweep_raw
-            * every other owned pixel (Cols 16..31) -> global_raw
+            * every other owned pixel (Cols 0..15) -> global_raw
 
         To avoid re-sending 512 identical SET_PIXEL_CFG commands before every
         single capture, the owned half is initialized to global_raw once. Then

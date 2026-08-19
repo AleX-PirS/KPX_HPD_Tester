@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 import traceback
 
 from PyQt6.QtCore import Qt
@@ -992,6 +993,7 @@ class MainWindow(QMainWindow):
         self.matrix.send_raw.clicked.connect(self._send_raw_pixel)
         self.matrix.stage_all.clicked.connect(self._stage_owned_matrix)
         self.matrix.write_chip.clicked.connect(self._write_pixel_matrix)
+        self.matrix.write_zeros.clicked.connect(self._stage_full_matrix_zeros)
 
         self.osc.apply_settings.clicked.connect(self._apply_osc)
         self.osc.dc_button.clicked.connect(self._measure_dc)
@@ -1275,6 +1277,63 @@ class MainWindow(QMainWindow):
             f"Staging 0x{raw:08X} to owned matrix half (512 pixels)...",
             lambda: self.controller.stage_owned_matrix(raw),
             on_result=self.matrix.apply_bulk_stage_result,
+            on_finished=lambda: self.matrix.set_busy(False),
+        )
+
+    def _stage_full_matrix_zeros(self):
+        """Stage zero into all 1024 UPO pixels, wait 100 ms, then commit."""
+        self.matrix.set_busy(True)
+        self.matrix.progress.setRange(0, 32 * 32)
+        self.matrix.progress.setValue(0)
+        self.matrix.progress.setFormat("Starting full-matrix zero update...")
+
+        def operation():
+            stage_result = self.controller.stage_full_matrix(0)
+            # Give UPO a short settling interval after the final SET_PIXEL_CFG
+            # before asking it to transfer the virtual matrix into the chip.
+            time.sleep(0.1)
+            try:
+                commit_ok = self.controller.write_pixel_matrix_to_chip()
+            except Exception as error:
+                # All 1024 virtual pixels have already been updated at this
+                # point, so preserve that information in the GUI even if the
+                # final WRITE_TO_CHIP command fails.
+                return {
+                    "stage_result": stage_result,
+                    "commit_ok": False,
+                    "commit_error": str(error),
+                    "commit_traceback": traceback.format_exc(),
+                }
+
+            return {
+                "stage_result": stage_result,
+                "commit_ok": bool(commit_ok),
+                "commit_error": None,
+                "commit_traceback": None,
+            }
+
+        def applied(result: dict):
+            self.matrix.apply_bulk_stage_result(result["stage_result"])
+
+            if result.get("commit_ok"):
+                self.matrix.apply_commit_result(True)
+                self.matrix.progress.setFormat("Zeros written to all 1024 pixels")
+                return
+
+            message = result.get("commit_error") or "SET_PIXEL_CFG WRITE_TO_CHIP failed"
+            self.matrix.progress.setFormat(
+                "Zero values staged in UPO, but WRITE_TO_CHIP failed"
+            )
+            self.log.append("ERROR", message)
+            tb = result.get("commit_traceback")
+            if tb and self.log.low_level.isChecked():
+                self.log.append("DEBUG", tb, True)
+            QMessageBox.critical(self, "Hardware operation failed", message)
+
+        self._run(
+            "Writing 0x00000000 to all 1024 matrix pixels...",
+            operation,
+            on_result=applied,
             on_finished=lambda: self.matrix.set_busy(False),
         )
 

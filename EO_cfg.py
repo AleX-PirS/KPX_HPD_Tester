@@ -351,9 +351,9 @@ DEFAULT_FIELD_VALUES = {
     # Injection system
     "DAC_PFB": 512,
     "DAC_PFB_TR": 3,
-    "DAC_TST_REF1": 500,
+    "DAC_TST_REF1": 600,
     "DAC_TST_REF1_TR": 3,
-    "DAC_TST_REF2": 700,
+    "DAC_TST_REF2": 800,
     "DAC_TST_REF2_TR": 3,
     "TST_REF1_MUX": 0,
     "TST_REF2_MUX": 0,

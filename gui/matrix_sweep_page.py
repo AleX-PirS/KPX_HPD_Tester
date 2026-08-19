@@ -221,7 +221,7 @@ class SweepMatrixMap(QWidget):
         font = QFont(self.font())
         font.setPointSizeF(max(7.0, min(9.0, cell * 0.55)))
         painter.setFont(font)
-        for col in (16, 20, 24, 28, 31):
+        for col in (0, 4, 8, 12, 15):
             local_col = col - min(OWNED_COLUMNS)
             center_x = x0 + (local_col + 0.5) * cell
             painter.drawText(
@@ -305,7 +305,7 @@ class MatrixSweepPage(QWidget):
         title = QLabel("Matrix sweep")
         title.setObjectName("Title")
         subtitle = QLabel(
-            "Sweep selected pixels in Col=16..31. During each capture exactly one pixel uses "
+            "Sweep selected pixels in Col=0..15. During each capture exactly one pixel uses "
             "Sweep settings while every other owned pixel uses Global settings. Empty selection means all pixels."
         )
         subtitle.setObjectName("Muted")

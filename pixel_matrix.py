@@ -8,8 +8,8 @@ from mgpd import MGPDClient
 
 MATRIX_ROWS = 32
 MATRIX_COLS = 32
-OWNED_COLUMN_START = 16
-OWNED_COLUMN_STOP = 32
+OWNED_COLUMN_START = 0
+OWNED_COLUMN_STOP = 16
 OWNED_COLUMNS = tuple(range(OWNED_COLUMN_START, OWNED_COLUMN_STOP))
 
 PIXEL_CONFIG_BITS = 32
@@ -171,7 +171,7 @@ DEFAULT_PIXEL_CONFIG = PIXEL_CODEC.pack()
 class PixelMatrixConfiguration:
     """Project helper for the 32x32 physical pixel matrix.
 
-    Only project-owned columns Col=16..31 are exposed by the normal high-level
+    Only project-owned columns Col=0..15 are exposed by the normal high-level
     API. Matrix values are not mapped to chip SPI addresses: they are sent as
     complete 32-bit words through MGPDLab SET_PIXEL_CFG.
     """
@@ -260,6 +260,38 @@ class PixelMatrixConfiguration:
 
         for row in range(MATRIX_ROWS):
             for col in self.owned_columns:
+                current += 1
+                if not self.client.set_pixel_cfg(
+                    row=row,
+                    col=col,
+                    value=raw_config,
+                ):
+                    raise RuntimeError(
+                        f"SET_PIXEL_CFG failed at Col={col} Row={row} "
+                        f"after {current - 1}/{total} successful pixel updates"
+                    )
+                if progress_callback is not None:
+                    progress_callback(current, total, row, col)
+
+        return total
+
+    def set_full_matrix(
+        self,
+        raw_config: int,
+        progress_callback: Callable[[int, int, int, int], None] | None = None,
+    ) -> int:
+        """Stage one PX word into all 1024 physical pixels in UPO memory.
+
+        This is an explicit full-matrix operation and therefore intentionally
+        bypasses the normal project-owned-column restriction. It does not call
+        WRITE_TO_CHIP.
+        """
+        PIXEL_CODEC.validate_raw(raw_config)
+        total = MATRIX_ROWS * MATRIX_COLS
+        current = 0
+
+        for row in range(MATRIX_ROWS):
+            for col in range(MATRIX_COLS):
                 current += 1
                 if not self.client.set_pixel_cfg(
                     row=row,
