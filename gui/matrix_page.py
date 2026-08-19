@@ -345,8 +345,9 @@ class OwnedMatrixMap(QWidget):
         font = QFont(self.font())
         font.setPointSizeF(max(7.0, min(9.0, cell * 0.55)))
         painter.setFont(font)
-        for col in (0, 4, 8, 12, 15):
-            local_col = col - min(OWNED_COLUMNS)
+        column_tick_indices = (0, 4, 8, 12, len(OWNED_COLUMNS) - 1)
+        for local_col in column_tick_indices:
+            col = OWNED_COLUMNS[local_col]
             center_x = x0 + (local_col + 0.5) * cell
             painter.drawText(
                 QRectF(center_x - 18, y0 - 24, 36, 18),
@@ -395,7 +396,7 @@ class OwnedMatrixMap(QWidget):
 
 
 class MatrixPage(QWidget):
-    """Editor and visual analyser for project-owned Col=0..15 pixels."""
+    """Editor and visual analyser for project-owned Col=16..31 pixels."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -423,7 +424,7 @@ class MatrixPage(QWidget):
         root.addWidget(title)
 
         subtitle = QLabel(
-            "Project-owned matrix half, Col=0..15. Use Ctrl/Shift selection for grouped local edits; "
+            "Project-owned matrix half, Col=16..31. Use Ctrl/Shift selection for grouped local edits; "
             "the two maps show parameter differences and write status independently."
         )
         subtitle.setObjectName("Muted")
@@ -518,7 +519,7 @@ class MatrixPage(QWidget):
         status_header_layout.setSpacing(6)
 
         selected_row = QHBoxLayout()
-        self.coord_label = QLabel("Col=0 Row=0")
+        self.coord_label = QLabel("Col=16 Row=0")
         self.coord_label.setObjectName("SectionTitle")
         self.selection_label = QLabel("Selected: 1")
         self.selection_label.setObjectName("Muted")
@@ -701,7 +702,7 @@ class MatrixPage(QWidget):
         operations.layout_.addWidget(self.write_zeros)
 
         commit_note = QLabel(
-            "Normal Matrix operations modify only Col=0..15 in MGPDLab virtual memory. "
+            "Normal Matrix operations modify only Col=16..31 in MGPDLab virtual memory. "
             "Write zeros is the explicit exception: it stages zero into all 1024 virtual pixels, "
             "waits 0.1 s, and then commits the complete virtual matrix to the chip."
         )

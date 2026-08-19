@@ -8,8 +8,8 @@ from mgpd import MGPDClient
 
 MATRIX_ROWS = 32
 MATRIX_COLS = 32
-OWNED_COLUMN_START = 0
-OWNED_COLUMN_STOP = 16
+OWNED_COLUMN_START = 16
+OWNED_COLUMN_STOP = 32
 OWNED_COLUMNS = tuple(range(OWNED_COLUMN_START, OWNED_COLUMN_STOP))
 
 PIXEL_CONFIG_BITS = 32
@@ -171,7 +171,7 @@ DEFAULT_PIXEL_CONFIG = PIXEL_CODEC.pack()
 class PixelMatrixConfiguration:
     """Project helper for the 32x32 physical pixel matrix.
 
-    Only project-owned columns Col=0..15 are exposed by the normal high-level
+    Only project-owned columns Col=16..31 are exposed by the normal high-level
     API. Matrix values are not mapped to chip SPI addresses: they are sent as
     complete 32-bit words through MGPDLab SET_PIXEL_CFG.
     """

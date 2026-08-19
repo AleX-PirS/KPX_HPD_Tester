@@ -119,7 +119,7 @@ Oscilloscope GUI defaults: CH1 only, DC 50 ohm coupling selected for all channel
 - `Load default`: load PX software defaults into the selected editor only.
 - `Clear local edits`: discard all edits not yet staged in UPO.
 - `Update`: stage all pixels currently marked `Local edit` in UPO.
-- `Update all`: stage the current editor PX word into all 512 owned pixels (Cols 0..15).
+- `Update all`: stage the current editor PX word into all 512 owned pixels (Cols 16..31).
 - `Write zeros`: stage `0x00000000` into all 1024 physical pixel entries in UPO virtual memory, wait 0.1 s after the final update, then issue `SET_PIXEL_CFG WRITE_TO_CHIP`.
 - `Write`: first stages all current `Local edit` pixels, then immediately sends `SET_PIXEL_CFG WRITE_TO_CHIP`.
 - `Update all` and `Write` execute immediately without confirmation dialogs.
@@ -149,7 +149,7 @@ It contains independent `Global settings` and `Sweep settings` editors for the
 32-bit PX word, one oscilloscope-channel selector, a settling delay and the same
 optional `FCLK OFF during capture` behavior as AMUX sweep.
 
-Only project-owned pixels (Cols 0..15, Rows 0..31) can be selected. Selection
+Only project-owned pixels (Cols 16..31, Rows 0..31) can be selected. Selection
 uses desktop-style modifiers: normal click replaces the selection, Ctrl+click
 toggles individual pixels, Shift+click selects the rectangle between the anchor
 and clicked pixel, and Ctrl+Shift adds such a rectangle. An empty explicit
@@ -172,7 +172,7 @@ saved from the page with Save As dialogs.
 
 ## Matrix grouped editing and parameter view
 
-The Matrix page shows only the project-owned Col=0..15 half. Both matrix views share desktop-style selection: click replaces the selection, Ctrl+click toggles pixels, Shift+click selects a rectangle from the anchor, and Ctrl+Shift+click adds a rectangle. `Apply local` copies the current editor value to the selected pixels locally; `Update` then stages all Local edits in UPO.
+The Matrix page shows only the project-owned Col=16..31 half. Both matrix views share desktop-style selection: click replaces the selection, Ctrl+click toggles pixels, Shift+click selects a rectangle from the anchor, and Ctrl+Shift+click adds a rectangle. `Apply local` copies the current editor value to the selected pixels locally; `Update` then stages all Local edits in UPO.
 
 The left Parameter view can show `Groups` (complete 32-bit configuration groups) or one PX field as a dynamically normalized heatmap. Uniform fields are muted in the Field selector, varying fields are emphasized, and `Show only varying fields` hides uniform fields. Available continuous maps are Viridis, Cividis, Plasma, Turbo and Grayscale. Hold Alt while hovering either matrix to inspect a pixel without interfering with selection.
 

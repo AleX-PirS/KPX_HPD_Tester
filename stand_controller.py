@@ -316,7 +316,7 @@ class StandController(QObject):
         return {"pixels": pixels, "count": count}
 
     def stage_owned_matrix(self, raw_config: int) -> dict:
-        """Load one config into every owned pixel (Rows 0..31, Cols 0..15)."""
+        """Load one config into every owned pixel (Rows 0..31, Cols 16..31)."""
         self._require_fclk_for_configuration()
         matrix = self._require_matrix()
 
@@ -327,7 +327,7 @@ class StandController(QObject):
         self._log(
             "INFO",
             f"Pixel config 0x{raw_config:08X} staged for owned half: "
-            f"{count} pixels (Cols 0..15)",
+            f"{count} pixels (Cols 16..31)",
         )
         self._log(
             "WARNING",
@@ -366,7 +366,7 @@ class StandController(QObject):
         self._log(
             "INFO",
             "SET_PIXEL_CFG WRITE_TO_CHIP accepted by UPO. Normal Matrix operations "
-            "stage the project-owned Cols 0..15; the explicit full-matrix zero "
+            "stage the project-owned Cols 16..31; the explicit full-matrix zero "
             "operation can stage all 1024 pixels. The protocol-level commit "
             "writes the complete virtual matrix.",
         )
@@ -792,7 +792,7 @@ class StandController(QObject):
 
         Hardware invariant during every capture:
             * current pixel -> sweep_raw
-            * every other owned pixel (Cols 0..15) -> global_raw
+            * every other owned pixel (Cols 16..31) -> global_raw
 
         To avoid re-sending 512 identical SET_PIXEL_CFG commands before every
         single capture, the owned half is initialized to global_raw once. Then
