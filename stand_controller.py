@@ -40,6 +40,7 @@ class StandController(QObject):
         self.cfg: Configuration | None = None
         self.matrix_cfg: PixelMatrixConfiguration | None = None
         self._fclk_mhz: int | None = None
+        self._last_nonzero_fclk_mhz: int | None = None
         self._ctrl_static_state: int | None = None
         self._ctrl_pwm_enabled: bool | None = None
         self.osc: Oscilloscope | None = None
@@ -89,6 +90,7 @@ class StandController(QObject):
         # The new protocol has SET_FCLK but no matching GET_FCLK command, so
         # the actual clock state is unknown immediately after connection.
         self._fclk_mhz = None
+        self._last_nonzero_fclk_mhz = None
         self._ctrl_static_state = None
         self._ctrl_pwm_enabled = None
         self.fclk_changed.emit(None)
@@ -111,6 +113,7 @@ class StandController(QObject):
                 self.cfg = None
                 self.matrix_cfg = None
                 self._fclk_mhz = None
+                self._last_nonzero_fclk_mhz = None
                 self._ctrl_static_state = None
                 self._ctrl_pwm_enabled = None
 
@@ -208,8 +211,7 @@ class StandController(QObject):
         # explicitly set FCLK=0 and therefore knows that the clock is disabled.
         if self._fclk_mhz == 0:
             raise RuntimeError(
-                "FCLK is disabled (0 MHz). Re-enable FCLK before changing "
-                "chip registers or pixel configuration."
+                "FCLK is disabled (0 MHz). Re-enable FCLK before changing pixel configuration."
             )
 
     def set_fclk(self, frequency_mhz: int) -> int:
@@ -218,15 +220,42 @@ class StandController(QObject):
         if not self.client.set_fclk(frequency_mhz):
             raise RuntimeError(f"Failed to set FCLK={frequency_mhz} MHz")
         self._fclk_mhz = int(frequency_mhz)
+        if self._fclk_mhz > 0:
+            self._last_nonzero_fclk_mhz = self._fclk_mhz
         self.fclk_changed.emit(self._fclk_mhz)
         if frequency_mhz == 0:
             self._log(
                 "WARNING",
-                "FCLK disabled. Re-enable it before changing registers or pixel settings.",
+                "FCLK disabled. Pixel configuration still requires FCLK; chip constant writes will temporarily restore it automatically.",
             )
         else:
             self._log("INFO", f"FCLK <- {frequency_mhz} MHz OK")
         return self._fclk_mhz
+
+    def _enable_fclk_for_constant_write_if_needed(self) -> bool:
+        """Temporarily restore FCLK when GUI knows it is currently OFF.
+
+        Register/constant writes require a running FCLK. If the user explicitly
+        disabled FCLK through this GUI, restore the last known non-zero value
+        (100 MHz fallback), perform the write, and let the caller switch it back
+        to 0 in a finally block. Unknown FCLK state keeps the historical behavior.
+        """
+        if self._fclk_mhz != 0:
+            return False
+
+        restore_mhz = self._last_nonzero_fclk_mhz or 100
+        self._log(
+            "INFO",
+            f"FCLK is OFF; temporarily restoring {restore_mhz} MHz for chip constant write",
+        )
+        self.set_fclk(restore_mhz)
+        return True
+
+    def _restore_fclk_off_after_constant_write(self, temporary_enable: bool):
+        if not temporary_enable:
+            return
+        self.set_fclk(0)
+        self._log("INFO", "FCLK returned to OFF after chip constant write")
 
     def toggle_fclk(self, enable_frequency_mhz: int = 100) -> int:
         """Toggle FCLK between 0 and the selected non-zero frequency.
@@ -346,29 +375,35 @@ class StandController(QObject):
         amux_signal: str | None = None,
     ) -> dict:
         cfg = self._require_chip()
-        self._require_fclk_for_configuration()
+        temporary_fclk = self._enable_fclk_for_constant_write_if_needed()
 
-        for name, value in changed_fields.items():
-            if name == "TEST_MUX":
-                # TEST_MUX is controlled through the dedicated AMUX control.
-                continue
-            if not cfg.set_data(name, value):
-                raise RuntimeError(f"Failed to write {name}={value}")
-            self._log("INFO", f"CHIP {name} <- {value} OK")
+        try:
+            for name, value in changed_fields.items():
+                if name == "TEST_MUX":
+                    # TEST_MUX is controlled through the dedicated AMUX control.
+                    continue
+                if not cfg.set_data(name, value):
+                    raise RuntimeError(f"Failed to write {name}={value}")
+                self._log("INFO", f"CHIP {name} <- {value} OK")
 
-        if amux_signal is not None:
-            if not cfg.set_amux(amux_signal):
-                raise RuntimeError(f"Failed to set AMUX={amux_signal}")
-            self._log("INFO", f"AMUX <- {amux_signal} OK")
+            if amux_signal is not None:
+                if not cfg.set_amux(amux_signal):
+                    raise RuntimeError(f"Failed to set AMUX={amux_signal}")
+                self._log("INFO", f"AMUX <- {amux_signal} OK")
+        finally:
+            self._restore_fclk_off_after_constant_write(temporary_fclk)
 
         return self.read_chip_snapshot()
 
     def load_chip_defaults(self) -> dict:
         cfg = self._require_chip()
-        self._require_fclk_for_configuration()
-        if not cfg.set_default():
-            raise RuntimeError("Failed to load default registers")
-        self._log("INFO", "Default chip configuration loaded")
+        temporary_fclk = self._enable_fclk_for_constant_write_if_needed()
+        try:
+            if not cfg.set_default():
+                raise RuntimeError("Failed to load default registers")
+            self._log("INFO", "Default chip configuration loaded")
+        finally:
+            self._restore_fclk_off_after_constant_write(temporary_fclk)
         return self.read_chip_snapshot()
 
     def set_ctrl_static(self, state: int) -> bool:

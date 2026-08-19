@@ -46,7 +46,7 @@ class PixelField:
 PX_FIELDS: dict[str, PixelField] = {
     "PX_GAIN": PixelField(offset=0, width=5, default=4),
     "PX_SHT": PixelField(offset=5, width=3, default=2),
-    "PX_REG": PixelField(offset=8, width=1, default=0),
+    "PX_MASK": PixelField(offset=8, width=1, default=0),
     "PX_SH_EN": PixelField(offset=9, width=1, default=0),
     "PX_TST_EN": PixelField(offset=10, width=1, default=0),
     "PX_BUF_NEN": PixelField(offset=11, width=1, default=1),

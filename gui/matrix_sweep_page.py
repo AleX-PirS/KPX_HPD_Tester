@@ -58,7 +58,8 @@ class PixelSettingsEditor(Card):
             edit.setToolTip(f"{name}: {width} bit(s)")
             self.field_edits[name] = edit
 
-            grid.addWidget(QLabel(name), row, label_col)
+            display_name = name[3:] if name.startswith("PX_") else name
+            grid.addWidget(QLabel(display_name), row, label_col)
             grid.addWidget(edit, row, edit_col)
 
         grid.setColumnStretch(1, 1)
@@ -143,6 +144,15 @@ class SweepMatrixMap(QWidget):
         self.update()
         self.selection_changed.emit()
 
+    @staticmethod
+    def _visual_row(row: int) -> int:
+        """Display Row=0 at the bottom and Row=31 at the top."""
+        return MATRIX_ROWS - 1 - int(row)
+
+    @staticmethod
+    def _logical_row(visual_row: int) -> int:
+        return MATRIX_ROWS - 1 - int(visual_row)
+
     def _geometry(self):
         left = 40.0
         top = 28.0
@@ -172,7 +182,7 @@ class SweepMatrixMap(QWidget):
             for local_col, col in enumerate(OWNED_COLUMNS):
                 rect = QRectF(
                     x0 + local_col * cell,
-                    y0 + row * cell,
+                    y0 + self._visual_row(row) * cell,
                     cell,
                     cell,
                 )
@@ -197,7 +207,7 @@ class SweepMatrixMap(QWidget):
                 local_col = col - min(OWNED_COLUMNS)
                 rect = QRectF(
                     x0 + local_col * cell + 1,
-                    y0 + row * cell + 1,
+                    y0 + self._visual_row(row) * cell + 1,
                     max(cell - 2, 1),
                     max(cell - 2, 1),
                 )
@@ -220,7 +230,7 @@ class SweepMatrixMap(QWidget):
                 str(col),
             )
         for row in (0, 8, 16, 24, 31):
-            center_y = y0 + (row + 0.5) * cell
+            center_y = y0 + (self._visual_row(row) + 0.5) * cell
             painter.drawText(
                 QRectF(x0 - 34, center_y - 9, 29, 18),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
@@ -239,7 +249,8 @@ class SweepMatrixMap(QWidget):
             return
 
         local_col = int((x - x0) // cell)
-        row = int((y - y0) // cell)
+        visual_row = int((y - y0) // cell)
+        row = self._logical_row(visual_row)
         col = min(OWNED_COLUMNS) + local_col
         if col not in OWNED_COLUMNS or not 0 <= row < MATRIX_ROWS:
             return

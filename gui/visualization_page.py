@@ -20,11 +20,13 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 import EO_cfg
+from .matrix_sweep_page import PixelSettingsEditor, SweepMatrixMap
 from .styles import current_theme_colors
 from .widgets import Card, FloatEdit
 
@@ -66,13 +68,14 @@ class AspectRatioImageLabel(QLabel):
 
 
 class VisualizationPage(QWidget):
-    """Oscilloscope screen preview and AMUX multi-signal visualization."""
+    """Shared oscilloscope preview with AMUX and matrix sweep control tabs."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._chip_connected = False
         self._osc_connected = False
-        self._sweep_busy = False
+        self._amux_busy = False
+        self._matrix_busy = False
         self._capture_busy = False
         self.current_mode: str | None = None
         self.current_screenshot_path: Path | None = None
@@ -85,8 +88,8 @@ class VisualizationPage(QWidget):
         title = QLabel("Visualize")
         title.setObjectName("Title")
         subtitle = QLabel(
-            "Preview the oscilloscope screen or sweep selected chip AMUX signals "
-            "without changing the current oscilloscope setup."
+            "Oscilloscope screen preview, AMUX sweep and matrix sweep share one visualization area. "
+            "Sweep acquisition uses the current oscilloscope setup."
         )
         subtitle.setObjectName("Muted")
         subtitle.setWordWrap(True)
@@ -97,153 +100,52 @@ class VisualizationPage(QWidget):
         split.setHandleWidth(5)
         root.addWidget(split, 1)
 
-        # ------------------------------------------------------------------ left
+        # ---------------------------------------------------------------- controls
         controls = QWidget()
-        controls.setMinimumWidth(390)
-        controls.setMaximumWidth(520)
+        controls.setMinimumWidth(450)
+        controls.setMaximumWidth(650)
         controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(0, 0, 6, 0)
-        controls_layout.setSpacing(12)
+        controls_layout.setContentsMargins(0, 0, 8, 0)
+        controls_layout.setSpacing(10)
 
+        # Screenshot remains permanently accessible above both sweep tabs.
         screen_card = Card("Oscilloscope screen")
-        screen_note = QLabel(
-            "Capture the current instrument display. Each refresh overwrites "
-            "temp/oscilloscope_screen.png."
-        )
+        screen_row = QHBoxLayout()
+        screen_note = QLabel("Capture the current instrument display.")
         screen_note.setObjectName("Muted")
-        screen_note.setWordWrap(True)
         self.refresh_screen = QPushButton("Refresh screen")
         self.refresh_screen.setObjectName("PrimaryButton")
-        screen_card.layout_.addWidget(screen_note)
-        screen_card.layout_.addWidget(self.refresh_screen)
+        screen_row.addWidget(screen_note, 1)
+        screen_row.addWidget(self.refresh_screen)
+        screen_card.layout_.addLayout(screen_row)
         controls_layout.addWidget(screen_card)
 
-        sweep_card = Card("AMUX sweep")
-        form = QFormLayout()
-        self.scope_channel = QComboBox()
-        self.scope_channel.addItems(["1", "2", "3", "4"])
-        self.scope_channel.setCurrentText("1")
-        self.delay_s = FloatEdit(0.1)
-        self.delay_s.setPlaceholderText("0.1")
-        form.addRow("Oscilloscope channel", self.scope_channel)
-        form.addRow("AMUX settling delay, s", self.delay_s)
-        sweep_card.layout_.addLayout(form)
+        self.sweep_tabs = QTabWidget()
+        self.sweep_tabs.setObjectName("SweepModeTabs")
+        # Use two equal-width, button-like tabs instead of the compact native
+        # document tabs. The QSS gives the selector a clear active state.
+        self.sweep_tabs.setDocumentMode(False)
+        self.sweep_tabs.tabBar().setExpanding(True)
+        self.sweep_tabs.addTab(self._build_amux_tab(), "AMUX SWEEP")
+        self.sweep_tabs.addTab(self._build_matrix_tab(), "MATRIX SWEEP")
+        controls_layout.addWidget(self.sweep_tabs, 1)
 
-        self.fclk_off_capture = QCheckBox("FCLK OFF during capture")
-        self.fclk_off_capture.setChecked(False)
-        self.fclk_off_capture.setToolTip(
-            "For each selected AMUX signal: set AMUX, force FCLK to 0, wait the "
-            "settling delay, capture the waveform, then restore FCLK before the next AMUX switch. "
-            "If the previous FCLK frequency is unknown, 100 MHz is used."
-        )
-        sweep_card.layout_.addWidget(self.fclk_off_capture)
-
-        signal_actions = QHBoxLayout()
-        self.select_all = QPushButton("Select all")
-        self.clear_all = QPushButton("Clear")
-        signal_actions.addWidget(self.select_all)
-        signal_actions.addWidget(self.clear_all)
-        signal_actions.addStretch(1)
-        sweep_card.layout_.addLayout(signal_actions)
-
-        signal_scroll = QScrollArea()
-        signal_scroll.setWidgetResizable(True)
-        signal_scroll.setMinimumHeight(330)
-        signal_container = QWidget()
-        signal_grid = QGridLayout(signal_container)
-        # Extra bottom space guarantees that the last AMUX rows are visually
-        # separated from the sweep controls below the scroll area.
-        signal_grid.setContentsMargins(4, 4, 8, 8)
-        signal_grid.setHorizontalSpacing(12)
-        signal_grid.setVerticalSpacing(6)
-
-        ordered_signals = sorted(EO_cfg.AMUX_SIGNALS.items(), key=lambda item: item[1])
-        self.signal_checks: dict[str, QCheckBox] = {}
-        columns = 2
-        rows_per_column = (len(ordered_signals) + columns - 1) // columns
-        for index, (signal, number) in enumerate(ordered_signals):
-            checkbox = QCheckBox(f"{number:02d}  {signal}")
-            checkbox.setToolTip(signal)
-            self.signal_checks[signal] = checkbox
-            column = index // rows_per_column
-            row = index % rows_per_column
-            signal_grid.addWidget(checkbox, row, column)
-
-        # IMPORTANT: do not rely on QScrollArea/widgetResizable to infer the
-        # complete content height. With two columns the final pair (19/39) can
-        # otherwise be laid out partly below the viewport while Qt still
-        # considers the content to fit. A real spacer row plus an explicit
-        # minimum height makes the scroll range include the complete last row.
-        bottom_spacer_row = rows_per_column
-        signal_grid.setRowMinimumHeight(bottom_spacer_row, 34)
-        signal_grid.setRowStretch(bottom_spacer_row, 0)
-        signal_grid.setColumnStretch(columns, 1)
-
-        # Calculate the minimum scrollable content height from the actual
-        # checkbox size hint rather than using a magic overall container size.
-        # This also behaves correctly with Windows DPI/font scaling.
-        sample_checkbox_height = max(
-            (checkbox.sizeHint().height() for checkbox in self.signal_checks.values()),
-            default=22,
-        )
-        margins = signal_grid.contentsMargins()
-        content_height = (
-            margins.top()
-            + margins.bottom()
-            + rows_per_column * sample_checkbox_height
-            + max(0, rows_per_column - 1) * signal_grid.verticalSpacing()
-            + 34
-        )
-        signal_container.setMinimumHeight(content_height)
-        signal_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        signal_scroll.setWidget(signal_container)
-        sweep_card.layout_.addWidget(signal_scroll)
-
-        # Sweep execution controls live in a dedicated footer BELOW the AMUX
-        # selection area. Keeping them in their own widget prevents Qt from
-        # visually compressing/overlapping the last AMUX rows on short windows.
-        sweep_footer = QWidget()
-        sweep_footer_layout = QVBoxLayout(sweep_footer)
-        sweep_footer_layout.setContentsMargins(0, 12, 0, 0)
-        sweep_footer_layout.setSpacing(8)
-
-        self.start_sweep = QPushButton("Start AMUX sweep")
-        self.start_sweep.setObjectName("PrimaryButton")
-        sweep_footer_layout.addWidget(self.start_sweep)
-
-        self.progress_text = QLabel("Ready")
-        self.progress_text.setObjectName("Muted")
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
-        self.progress.setTextVisible(True)
-        sweep_footer_layout.addWidget(self.progress_text)
-        sweep_footer_layout.addWidget(self.progress)
-        sweep_card.layout_.addWidget(sweep_footer)
-
-        controls_layout.addWidget(sweep_card)
-        controls_layout.addStretch(1)
-
-        # The complete left control column is scrollable. This preserves the
-        # natural geometry of the AMUX list + footer even on smaller windows
-        # instead of forcing Qt to squeeze child widgets into each other.
         controls_scroll = QScrollArea()
         controls_scroll.setWidgetResizable(True)
         controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
         controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         controls_scroll.setWidget(controls)
-        controls_scroll.setMinimumWidth(400)
-        controls_scroll.setMaximumWidth(540)
+        controls_scroll.setMinimumWidth(460)
+        controls_scroll.setMaximumWidth(670)
         split.addWidget(controls_scroll)
 
-        # ----------------------------------------------------------------- right
+        # ---------------------------------------------------------------- preview
         preview_card = Card("Preview")
         self.preview_stack = QStackedWidget()
         self.preview_stack.setObjectName("VisualizationPreview")
 
         self.placeholder = QLabel(
-            "Use 'Refresh screen' for the oscilloscope display, or select AMUX "
-            "signals and start a sweep."
+            "Refresh the oscilloscope screen or run an AMUX / Matrix sweep."
         )
         self.placeholder.setObjectName("PreviewArea")
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -275,13 +177,195 @@ class VisualizationPage(QWidget):
         split.addWidget(preview_card)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([430, 850])
+        split.setSizes([540, 860])
+
+        self._refresh_enabled_state()
+
+    # ================================================================ tab builders
+
+    def _build_amux_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 10, 8, 8)
+        layout.setSpacing(10)
+
+        form = QFormLayout()
+        self.scope_channel = QComboBox()
+        self.scope_channel.addItems(["1", "2", "3", "4"])
+        self.scope_channel.setCurrentText("1")
+        self.delay_s = FloatEdit(0.1)
+        self.delay_s.setPlaceholderText("0.1")
+        form.addRow("Oscilloscope channel", self.scope_channel)
+        form.addRow("AMUX settling delay, s", self.delay_s)
+        layout.addLayout(form)
+
+        self.fclk_off_capture = QCheckBox("FCLK OFF during capture")
+        self.fclk_off_capture.setProperty("amuxLegacy", True)
+        self.fclk_off_capture.setChecked(False)
+        self.fclk_off_capture.setToolTip(
+            "For each selected AMUX signal: set AMUX, force FCLK to 0, wait the "
+            "settling delay, capture the waveform, then restore FCLK before the next AMUX switch. "
+            "If the previous FCLK frequency is unknown, 100 MHz is used."
+        )
+        layout.addWidget(self.fclk_off_capture)
+
+        signal_actions = QHBoxLayout()
+        self.select_all = QPushButton("Select all")
+        self.clear_all = QPushButton("Clear")
+        signal_actions.addWidget(self.select_all)
+        signal_actions.addWidget(self.clear_all)
+        signal_actions.addStretch(1)
+        layout.addLayout(signal_actions)
+
+        signal_scroll = QScrollArea()
+        signal_scroll.setWidgetResizable(True)
+        signal_scroll.setMinimumHeight(300)
+        signal_container = QWidget()
+        signal_grid = QGridLayout(signal_container)
+        signal_grid.setContentsMargins(4, 4, 8, 8)
+        signal_grid.setHorizontalSpacing(12)
+        signal_grid.setVerticalSpacing(6)
+        # Keep the signal list compact even when the combined Visualize tab has
+        # a tall viewport. Without top alignment QGridLayout distributes the
+        # extra height between its rows, producing very large gaps between
+        # checkboxes. The old standalone AMUX page kept rows packed at the top.
+        signal_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        ordered_signals = sorted(EO_cfg.AMUX_SIGNALS.items(), key=lambda item: item[1])
+        self.signal_checks: dict[str, QCheckBox] = {}
+        columns = 2
+        rows_per_column = (len(ordered_signals) + columns - 1) // columns
+        for index, (signal, number) in enumerate(ordered_signals):
+            checkbox = QCheckBox(f"{number:02d}  {signal}")
+            # Keep the pre-combined-Visualize AMUX checkbox appearance.
+            checkbox.setProperty("amuxLegacy", True)
+            checkbox.setToolTip(signal)
+            self.signal_checks[signal] = checkbox
+            column = index // rows_per_column
+            row = index % rows_per_column
+            signal_grid.addWidget(checkbox, row, column)
+
+        bottom_spacer_row = rows_per_column
+        signal_grid.setRowMinimumHeight(bottom_spacer_row, 26)
+        signal_grid.setRowStretch(bottom_spacer_row, 0)
+        signal_grid.setColumnStretch(columns, 1)
+        sample_checkbox_height = max(
+            (checkbox.sizeHint().height() for checkbox in self.signal_checks.values()),
+            default=22,
+        )
+        margins = signal_grid.contentsMargins()
+        content_height = (
+            margins.top()
+            + margins.bottom()
+            + rows_per_column * sample_checkbox_height
+            + max(0, rows_per_column - 1) * signal_grid.verticalSpacing()
+            + 26
+        )
+        # Do not let widgetResizable stretch the grid vertically. Fix only the
+        # content height; the width still follows the scroll viewport. On short
+        # windows QScrollArea scrolls normally, while on tall windows the rows
+        # remain at their natural compact spacing.
+        signal_container.setMinimumHeight(content_height)
+        signal_container.setMaximumHeight(content_height)
+        signal_scroll.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        signal_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        signal_scroll.setWidget(signal_container)
+        layout.addWidget(signal_scroll, 1)
+
+        self.start_sweep = QPushButton("Start AMUX sweep")
+        self.start_sweep.setObjectName("PrimaryButton")
+        layout.addWidget(self.start_sweep)
+
+        self.progress_text = QLabel("Ready")
+        self.progress_text.setObjectName("Muted")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        layout.addWidget(self.progress_text)
+        layout.addWidget(self.progress)
 
         self.select_all.clicked.connect(lambda: self._set_all_signals(True))
         self.clear_all.clicked.connect(lambda: self._set_all_signals(False))
-        self._refresh_enabled_state()
+        return tab
 
-    # ---------------------------------------------------------------- selection
+    def _build_matrix_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 10, 8, 8)
+        layout.setSpacing(10)
+
+        self.matrix_global_settings = PixelSettingsEditor("Global settings")
+        self.matrix_sweep_settings = PixelSettingsEditor("Sweep settings")
+        layout.addWidget(self.matrix_global_settings)
+        layout.addWidget(self.matrix_sweep_settings)
+
+        acquisition = Card("Acquisition")
+        acq_grid = QGridLayout()
+        self.matrix_scope_channel = QComboBox()
+        self.matrix_scope_channel.addItems(["1", "2", "3", "4"])
+        self.matrix_scope_channel.setCurrentText("1")
+        self.matrix_delay_s = FloatEdit(0.1)
+        self.matrix_delay_s.setPlaceholderText("0.1")
+        self.matrix_fclk_off_capture = QCheckBox("FCLK OFF during capture")
+        self.matrix_fclk_off_capture.setChecked(False)
+        self.matrix_fclk_off_capture.setToolTip(
+            "After the current pixel configuration is written to the chip, set FCLK=0, "
+            "wait the settling delay, capture the waveform, then restore the previous known FCLK. "
+            "If FCLK was unknown, 100 MHz is established as the restore value."
+        )
+        acq_grid.addWidget(QLabel("Oscilloscope channel"), 0, 0)
+        acq_grid.addWidget(self.matrix_scope_channel, 0, 1)
+        acq_grid.addWidget(QLabel("Settling delay, s"), 1, 0)
+        acq_grid.addWidget(self.matrix_delay_s, 1, 1)
+        acquisition.layout_.addLayout(acq_grid)
+        acquisition.layout_.addWidget(self.matrix_fclk_off_capture)
+        layout.addWidget(acquisition)
+
+        selector = Card("Pixel selection")
+        selection_note = QLabel(
+            "Click: select one. Ctrl+click: add/remove. Shift+click: rectangle from the last anchor. "
+            "Ctrl+Shift: add a rectangle. No explicit selection = sweep all 512 pixels."
+        )
+        selection_note.setObjectName("Muted")
+        selection_note.setWordWrap(True)
+        selector.layout_.addWidget(selection_note)
+
+        selection_row = QHBoxLayout()
+        self.matrix_selection_status = QLabel()
+        self.matrix_selection_status.setObjectName("SectionTitle")
+        self.matrix_clear_selection = QPushButton("Clear selection (All)")
+        self.matrix_clear_selection.setObjectName("NeutralButton")
+        selection_row.addWidget(self.matrix_selection_status)
+        selection_row.addStretch(1)
+        selection_row.addWidget(self.matrix_clear_selection)
+        selector.layout_.addLayout(selection_row)
+
+        self.matrix_map = SweepMatrixMap()
+        selector.layout_.addWidget(self.matrix_map, 1)
+        layout.addWidget(selector, 1)
+
+        self.matrix_start_sweep = QPushButton("Start matrix sweep")
+        self.matrix_start_sweep.setObjectName("PrimaryButton")
+        layout.addWidget(self.matrix_start_sweep)
+
+        self.matrix_progress_text = QLabel("Ready")
+        self.matrix_progress_text.setObjectName("Muted")
+        self.matrix_progress = QProgressBar()
+        self.matrix_progress.setRange(0, 1)
+        self.matrix_progress.setValue(0)
+        self.matrix_progress.setTextVisible(True)
+        layout.addWidget(self.matrix_progress_text)
+        layout.addWidget(self.matrix_progress)
+
+        self.matrix_clear_selection.clicked.connect(self.matrix_map.clear_selection)
+        self.matrix_map.selection_changed.connect(self._refresh_matrix_selection_status)
+        self._refresh_matrix_selection_status()
+        return tab
+
+    # ================================================================ AMUX API
 
     def _set_all_signals(self, checked: bool):
         for checkbox in self.signal_checks.values():
@@ -306,7 +390,37 @@ class VisualizationPage(QWidget):
     def disable_fclk_during_capture(self) -> bool:
         return self.fclk_off_capture.isChecked()
 
-    # --------------------------------------------------------------- connection
+    # ============================================================ Matrix sweep API
+
+    def matrix_sweep_pixels(self) -> tuple[tuple[int, int], ...]:
+        return self.matrix_map.effective_selection()
+
+    def matrix_global_raw(self) -> int:
+        return self.matrix_global_settings.raw_value()
+
+    def matrix_sweep_raw(self) -> int:
+        return self.matrix_sweep_settings.raw_value()
+
+    def matrix_selected_scope_channel(self) -> int:
+        return int(self.matrix_scope_channel.currentText())
+
+    def matrix_settling_delay_s(self) -> float:
+        value = self.matrix_delay_s.value()
+        if value is None or value < 0:
+            raise ValueError("Matrix settling delay must be >= 0 s")
+        return value
+
+    def matrix_disable_fclk_during_capture(self) -> bool:
+        return self.matrix_fclk_off_capture.isChecked()
+
+    def _refresh_matrix_selection_status(self):
+        explicit = self.matrix_map.explicit_selection()
+        if explicit:
+            self.matrix_selection_status.setText(f"Selected: {len(explicit)}")
+        else:
+            self.matrix_selection_status.setText("Selected: ALL 512")
+
+    # ================================================================ connection
 
     def set_chip_connected(self, connected: bool):
         self._chip_connected = bool(connected)
@@ -317,27 +431,31 @@ class VisualizationPage(QWidget):
         self._refresh_enabled_state()
 
     def _refresh_enabled_state(self):
-        hardware_busy = self._sweep_busy or self._capture_busy
+        hardware_busy = self._amux_busy or self._matrix_busy or self._capture_busy
         self.refresh_screen.setEnabled(self._osc_connected and not hardware_busy)
-        self.start_sweep.setEnabled(
-            self._chip_connected and self._osc_connected and not hardware_busy
-        )
+        sweep_ready = self._chip_connected and self._osc_connected and not hardware_busy
+        self.start_sweep.setEnabled(sweep_ready)
+        self.matrix_start_sweep.setEnabled(sweep_ready)
 
-    # ---------------------------------------------------------------- progress
+    # ================================================================ progress
 
     def set_sweep_busy(self, busy: bool):
-        self._sweep_busy = bool(busy)
+        """AMUX sweep busy state (kept for existing MainWindow integration)."""
+        self._amux_busy = bool(busy)
+        enabled = not busy
         for checkbox in self.signal_checks.values():
-            checkbox.setEnabled(not busy)
-        self.select_all.setEnabled(not busy)
-        self.clear_all.setEnabled(not busy)
-        self.scope_channel.setEnabled(not busy)
-        self.delay_s.setEnabled(not busy)
-        self.fclk_off_capture.setEnabled(not busy)
+            checkbox.setEnabled(enabled)
+        self.select_all.setEnabled(enabled)
+        self.clear_all.setEnabled(enabled)
+        self.scope_channel.setEnabled(enabled)
+        self.delay_s.setEnabled(enabled)
+        self.fclk_off_capture.setEnabled(enabled)
 
         if busy:
             self.progress.setRange(0, 0)
             self.progress_text.setText("Starting AMUX sweep...")
+            self.save_figure.setEnabled(False)
+            self.save_csv.setEnabled(False)
         else:
             if self.progress.maximum() == 0:
                 self.progress.setRange(0, 1)
@@ -358,7 +476,39 @@ class VisualizationPage(QWidget):
         self.progress.setFormat(f"{current} / {total}")
         self.progress_text.setText(f"Capturing {signal}")
 
-    # ---------------------------------------------------------------- preview
+    def set_matrix_sweep_busy(self, busy: bool):
+        self._matrix_busy = bool(busy)
+        enabled = not busy
+        self.matrix_global_settings.set_editor_enabled(enabled)
+        self.matrix_sweep_settings.set_editor_enabled(enabled)
+        self.matrix_scope_channel.setEnabled(enabled)
+        self.matrix_delay_s.setEnabled(enabled)
+        self.matrix_fclk_off_capture.setEnabled(enabled)
+        self.matrix_map.setEnabled(enabled)
+        self.matrix_clear_selection.setEnabled(enabled)
+
+        if busy:
+            self.matrix_progress.setRange(0, 0)
+            self.matrix_progress_text.setText("Preparing matrix sweep...")
+            self.save_figure.setEnabled(False)
+            self.save_csv.setEnabled(False)
+        else:
+            if self.matrix_progress.maximum() == 0:
+                self.matrix_progress.setRange(0, 1)
+                self.matrix_progress.setValue(0)
+            if self.matrix_progress_text.text().startswith("Preparing"):
+                self.matrix_progress_text.setText("Ready")
+        self._refresh_enabled_state()
+
+    def set_matrix_sweep_progress(self, current: int, total: int, row: int, col: int):
+        total = max(int(total), 1)
+        current = max(0, min(int(current), total))
+        self.matrix_progress.setRange(0, total)
+        self.matrix_progress.setValue(current)
+        self.matrix_progress.setFormat(f"{current} / {total}")
+        self.matrix_progress_text.setText(f"Capturing Col={col} Row={row}")
+
+    # ================================================================ preview
 
     def show_screenshot(self, path: str | Path):
         path = Path(path)
@@ -370,27 +520,33 @@ class VisualizationPage(QWidget):
         self.save_figure.setEnabled(True)
         self.save_csv.setEnabled(False)
 
-    def show_amux_result(self, result: dict):
-        signals = list(result["signals"])
-        time_s = result["time_s"]
-        waveforms = result["waveforms"]
-
+    def _prepare_plot(self):
         c = current_theme_colors()
         self.figure.clear()
         self.figure.set_facecolor(c["card"])
         ax = self.figure.add_subplot(111)
         ax.set_facecolor(c["table"])
+        return c, ax
 
-        for signal in signals:
-            ax.plot(time_s, waveforms[signal], linewidth=1.1, label=signal)
-
+    @staticmethod
+    def _style_plot_axes(ax, c):
         ax.set_xlabel("Time, s", color=c["text"])
         ax.set_ylabel("Voltage, V", color=c["text"])
-        ax.set_title("AMUX sweep", color=c["text_strong"])
         ax.grid(True, alpha=0.25)
         ax.tick_params(colors=c["text"])
         for spine in ax.spines.values():
             spine.set_color(c["input_border"])
+
+    def show_amux_result(self, result: dict):
+        signals = list(result["signals"])
+        time_s = result["time_s"]
+        waveforms = result["waveforms"]
+
+        c, ax = self._prepare_plot()
+        for signal in signals:
+            ax.plot(time_s, waveforms[signal], linewidth=1.1, label=signal)
+        self._style_plot_axes(ax, c)
+        ax.set_title("AMUX sweep", color=c["text_strong"])
 
         if signals:
             legend_columns = 2 if len(signals) > 16 else 1
@@ -412,7 +568,6 @@ class VisualizationPage(QWidget):
 
         self.figure.subplots_adjust(left=0.10, bottom=0.12, top=0.93)
         self.canvas.draw()
-
         self.current_combined_csv_path = Path(result["combined_csv"])
         self.current_screenshot_path = None
         self.current_mode = "amux"
@@ -421,7 +576,47 @@ class VisualizationPage(QWidget):
         self.save_csv.setEnabled(True)
         self.progress_text.setText(f"Completed: {len(signals)} signal(s)")
 
-    # ------------------------------------------------------------------- saving
+    def show_matrix_result(self, result: dict):
+        pixels = list(result["pixels"])
+        time_s = result["time_s"]
+        waveforms = result["waveforms"]
+
+        c, ax = self._prepare_plot()
+        for row, col in pixels:
+            key = (row, col)
+            ax.plot(time_s, waveforms[key], linewidth=0.9, label=f"C{col} R{row}")
+        self._style_plot_axes(ax, c)
+        ax.set_title(f"Matrix sweep - {len(pixels)} pixel(s)", color=c["text_strong"])
+
+        if 0 < len(pixels) <= 32:
+            legend_columns = 2 if len(pixels) > 16 else 1
+            legend = ax.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.01, 1.0),
+                borderaxespad=0.0,
+                fontsize=7,
+                ncol=legend_columns,
+            )
+            frame = legend.get_frame()
+            frame.set_facecolor(c["card"])
+            frame.set_edgecolor(c["input_border"])
+            for text in legend.get_texts():
+                text.set_color(c["text"])
+            self.figure.subplots_adjust(right=0.72 if legend_columns == 2 else 0.80)
+        else:
+            self.figure.subplots_adjust(right=0.96)
+
+        self.figure.subplots_adjust(left=0.10, bottom=0.12, top=0.93)
+        self.canvas.draw()
+        self.current_combined_csv_path = Path(result["combined_csv"])
+        self.current_screenshot_path = None
+        self.current_mode = "matrix"
+        self.preview_stack.setCurrentWidget(self.canvas)
+        self.save_figure.setEnabled(True)
+        self.save_csv.setEnabled(True)
+        self.matrix_progress_text.setText(f"Completed: {len(pixels)} pixel(s)")
+
+    # ================================================================ saving
 
     def save_current_figure(self, output_path: str | Path) -> Path:
         output_path = Path(output_path)
@@ -435,7 +630,7 @@ class VisualizationPage(QWidget):
             shutil.copy2(self.current_screenshot_path, output_path)
             return output_path
 
-        if self.current_mode == "amux":
+        if self.current_mode in ("amux", "matrix"):
             if not output_path.suffix:
                 output_path = output_path.with_suffix(".png")
             self.figure.savefig(output_path, dpi=200, bbox_inches="tight")
@@ -445,7 +640,7 @@ class VisualizationPage(QWidget):
 
     def save_current_csv(self, output_path: str | Path) -> Path:
         if self.current_combined_csv_path is None or not self.current_combined_csv_path.exists():
-            raise RuntimeError("No AMUX sweep CSV is available")
+            raise RuntimeError("No sweep CSV is available")
 
         output_path = Path(output_path)
         if output_path.suffix.lower() != ".csv":

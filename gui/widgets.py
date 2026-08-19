@@ -277,6 +277,10 @@ class RegisterTable(QTableWidget):
 
     @staticmethod
     def _group_for(name: str) -> str:
+        # DAC_CSA_VB2 belongs to the shaper controls from the user's workflow
+        # perspective, even though the historical signal name keeps the CSA prefix.
+        if name in ("DAC_CSA_VB2", "DAC_CSA_VB2_TR"):
+            return "Shaper"
         if name.startswith("DAC_CSA_"):
             return "CSA"
         if name.startswith("DAC_SH_"):

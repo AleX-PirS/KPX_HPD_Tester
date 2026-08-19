@@ -168,3 +168,19 @@ TEST_MUX value afterward. Individual waveforms and `combined.csv` are stored in
 AMUX sweep, waveform `x_origin` is ignored and a relative time axis is used;
 `x_increment` must remain unchanged. The resulting plot and combined CSV can be
 saved from the page with Save As dialogs.
+
+## Matrix grouped editing and parameter view
+
+The Matrix page shows only the project-owned Col=16..31 half. Both matrix views share desktop-style selection: click replaces the selection, Ctrl+click toggles pixels, Shift+click selects a rectangle from the anchor, and Ctrl+Shift+click adds a rectangle. `Apply local` copies the current editor value to the selected pixels locally; `Update` then stages all Local edits in UPO.
+
+The left Parameter view can show `Groups` (complete 32-bit configuration groups) or one PX field as a dynamically normalized heatmap. Uniform fields are muted in the Field selector, varying fields are emphasized, and `Show only varying fields` hides uniform fields. Available continuous maps are Viridis, Cividis, Plasma, Turbo and Grayscale. Hold Alt while hovering either matrix to inspect a pixel without interfering with selection.
+
+The matrix field formerly named `PX_REG` is now named `PX_MASK` throughout the project; its bit position and default value are unchanged.
+
+## v9 GUI / FCLK updates
+
+- CTRL PWM GUI defaults: 100 kHz, 5000 ns.
+- Oscilloscope GUI defaults: edge slope NEG; CH1..CH4 input mode DC / 1 MΩ.
+- `DAC_CSA_VB2` and `DAC_CSA_VB2_TR` keep their signal names but are shown under the `Shaper` filter group.
+- If the GUI knows FCLK is OFF and chip constants are written (`Apply changes` or `Load defaults`), the controller temporarily restores the last known non-zero FCLK, performs the register writes, and returns FCLK to 0. Pixel-matrix writes keep their existing explicit FCLK guard.
+- `Visualize` is now the only visualization sidebar page. The oscilloscope screenshot control stays above an internal `AMUX sweep` / `Matrix sweep` tab selector, and both sweep modes share the large preview and Save figure / Save CSV controls.

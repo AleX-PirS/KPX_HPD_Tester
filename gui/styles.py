@@ -346,6 +346,66 @@ QCheckBox::indicator:disabled {{
     border-color: {c['border_soft']};
 }}
 
+/* Explicitly preserve the original AMUX checkbox styling inside the new
+   combined Visualize tab. Keeping this selector local prevents future tab
+   styling from changing the signal-selection controls. */
+QCheckBox[amuxLegacy="true"] {{
+    spacing: 7px;
+    padding: 0px;
+}}
+QCheckBox[amuxLegacy="true"]::indicator {{
+    width: 17px;
+    height: 17px;
+    border: 2px solid {c['input_border']};
+    border-radius: 4px;
+    background: {c['input']};
+}}
+QCheckBox[amuxLegacy="true"]::indicator:hover {{
+    border-color: {c['input_focus']};
+}}
+QCheckBox[amuxLegacy="true"]::indicator:checked {{
+    background: {c['primary']};
+    border-color: {c['primary']};
+    image: url("{checkmark}");
+}}
+QCheckBox[amuxLegacy="true"]::indicator:disabled {{
+    background: {c['button_disabled']};
+    border-color: {c['border_soft']};
+}}
+
+/* Large segmented selector for AMUX / Matrix sweep modes. */
+QTabWidget#SweepModeTabs::pane {{
+    border: 1px solid {c['border']};
+    border-radius: 9px;
+    background: transparent;
+    top: -1px;
+}}
+QTabWidget#SweepModeTabs QTabBar::tab {{
+    min-height: 40px;
+    padding: 8px 18px;
+    margin: 0px 3px 5px 0px;
+    background: {c['button']};
+    color: {c['text']};
+    border: 1px solid {c['input_border']};
+    border-radius: 8px;
+    font-weight: 650;
+}}
+QTabWidget#SweepModeTabs QTabBar::tab:hover:!selected {{
+    background: {c['button_hover']};
+    border-color: {c['input_focus']};
+}}
+QTabWidget#SweepModeTabs QTabBar::tab:selected {{
+    background: {c['primary']};
+    color: white;
+    border-color: {c['primary']};
+    font-weight: 700;
+}}
+QTabWidget#SweepModeTabs QTabBar::tab:disabled {{
+    background: {c['button_disabled']};
+    color: {c['disabled_text']};
+    border-color: {c['border_soft']};
+}}
+
 QPushButton[outputState="on"] {{
     background: {c['output_on_bg']};
     border-color: {c['output_on_bg']};
@@ -482,6 +542,14 @@ QLabel#MatrixWarning {{
     padding: 8px 10px;
 }}
 
+QLabel#MatrixLegendUnknown {{
+    background: {c['table_alt']};
+    color: {c['text']};
+    border: 1px solid {c['input_border']};
+    border-radius: 5px;
+    padding: 3px 7px;
+    font-weight: 600;
+}}
 QLabel#MatrixLegendLocal {{
     background: {c['warning']};
     color: {c['window']};
