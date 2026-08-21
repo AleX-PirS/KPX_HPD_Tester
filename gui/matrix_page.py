@@ -172,7 +172,7 @@ class OwnedMatrixMap(QWidget):
         self._hover_provider = None
         self._selection_provider = None
         self._active_provider = None
-        self.setMinimumSize(280, 380)
+        self.setMinimumSize(270, 460)
         self.setMouseTracking(True)
         self.setToolTip("")
 
@@ -430,7 +430,7 @@ class MatrixPage(QWidget):
         root.addWidget(title)
 
         subtitle = QLabel(
-            "Diagnostic full-matrix access, Col=0..31. Use Ctrl/Shift selection for grouped local edits; "
+            "Project-owned matrix half, Col=16..31. Use Ctrl/Shift selection for grouped local edits; "
             "the two maps show parameter differences and write status independently."
         )
         subtitle.setObjectName("Muted")
@@ -678,7 +678,7 @@ class MatrixPage(QWidget):
 
         operations = Card("Matrix operations")
         note = QLabel(
-            "Update all sends the current editor value to all 1024 matrix pixels. "
+            "Update all sends the current editor value to all 512 project-owned pixels. "
             "Write first stages all Local edits, then commits the virtual matrix to the chip."
         )
         note.setObjectName("Muted")
@@ -708,8 +708,8 @@ class MatrixPage(QWidget):
         operations.layout_.addWidget(self.write_zeros)
 
         commit_note = QLabel(
-            "Diagnostic mode currently exposes Col=0..31, so normal Matrix operations can modify "
-            "the complete 1024-pixel MGPDLab virtual matrix. Write zeros stages zero into all 1024 "
+            "Normal Matrix operations are restricted to project-owned Col=16..31. "
+            "Write zeros remains an explicit service operation that stages zero into all 1024 "
             "pixels, waits 0.1 s, and then commits the complete virtual matrix to the chip."
         )
         commit_note.setObjectName("Muted")

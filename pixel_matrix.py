@@ -8,10 +8,9 @@ from mgpd import MGPDClient
 
 MATRIX_ROWS = 32
 MATRIX_COLS = 32
-# TEMPORARY diagnostic mode: expose the complete physical 32x32 matrix.
-# When the project-owned half is identified, restore these two bounds to the
-# required 16-column range; the GUI/backend derive their active columns here.
-OWNED_COLUMN_START = 0
+# Project-owned matrix half: upper column half, Col=16..31.
+# Low-level MGPDClient commands still support the complete physical 32x32 matrix.
+OWNED_COLUMN_START = 16
 OWNED_COLUMN_STOP = 32
 OWNED_COLUMNS = tuple(range(OWNED_COLUMN_START, OWNED_COLUMN_STOP))
 
@@ -174,8 +173,7 @@ DEFAULT_PIXEL_CONFIG = PIXEL_CODEC.pack()
 class PixelMatrixConfiguration:
     """Project helper for the 32x32 physical pixel matrix.
 
-    The currently enabled matrix-column range is exposed by the normal high-level
-    API. In the present diagnostic build this is the complete Col=0..31 range.
+    The normal high-level project API is restricted to the owned half, Col=16..31.
     Matrix values are not mapped to chip SPI addresses: they are sent as complete
     32-bit words through MGPDLab SET_PIXEL_CFG.
     """
@@ -259,9 +257,8 @@ class PixelMatrixConfiguration:
     ) -> int:
         """Load one PX config into every currently enabled matrix pixel in UPO memory.
 
-        The method name is kept for backward compatibility. In the current
-        diagnostic build OWNED_COLUMNS spans Col=0..31, so this stages all 1024
-        physical pixels.
+        The method name is kept for backward compatibility. OWNED_COLUMNS is
+        Col=16..31, so this stages the 512 project-owned physical pixels.
         """
         PIXEL_CODEC.validate_raw(raw_config)
         total = MATRIX_ROWS * len(self.owned_columns)

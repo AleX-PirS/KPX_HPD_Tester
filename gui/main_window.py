@@ -35,6 +35,7 @@ from .widgets import Card, FloatEdit, LogPanel, OutputStateButton, RegisterTable
 from .styles import current_theme_colors
 from .visualization_page import VisualizationPage
 from .matrix_page import MatrixPage
+from .matrix_operation_page import MatrixOperationPage
 
 
 # =============================================================================
@@ -913,6 +914,7 @@ class MainWindow(QMainWindow):
         self.connections = ConnectionsPage()
         self.chip = ChipPage()
         self.matrix = MatrixPage()
+        self.matrix_operation = MatrixOperationPage()
         self.osc = OscilloscopePage()
         self.gen = GeneratorPage()
         self.visualize = VisualizationPage()
@@ -921,6 +923,7 @@ class MainWindow(QMainWindow):
             ("Connections", self.connections),
             ("Chip", self.chip),
             ("Matrix", self.matrix),
+            ("Matrix operation", self.matrix_operation),
             ("Oscilloscope", self.osc),
             ("Generator", self.gen),
             ("Visualize", self.visualize),
@@ -936,7 +939,7 @@ class MainWindow(QMainWindow):
             # ChipPage contains a large QTableWidget with its own scrollbars.
             # Keeping it out of an outer QScrollArea makes wheel/scrollbar
             # interaction predictable and lets the table use all free height.
-            if isinstance(page, (ChipPage, VisualizationPage)):
+            if isinstance(page, (ChipPage, VisualizationPage, MatrixOperationPage)):
                 self.stack.addWidget(page)
             else:
                 self.stack.addWidget(_page_scroll(page))
@@ -971,6 +974,7 @@ class MainWindow(QMainWindow):
         self.controller.amux_sweep_progress.connect(self.visualize.set_sweep_progress)
         self.controller.matrix_sweep_progress.connect(self.visualize.set_matrix_sweep_progress)
         self.controller.pixel_matrix_progress.connect(self.matrix.set_matrix_progress)
+        self.controller.matrix_read_progress.connect(self.matrix_operation.set_read_progress)
         self.controller.fclk_changed.connect(self.chip.set_fclk_state)
         self.controller.ctrl_state_changed.connect(self.chip.set_ctrl_state)
 
@@ -995,6 +999,10 @@ class MainWindow(QMainWindow):
         self.matrix.stage_all.clicked.connect(self._stage_owned_matrix)
         self.matrix.write_chip.clicked.connect(self._write_pixel_matrix)
         self.matrix.write_zeros.clicked.connect(self._stage_full_matrix_zeros)
+
+        self.matrix_operation.get_shot_button.clicked.connect(self._matrix_get_shot)
+        self.matrix_operation.read_selected_button.clicked.connect(self._matrix_read_selected)
+        self.matrix_operation.read_all_button.clicked.connect(self._matrix_read_all)
 
         self.osc.apply_settings.clicked.connect(self._apply_osc)
         self.osc.dc_button.clicked.connect(self._measure_dc)
@@ -1039,6 +1047,7 @@ class MainWindow(QMainWindow):
             self.connections.chip_disconnect.setEnabled(connected)
             self.chip.set_connected(connected)
             self.matrix.set_connected(connected)
+            self.matrix_operation.set_connected(connected)
             self.visualize.set_chip_connected(connected)
             if not connected:
                 self.chip.set_fclk_state(None)
@@ -1094,6 +1103,7 @@ class MainWindow(QMainWindow):
         def connected(snapshot):
             self.chip.set_snapshot(snapshot)
             self.matrix.reset_session()
+            self.matrix_operation.clear_data("Connected - ready")
             self.chip.set_fclk_state(None)
             self.chip.set_ctrl_state(None, None)
 
@@ -1275,7 +1285,7 @@ class MainWindow(QMainWindow):
         self.matrix.progress.setValue(0)
         self.matrix.progress.setFormat("Starting bulk pixel update...")
         self._run(
-            f"Staging 0x{raw:08X} to complete matrix ({MATRIX_ROWS * len(OWNED_COLUMNS)} pixels)...",
+            f"Staging 0x{raw:08X} to owned matrix half ({MATRIX_ROWS * len(OWNED_COLUMNS)} pixels)...",
             lambda: self.controller.stage_owned_matrix(raw),
             on_result=self.matrix.apply_bulk_stage_result,
             on_finished=lambda: self.matrix.set_busy(False),
@@ -1408,6 +1418,51 @@ class MainWindow(QMainWindow):
             operation,
             on_result=applied,
             on_finished=lambda: self.matrix.set_busy(False),
+        )
+
+    # --------------------------------------------------------- matrix operation
+
+    def _matrix_get_shot(self):
+        settings = self.matrix_operation.omr_settings()
+        self.matrix_operation.set_busy(True, "Running GET_SHOT...")
+
+        def completed(_result):
+            # A new shot makes previously fetched GET_PIXEL values stale.
+            self.matrix_operation.clear_data(
+                "GET_SHOT complete - read selected pixel or Read all"
+            )
+
+        self._run(
+            "Running GET_SHOT"
+            + (" with direct OMR pre-configuration..." if settings["configure_omr"] else " using MGPDLab/UPO OMR settings..."),
+            lambda: self.controller.run_get_shot(**settings),
+            on_result=completed,
+            on_finished=lambda: self.matrix_operation.set_busy(False),
+        )
+
+    def _matrix_read_selected(self):
+        row, col = self.matrix_operation.selected_pixel()
+        self.matrix_operation.set_busy(
+            True, f"Reading Col={col} Row={row}..."
+        )
+        self._run(
+            f"Reading counters for Col={col} Row={row}...",
+            lambda: self.controller.read_pixel_counters(row, col),
+            on_result=self.matrix_operation.apply_pixel_result,
+            on_finished=lambda: self.matrix_operation.set_busy(False),
+        )
+
+    def _matrix_read_all(self):
+        total = MATRIX_ROWS * len(OWNED_COLUMNS)
+        self.matrix_operation.set_busy(True, "Starting matrix counter read...")
+        self.matrix_operation.progress.setRange(0, total)
+        self.matrix_operation.progress.setValue(0)
+        self.matrix_operation.progress.setFormat(f"0 / {total}")
+        self._run(
+            f"Reading counters for all {total} project-owned pixels...",
+            self.controller.read_owned_matrix_counters,
+            on_result=self.matrix_operation.apply_read_all_result,
+            on_finished=lambda: self.matrix_operation.set_busy(False),
         )
 
     # ------------------------------------------------------------- oscilloscope

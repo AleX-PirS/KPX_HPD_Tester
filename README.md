@@ -119,7 +119,7 @@ Oscilloscope GUI defaults: CH1 only, DC 50 ohm coupling selected for all channel
 - `Load default`: load PX software defaults into the selected editor only.
 - `Clear local edits`: discard all edits not yet staged in UPO.
 - `Update`: stage all pixels currently marked `Local edit` in UPO.
-- `Update all`: in the current diagnostic build, stage the current editor PX word into all 1024 pixels (Cols 0..31).
+- `Update all`: stage the current editor PX word into all 512 project-owned pixels (Cols 16..31).
 - `Write zeros`: stage `0x00000000` into all 1024 physical pixel entries in UPO virtual memory, wait 0.1 s after the final update, then issue `SET_PIXEL_CFG WRITE_TO_CHIP`.
 - `Write`: first stages all current `Local edit` pixels, then immediately sends `SET_PIXEL_CFG WRITE_TO_CHIP`.
 - `Update all` and `Write` execute immediately without confirmation dialogs.
@@ -149,17 +149,17 @@ It contains independent `Global settings` and `Sweep settings` editors for the
 32-bit PX word, one oscilloscope-channel selector, a settling delay and the same
 optional `FCLK OFF during capture` behavior as AMUX sweep.
 
-In the current diagnostic build the complete matrix (Cols 0..31, Rows 0..31) can be selected. Selection
+The project-owned matrix half (Cols 16..31, Rows 0..31) can be selected. Selection
 uses desktop-style modifiers: normal click replaces the selection, Ctrl+click
 toggles individual pixels, Shift+click selects the rectangle between the anchor
 and clicked pixel, and Ctrl+Shift adds such a rectangle. An empty explicit
-selection means all 1024 matrix pixels.
+selection means all 512 project-owned pixels.
 
 At sweep start the complete enabled matrix is initialized once with Global settings and
 committed to the chip. For each captured pixel the previous sweep pixel is
 restored to Global settings and only the current pixel is changed to Sweep
 settings before the next commit. Thus each capture has exactly one Sweep pixel
-and all other matrix pixels at Global settings without re-sending 1024 identical
+and all other project-owned pixels at Global settings without re-sending 512 identical
 SET_PIXEL_CFG commands for every point. After completion (or best-effort cleanup
 on error), the complete enabled matrix is returned to Global settings.
 
@@ -172,7 +172,7 @@ saved from the page with Save As dialogs.
 
 ## Matrix grouped editing and parameter view
 
-The Matrix page currently shows the complete Col=0..31 matrix for diagnostic identification of the project half. Both matrix views share desktop-style selection: click replaces the selection, Ctrl+click toggles pixels, Shift+click selects a rectangle from the anchor, and Ctrl+Shift+click adds a rectangle. `Apply local` copies the current editor value to the selected pixels locally; `Update` then stages all Local edits in UPO.
+The Matrix page shows the project-owned Col=16..31 half. Both matrix views share desktop-style selection: click replaces the selection, Ctrl+click toggles pixels, Shift+click selects a rectangle from the anchor, and Ctrl+Shift+click adds a rectangle. `Apply local` copies the current editor value to the selected pixels locally; `Update` then stages all Local edits in UPO.
 
 The left Parameter view can show `Groups` (complete 32-bit configuration groups) or one PX field as a dynamically normalized heatmap. Uniform fields are muted in the Field selector, varying fields are emphasized, and `Show only varying fields` hides uniform fields. Available continuous maps are Viridis, Cividis, Plasma, Turbo and Grayscale. Hold Alt while hovering either matrix to inspect a pixel without interfering with selection.
 
@@ -185,3 +185,64 @@ The matrix field formerly named `PX_REG` is now named `PX_MASK` throughout the p
 - `DAC_CSA_VB2` and `DAC_CSA_VB2_TR` keep their signal names but are shown under the `Shaper` filter group.
 - If the GUI knows FCLK is OFF and chip constants are written (`Apply changes` or `Load defaults`), the controller temporarily restores the last known non-zero FCLK, performs the register writes, and returns FCLK to 0. Pixel-matrix writes keep their existing explicit FCLK guard.
 - `Visualize` is now the only visualization sidebar page. The oscilloscope screenshot control stays above an internal `AMUX sweep` / `Matrix sweep` tab selector, and both sweep modes share the large preview and Save figure / Save CSV controls.
+
+## GET_SHOT / GET_PIXEL and OMR helpers
+
+`MGPDClient` also supports the MGPDLab v2.0+ acquisition commands:
+
+```python
+from mgpd import MGPDClient
+
+client = MGPDClient(
+    configure_omr_before_get_shot=False,  # default: trust MGPDLab/UPO settings
+).connect()
+
+ok = client.get_shot()
+pixel = client.get_pixel(row=5, col=17)
+if pixel is not None:
+    print(pixel["raw_hex"], pixel["low"], pixel["mid"], pixel["high"])
+```
+
+The following OMR helpers use READ_BYTE -> masked modification -> WRITE_BYTE and
+preserve all unrelated OMR bits:
+
+```python
+client.set_mode_cnt(0)       # OMR[10]: 0=16-bit, 1=8-bit counters
+client.set_mode_read(0b010)  # OMR[7:5], raw 3-bit MODE_READ code
+client.set_crw_mode(0)       # OMR[11]: 0=sequential, 1=CRW
+```
+
+For optional pre-configuration before `GET_SHOT`:
+
+```python
+client.configure_omr_before_get_shot = True
+client.get_shot(mode_cnt=0, mode_read=0b010, crw_mode=0)
+```
+
+The module-level default is `CONFIGURE_OMR_BEFORE_GET_SHOT_DEFAULT = False`.
+DCR and ICR are deliberately not changed by this Python pre-configuration.
+MGPDLab documents `GET_SHOT` itself as beginning with its own "Load settings"
+operation, so its stored UPO/GUI OMR settings should be kept consistent with any
+Python pre-configuration.
+
+## Matrix operation / counter readout
+
+The GUI includes a dedicated **Matrix operation** page for MGPDLab `GET_SHOT` and `GET_PIXEL` commands.
+
+- The displayed/read project matrix range is Rows `0..31`, Cols `16..31` (512 pixels).
+- `Get shot` sends `GET_SHOT`. The optional checkbox enables direct read-modify-write of only `OMR.MODE_CNT`, `OMR.MODE_READ` and `OMR.CRW_MODE` immediately before the command. DCR and ICR are not directly written by this page.
+- `Read selected` calls `GET_PIXEL` for the pixel selected on the counter map.
+- `Read all` calls `GET_PIXEL` for all 512 project-owned pixels and updates the heatmap/progress incrementally.
+- The counter selector switches the heatmap and histogram between Low, Mid and High 16-bit words returned by MGPDLab. Values are displayed exactly as returned; no physical counter decoding is applied.
+- `GET_SHOT` itself is implemented by MGPDLab/UPO and may internally load its configured register image as documented by the vendor.
+
+## Matrix operation histogram and application icon
+
+The Matrix operation page includes a **Show all** checkbox. When enabled, the
+Low, Mid and High counter distributions are overlaid on the same histogram with
+transparency; the counter selector continues to control the matrix heatmap.
+
+The GUI application/window icon is stored in `gui/app_icon.svg`. On Windows the
+launcher also assigns a stable AppUserModelID so the running application uses
+this icon instead of the generic Python process icon.
+

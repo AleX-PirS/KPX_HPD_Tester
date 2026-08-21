@@ -31,6 +31,7 @@ class StandController(QObject):
     amux_sweep_progress = pyqtSignal(int, int, str)  # current, total, signal
     matrix_sweep_progress = pyqtSignal(int, int, int, int)  # current, total, row, col
     pixel_matrix_progress = pyqtSignal(int, int, int, int)  # current, total, row, col
+    matrix_read_progress = pyqtSignal(int, int, int, int)  # current, total, row, col
     fclk_changed = pyqtSignal(object)  # int MHz or None when unknown/disconnected
     ctrl_state_changed = pyqtSignal(object, object)  # static state 0/1/None, PWM enabled bool/None
 
@@ -318,7 +319,7 @@ class StandController(QObject):
     def stage_owned_matrix(self, raw_config: int) -> dict:
         """Load one config into every currently enabled matrix pixel.
 
-        In the current diagnostic build this means Rows 0..31, Cols 0..31.
+        For the project GUI this means Rows 0..31, Cols 16..31.
         """
         self._require_fclk_for_configuration()
         matrix = self._require_matrix()
@@ -355,7 +356,7 @@ class StandController(QObject):
         )
         self._log(
             "WARNING",
-            "All 1024 pixels changed through SET_PIXEL_CFG are no longer controlled "
+            "Pixels changed through SET_PIXEL_CFG are no longer controlled "
             "by the MGPDLab GUI until UPO is restarted. WRITE_TO_CHIP was not sent.",
         )
         return {"value": raw_config, "count": count}
@@ -368,8 +369,8 @@ class StandController(QObject):
             raise RuntimeError("Failed to send SET_PIXEL_CFG WRITE_TO_CHIP")
         self._log(
             "INFO",
-            "SET_PIXEL_CFG WRITE_TO_CHIP accepted by UPO. Diagnostic Matrix operations "
-            "currently expose Cols 0..31, so they can stage all 1024 pixels. "
+            "SET_PIXEL_CFG WRITE_TO_CHIP accepted by UPO. Matrix operations "
+            "operate on project-owned Cols 16..31. "
             "The protocol-level commit writes the complete virtual matrix.",
         )
         self._log(
@@ -378,6 +379,97 @@ class StandController(QObject):
             "errors may be shown in the UPO window.",
         )
         return True
+
+    def run_get_shot(
+        self,
+        *,
+        configure_omr: bool = False,
+        mode_cnt: int = 0,
+        mode_read: int = 0b010,
+        crw_mode: int = 0,
+    ) -> bool:
+        """Execute GET_SHOT with optional direct OMR pre-configuration.
+
+        Only MODE_CNT, MODE_READ and CRW_MODE are touched by Python when
+        configure_omr=True. DCR and ICR are deliberately not written here.
+        GET_SHOT itself remains an MGPDLab/UPO command and may internally load
+        the register image configured in MGPDLab.
+        """
+        self._require_chip()
+        assert self.client is not None
+        if not self.client.get_shot(
+            configure_omr=bool(configure_omr),
+            mode_cnt=mode_cnt,
+            mode_read=mode_read,
+            crw_mode=crw_mode,
+        ):
+            raise RuntimeError("GET_SHOT failed")
+
+        self._log(
+            "INFO",
+            "GET_SHOT completed"
+            + (
+                f" after direct OMR setup: MODE_CNT={int(mode_cnt)}, "
+                f"MODE_READ=0b{int(mode_read):03b}, CRW_MODE={int(crw_mode)}"
+                if configure_omr
+                else " using MGPDLab/UPO OMR settings"
+            ),
+        )
+        return True
+
+    def read_pixel_counters(self, row: int, col: int) -> dict:
+        """Read one physical pixel counter word through GET_PIXEL."""
+        self._require_chip()
+        assert self.client is not None
+        result = self.client.get_pixel(row=row, col=col)
+        if result is None:
+            raise RuntimeError(f"GET_PIXEL failed for Col={col} Row={row}")
+        self._log(
+            "INFO",
+            f"GET_PIXEL Col={col} Row={row}: "
+            f"Low={result['low']}, Mid={result['mid']}, High={result['high']}",
+        )
+        return result
+
+    def read_owned_matrix_counters(self) -> dict:
+        """Read GET_PIXEL data for all 512 project-owned pixels.
+
+        The operation is intentionally restricted to the project-owned
+        Col=16..31 range even though the low-level GET_PIXEL command supports
+        all 32 columns. A single failed pixel aborts the scan so a partially
+        read matrix is not silently presented as complete.
+        """
+        matrix = self._require_matrix()
+        assert self.client is not None
+
+        coordinates = [
+            (row, col)
+            for row in range(32)
+            for col in matrix.owned_columns
+        ]
+        total = len(coordinates)
+        pixels: dict[tuple[int, int], dict] = {}
+
+        for current, (row, col) in enumerate(coordinates, start=1):
+            result = self.client.get_pixel(row=row, col=col)
+            if result is None:
+                raise RuntimeError(
+                    f"GET_PIXEL failed at Col={col} Row={row} "
+                    f"({current}/{total})"
+                )
+            pixels[(row, col)] = result
+            self.matrix_read_progress.emit(current, total, row, col)
+
+        self._log(
+            "INFO",
+            f"Read counters for {total} project-owned pixels "
+            f"(Cols {min(matrix.owned_columns)}..{max(matrix.owned_columns)})",
+        )
+        return {
+            "pixels": pixels,
+            "count": total,
+            "columns": tuple(matrix.owned_columns),
+        }
 
     def read_chip_snapshot(self) -> dict:
         cfg = self._require_chip()

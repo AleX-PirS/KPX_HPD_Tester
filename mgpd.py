@@ -3,6 +3,11 @@ import socket
 
 logger = logging.getLogger(__name__)
 
+# Default policy for GET_SHOT. False means that Python does not touch OMR
+# immediately before issuing GET_SHOT and MGPDLab/UPO settings are trusted.
+# It can be overridden per client instance or per get_shot() call.
+CONFIGURE_OMR_BEFORE_GET_SHOT_DEFAULT = False
+
 
 class MGPDClient:
     """
@@ -16,12 +21,17 @@ class MGPDClient:
         SET_FCLK <MHz>
         SET_PIXEL_CFG ROW=<row> COL=<col> 0xXXXXXXXX
         SET_PIXEL_CFG WRITE_TO_CHIP
+        GET_SHOT
+        GET_PIXEL ROW <row> COL <col>
 
     Дополнительные chip-level helpers используют READ_BYTE/WRITE_BYTE
     и меняют только выбранные биты регистра OMR:
         set_puf_mode(0|1)
         set_win_dis_mode(0|1)
         set_polarity(0|1)
+        set_mode_cnt(0|1)
+        set_mode_read(0..7)
+        set_crw_mode(0|1)
 
     При подключении может автоматически активировать KIPIX CONTROL
     записью 0xA5 по адресу 0x803C.
@@ -45,11 +55,15 @@ class MGPDClient:
     #   0x0021 -> OMR[15:8]
     #   0x0022 -> OMR[23:16]
     #   0x0023 -> OMR[31:24]
+    OMR_BYTE_0_ADDRESS = 0x0020
     OMR_BYTE_1_ADDRESS = 0x0021
     OMR_BYTE_2_ADDRESS = 0x0022
     OMR_BYTE_3_ADDRESS = 0x0023
 
+    OMR_MODE_READ_MASK = 0b111 << 5 # OMR[7:5]
     OMR_WIN_DIS_MODE_MASK = 1 << 1   # OMR[9]
+    OMR_MODE_CNT_MASK = 1 << 2       # OMR[10]
+    OMR_CRW_MODE_MASK = 1 << 3       # OMR[11]
     OMR_POL_CTRL_MASK = 1 << 3       # OMR[19]
     OMR_PUF_MODE_MASK = 1 << 4       # OMR[20]
     OMR_POL_SW_MASK = 1 << 0         # OMR[24]
@@ -60,12 +74,14 @@ class MGPDClient:
         port: int = 0xBEEB,
         timeout: float = 5.0,
         auto_enable_kipix: bool = True,
+        configure_omr_before_get_shot: bool = CONFIGURE_OMR_BEFORE_GET_SHOT_DEFAULT,
         trace_callback=None,
     ):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.auto_enable_kipix = auto_enable_kipix
+        self.configure_omr_before_get_shot = bool(configure_omr_before_get_shot)
         self.trace_callback = trace_callback
         self._socket: socket.socket | None = None
         self._connected = False
@@ -315,6 +331,55 @@ class MGPDClient:
             self.OMR_WIN_DIS_MODE_MASK if state else 0,
         )
 
+    def set_mode_cnt(self, state: int | bool) -> bool:
+        """Set OMR[10] MODE_CNT while preserving all unrelated OMR bits.
+
+        state:
+            0 - 16-bit counter mode
+            1 - 8-bit counter mode
+
+        OMR[10] is bit 2 of byte address 0x0021.
+        """
+        state = self._validate_bit_state(state, "MODE_CNT")
+        return self._update_byte_bits(
+            self.OMR_BYTE_1_ADDRESS,
+            self.OMR_MODE_CNT_MASK,
+            self.OMR_MODE_CNT_MASK if state else 0,
+        )
+
+    def set_crw_mode(self, state: int | bool) -> bool:
+        """Set OMR[11] CRW_MODE while preserving all unrelated OMR bits.
+
+        state:
+            0 - sequential readout mode
+            1 - continuous read/write (CRW) mode
+
+        OMR[11] is bit 3 of byte address 0x0021.
+        """
+        state = self._validate_bit_state(state, "CRW_MODE")
+        return self._update_byte_bits(
+            self.OMR_BYTE_1_ADDRESS,
+            self.OMR_CRW_MODE_MASK,
+            self.OMR_CRW_MODE_MASK if state else 0,
+        )
+
+    def set_mode_read(self, mode: int) -> bool:
+        """Set the 3-bit OMR[7:5] MODE_READ field.
+
+        The raw field value 0..7 is accepted. The PMUX2 programming model
+        defines the actual counter combinations for Serial/SPI operation.
+        Only bits OMR[7:5] are modified.
+        """
+        if not isinstance(mode, int) or isinstance(mode, bool):
+            raise TypeError("MODE_READ must be int")
+        if not 0 <= mode <= 0b111:
+            raise ValueError("MODE_READ must be in range 0..7")
+        return self._update_byte_bits(
+            self.OMR_BYTE_0_ADDRESS,
+            self.OMR_MODE_READ_MASK,
+            (mode << 5) & self.OMR_MODE_READ_MASK,
+        )
+
     def set_polarity(self, state: int | bool) -> bool:
         """Select software polarity control and set OMR[24] POL_SW.
 
@@ -436,6 +501,128 @@ class MGPDClient:
 
         logger.debug("Pixel matrix WRITE_TO_CHIP command accepted")
         return True
+
+    def configure_get_shot_omr(
+        self,
+        *,
+        mode_cnt: int | bool = 0,
+        mode_read: int = 0b010,
+        crw_mode: int | bool = 0,
+    ) -> bool:
+        """Apply the OMR fields commonly required before GET_SHOT.
+
+        Defaults follow the PMUX2 initialization/readout description:
+            MODE_CNT=0  -> 16-bit counters
+            MODE_READ=2 -> SPI Low + Mid + Hi counters
+            CRW_MODE=0  -> sequential readout
+
+        DCR and ICR are deliberately not modified here. Every field is updated
+        through READ_BYTE -> masked modification -> WRITE_BYTE.
+        """
+        if not self.set_mode_cnt(mode_cnt):
+            return False
+        if not self.set_mode_read(mode_read):
+            return False
+        if not self.set_crw_mode(crw_mode):
+            return False
+        return True
+
+    def get_shot(
+        self,
+        *,
+        configure_omr: bool | None = None,
+        mode_cnt: int | bool = 0,
+        mode_read: int = 0b010,
+        crw_mode: int | bool = 0,
+    ) -> bool:
+        """Execute MGPDLab GET_SHOT.
+
+        configure_omr controls whether Python first calls
+        configure_get_shot_omr(). If None, the per-client
+        configure_omr_before_get_shot setting is used. The default policy is
+        False, so no OMR bytes are touched unless explicitly requested.
+
+        Note: according to the MGPDLab command description, GET_SHOT itself
+        begins with the UPO "Load settings" operation. Therefore the UPO/GUI
+        OMR image must be consistent with the requested shot settings; MGPDLab
+        may rewrite OMR again after this optional direct pre-configuration.
+        """
+        if configure_omr is None:
+            configure_omr = self.configure_omr_before_get_shot
+        elif not isinstance(configure_omr, bool):
+            raise TypeError("configure_omr must be bool or None")
+
+        if configure_omr:
+            if not self.configure_get_shot_omr(
+                mode_cnt=mode_cnt,
+                mode_read=mode_read,
+                crw_mode=crw_mode,
+            ):
+                logger.error("GET_SHOT OMR pre-configuration failed")
+                return False
+
+        response = self._send_command(b"GET_SHOT\r\n")
+        if not self._check_ok(response):
+            logger.error("GET_SHOT error: response=%r", response)
+            return False
+
+        logger.debug("GET_SHOT completed successfully")
+        return True
+
+    def get_pixel(self, row: int, col: int) -> dict[str, int | str] | None:
+        """Read raw counter data for one physical pixel using GET_PIXEL.
+
+        The returned 64-bit word is not otherwise decoded. For convenience it
+        is split exactly as documented by MGPDLab:
+            bits 15:0   -> low
+            bits 31:16  -> mid
+            bits 47:32  -> high
+            bits 63:48  -> reserved (normally zero)
+
+        The low-level command intentionally supports the complete 32x32 matrix.
+        """
+        self._validate_pixel_coordinate(row, col)
+
+        cmd = f"GET_PIXEL ROW {row} COL {col}\r\n".encode("ascii")
+        response = self._send_command(cmd)
+
+        if self._check_error(response):
+            logger.error(
+                "GET_PIXEL error: row=%d, col=%d, response=%r",
+                row,
+                col,
+                response,
+            )
+            return None
+
+        text = self._decode_response(response).strip()
+        if text.lower().startswith("0x"):
+            text = text[2:]
+
+        if not text or len(text) > 16:
+            logger.error("Unexpected GET_PIXEL response: %r", response)
+            return None
+
+        try:
+            raw = int(text, 16)
+        except ValueError:
+            logger.error("Failed to parse GET_PIXEL response: %r", response)
+            return None
+
+        if not 0 <= raw <= 0xFFFFFFFFFFFFFFFF:
+            logger.error("GET_PIXEL value outside 64-bit range: %r", response)
+            return None
+
+        return {
+            "row": row,
+            "col": col,
+            "raw": raw,
+            "raw_hex": f"{raw:016X}",
+            "low": raw & 0xFFFF,
+            "mid": (raw >> 16) & 0xFFFF,
+            "high": (raw >> 32) & 0xFFFF,
+            "reserved": (raw >> 48) & 0xFFFF,
+        }
 
     def set_ctrl(self, state: int | bool) -> bool:
         """

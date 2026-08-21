@@ -119,11 +119,11 @@ class SweepMatrixMap(QWidget):
         super().__init__(parent)
         self._selection: set[tuple[int, int]] = set()
         self._anchor: tuple[int, int] | None = None
-        self.setMinimumSize(330, 380)
+        self.setMinimumSize(360, 500)
         self.setMouseTracking(True)
         self.setToolTip(
             "Click = one pixel; Ctrl+click = add/remove; Shift+click = rectangular range; "
-            "Ctrl+Shift = add rectangle. Empty selection means all 1024 matrix pixels."
+            "Ctrl+Shift = add rectangle. Empty selection means all 512 project-owned pixels."
         )
 
     def explicit_selection(self) -> tuple[tuple[int, int], ...]:
@@ -312,7 +312,7 @@ class MatrixSweepPage(QWidget):
         title = QLabel("Matrix sweep")
         title.setObjectName("Title")
         subtitle = QLabel(
-            "Sweep selected pixels in Col=0..31. During each capture exactly one pixel uses "
+            "Sweep selected pixels in Col=16..31. During each capture exactly one pixel uses "
             "Sweep settings while every other matrix pixel uses Global settings. Empty selection means all pixels."
         )
         subtitle.setObjectName("Muted")
@@ -362,7 +362,7 @@ class MatrixSweepPage(QWidget):
         selector = Card("Pixel selection")
         selection_note = QLabel(
             "Click: select one. Ctrl+click: add/remove. Shift+click: rectangle from the last anchor. "
-            "Ctrl+Shift: add a rectangle. No explicit selection = sweep all 1024 pixels."
+            "Ctrl+Shift: add a rectangle. No explicit selection = sweep all 512 owned pixels."
         )
         selection_note.setObjectName("Muted")
         selection_note.setWordWrap(True)
@@ -483,7 +483,7 @@ class MatrixSweepPage(QWidget):
         if explicit:
             self.selection_status.setText(f"Selected: {len(explicit)}")
         else:
-            self.selection_status.setText("Selected: ALL 1024")
+            self.selection_status.setText("Selected: ALL 512")
 
     # --------------------------------------------------------------- connection
 
