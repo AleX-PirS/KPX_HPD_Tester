@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
+from lfsr_decoder import LFSRDecoder
 from .matrix_page import CONTINUOUS_COLORMAPS, HeatmapScale, _interpolate_color
 from .styles import current_theme_colors
 from .widgets import Card
@@ -43,7 +44,7 @@ class CounterMatrixMap(QWidget):
         self._data_provider = None
         self._counter_provider = None
         self._selected_provider = None
-        self.setMinimumSize(300, 500)
+        self.setMinimumSize(360, 620)
         self.setMouseTracking(True)
 
     def set_data_provider(self, provider):
@@ -67,10 +68,13 @@ class CounterMatrixMap(QWidget):
         return MATRIX_ROWS - 1 - int(visual_row)
 
     def _geometry(self):
-        left = 38.0
-        top = 27.0
-        right = 8.0
-        bottom = 8.0
+        # Keep the coordinate labels outside the heatmap area. The previous
+        # values placed the top column labels directly above the first cells,
+        # which caused overlap when the widget was resized.
+        left = 48.0
+        top = 34.0
+        right = 12.0
+        bottom = 18.0
         columns = len(OWNED_COLUMNS)
         available_w = max(self.width() - left - right, 1.0)
         available_h = max(self.height() - top - bottom, 1.0)
@@ -78,7 +82,9 @@ class CounterMatrixMap(QWidget):
         grid_w = cell * columns
         grid_h = cell * MATRIX_ROWS
         x0 = left + max((available_w - grid_w) / 2.0, 0.0)
-        y0 = top + max((available_h - grid_h) / 2.0, 0.0)
+        # Keep the matrix aligned to the top of the card. Horizontal centering
+        # is retained, but unused vertical space stays below the grid.
+        y0 = top
         return x0, y0, cell, grid_w, grid_h
 
     def _pixel_at(self, position) -> tuple[int, int] | None:
@@ -176,7 +182,7 @@ class CounterMatrixMap(QWidget):
             local_col = col - min(OWNED_COLUMNS)
             center_x = x0 + (local_col + 0.5) * cell
             painter.drawText(
-                QRectF(center_x - 15, 2, 30, 20),
+                QRectF(center_x - 15, 8, 30, 20),
                 Qt.AlignmentFlag.AlignCenter,
                 str(col),
             )
@@ -184,7 +190,7 @@ class CounterMatrixMap(QWidget):
         for row in (31, 24, 16, 8, 0):
             center_y = y0 + (self._visual_row(row) + 0.5) * cell
             painter.drawText(
-                QRectF(0, center_y - 10, 34, 20),
+                QRectF(2, center_y - 10, 40, 20),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                 str(row),
             )
@@ -231,6 +237,7 @@ class MatrixOperationPage(QWidget):
         self._busy = False
         self._selected_pixel = (0, min(OWNED_COLUMNS))
         self._pixel_data: dict[tuple[int, int], dict] = {}
+        self._decoder_cache = {8: LFSRDecoder(8), 16: LFSRDecoder(16)}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 18, 18, 18)
@@ -335,11 +342,15 @@ class MatrixOperationPage(QWidget):
 
         self.show_all_counters = QCheckBox("Show all")
         self.show_all_counters.setChecked(False)
+
+        self.decode_lfsr = QCheckBox("Decode LFSR counters")
+        self.decode_lfsr.setChecked(True)
         self.show_all_counters.setToolTip(
             "Overlay Low, Mid and High counter histograms with transparency. "
             "The matrix heatmap still follows the Counter selection above."
         )
         view_card.layout_.addWidget(self.show_all_counters)
+        view_card.layout_.addWidget(self.decode_lfsr)
 
         self.stats_label = QLabel("No counter data read")
         self.stats_label.setObjectName("Muted")
@@ -351,6 +362,7 @@ class MatrixOperationPage(QWidget):
 
         # ---------------------------------------------------------------- matrix
         matrix_card = Card("Counter matrix")
+        matrix_card.setMinimumWidth(360)
         matrix_row = QHBoxLayout()
         matrix_row.setContentsMargins(0, 0, 0, 0)
         matrix_row.setSpacing(8)
@@ -362,7 +374,8 @@ class MatrixOperationPage(QWidget):
         matrix_row.addWidget(self.matrix_map, 1)
 
         self.scale = HeatmapScale()
-        self.scale.setMinimumWidth(58)
+        self.scale.setMinimumWidth(48)
+        self.scale.setMaximumWidth(54)
         matrix_row.addWidget(self.scale, 0)
         matrix_card.layout_.addLayout(matrix_row)
         split.addWidget(matrix_card)
@@ -371,18 +384,22 @@ class MatrixOperationPage(QWidget):
         hist_card = Card("Counter distribution")
         self.figure = Figure(figsize=(7, 5), tight_layout=False)
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumSize(480, 400)
+        self.canvas.setMinimumSize(420, 400)
         hist_card.layout_.addWidget(self.canvas, 1)
         split.addWidget(hist_card)
 
+        # Give the counter matrix substantially more horizontal room.  The
+        # histogram still expands with the window, but no longer dominates the
+        # three-column layout.
         split.setStretchFactor(0, 0)
-        split.setStretchFactor(1, 0)
+        split.setStretchFactor(1, 1)
         split.setStretchFactor(2, 1)
-        split.setSizes([350, 390, 700])
+        split.setSizes([350, 500, 590])
 
         self.matrix_map.pixel_clicked.connect(self.set_selected_pixel)
         self.counter_view.currentIndexChanged.connect(self.refresh_visualization)
         self.show_all_counters.stateChanged.connect(self.refresh_visualization)
+        self.decode_lfsr.stateChanged.connect(self.refresh_visualization)
 
         self._refresh_selected_labels()
         self.refresh_visualization()
@@ -438,6 +455,7 @@ class MatrixOperationPage(QWidget):
             self.crw_mode,
             self.configure_omr,
             self.show_all_counters,
+            self.decode_lfsr,
         ):
             widget.setEnabled(enabled)
         self.matrix_map.setEnabled(not self._busy)
@@ -504,9 +522,20 @@ class MatrixOperationPage(QWidget):
 
     # ---------------------------------------------------------------- visuals
 
+    def counter_width(self) -> int:
+        return 8 if int(self.mode_cnt.currentData()) == 1 else 16
+
+    def display_counter_value(self, pixel: dict, key: str):
+        value = int(pixel[key])
+        if not self.decode_lfsr.isChecked():
+            return value
+
+        decoded = self._decoder_cache[self.counter_width()].decode(value)
+        return value if decoded is None else decoded
+
     def refresh_visualization(self):
         counter = self.selected_counter()
-        values = [int(pixel[counter]) for pixel in self._pixel_data.values()]
+        values = [self.display_counter_value(pixel, counter) for pixel in self._pixel_data.values()]
 
         if values:
             minimum = min(values)
@@ -534,7 +563,7 @@ class MatrixOperationPage(QWidget):
 
         if show_all and self._pixel_data:
             datasets = {
-                key: [int(pixel[key]) for pixel in self._pixel_data.values()]
+                key: [self.display_counter_value(pixel, key) for pixel in self._pixel_data.values()]
                 for key in COUNTER_KEYS
             }
             combined = [value for dataset in datasets.values() for value in dataset]
@@ -609,5 +638,5 @@ class MatrixOperationPage(QWidget):
         ax.tick_params(colors=c["text"])
         for spine in ax.spines.values():
             spine.set_color(c["input_border"])
-        self.figure.subplots_adjust(left=0.12, right=0.97, bottom=0.13, top=0.91)
+        self.figure.subplots_adjust(left=0.16, right=0.90, bottom=0.10, top=0.86)
         self.canvas.draw()
