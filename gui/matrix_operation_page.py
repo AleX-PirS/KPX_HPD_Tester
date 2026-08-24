@@ -44,6 +44,7 @@ class CounterMatrixMap(QWidget):
         self._data_provider = None
         self._counter_provider = None
         self._selected_provider = None
+        self._value_decoder = None
         self.setMinimumSize(360, 620)
         self.setMouseTracking(True)
 
@@ -58,6 +59,19 @@ class CounterMatrixMap(QWidget):
     def set_selected_provider(self, provider):
         self._selected_provider = provider
         self.update()
+
+    def set_value_decoder(self, decoder):
+        self._value_decoder = decoder
+        self.update()
+
+    def _display_value(self, value):
+        if self._value_decoder is None:
+            return int(value)
+        try:
+            result = self._value_decoder(int(value))
+            return int(value) if result is None else int(result)
+        except Exception:
+            return int(value)
 
     @staticmethod
     def _visual_row(row: int) -> int:
@@ -220,9 +234,9 @@ class CounterMatrixMap(QWidget):
         else:
             self.setToolTip(
                 f"Col={col} Row={row}\n"
-                f"Low={int(pixel['low'])}\n"
-                f"Mid={int(pixel['mid'])}\n"
-                f"High={int(pixel['high'])}\n"
+                f"Low={self._display_value(pixel['low'])}\n"
+                f"Mid={self._display_value(pixel['mid'])}\n"
+                f"High={self._display_value(pixel['high'])}\n"
                 f"RAW=0x{pixel['raw_hex']}"
             )
         super().mouseMoveEvent(event)
@@ -371,6 +385,7 @@ class MatrixOperationPage(QWidget):
         self.matrix_map.set_data_provider(lambda: self._pixel_data)
         self.matrix_map.set_counter_provider(self.selected_counter)
         self.matrix_map.set_selected_provider(lambda: self._selected_pixel)
+        self.matrix_map.set_value_decoder(self._decode_counter_value)
         matrix_row.addWidget(self.matrix_map, 1)
 
         self.scale = HeatmapScale()
@@ -475,9 +490,9 @@ class MatrixOperationPage(QWidget):
             self.selected_values.setText("Low: -\nMid: -\nHigh: -\nRAW: -")
         else:
             self.selected_values.setText(
-                f"Low: {int(data['low'])}  (0x{int(data['low']):04X})\n"
-                f"Mid: {int(data['mid'])}  (0x{int(data['mid']):04X})\n"
-                f"High: {int(data['high'])}  (0x{int(data['high']):04X})\n"
+                f"Low: {self._decode_counter_value(data['low'])}  (RAW 0x{int(data['low']):04X})\n"
+                f"Mid: {self._decode_counter_value(data['mid'])}  (RAW 0x{int(data['mid']):04X})\n"
+                f"High: {self._decode_counter_value(data['high'])}  (RAW 0x{int(data['high']):04X})\n"
                 f"RAW: 0x{data['raw_hex']}"
             )
 
@@ -525,13 +540,17 @@ class MatrixOperationPage(QWidget):
     def counter_width(self) -> int:
         return 8 if int(self.mode_cnt.currentData()) == 1 else 16
 
-    def display_counter_value(self, pixel: dict, key: str):
-        value = int(pixel[key])
-        if not self.decode_lfsr.isChecked():
-            return value
 
-        decoded = self._decoder_cache[self.counter_width()].decode(value)
-        return value if decoded is None else decoded
+    def _decode_counter_value(self, value: int):
+        """Decoder callback for matrix widgets and tooltips."""
+        if not self.decode_lfsr.isChecked():
+            return int(value)
+
+        decoded = self._decoder_cache[self.counter_width()].decode(int(value))
+        return int(value) if decoded is None else decoded
+
+    def display_counter_value(self, pixel: dict, key: str):
+        return self._decode_counter_value(int(pixel[key]))
 
     def refresh_visualization(self):
         counter = self.selected_counter()
