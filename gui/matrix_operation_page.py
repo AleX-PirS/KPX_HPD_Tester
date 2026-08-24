@@ -117,7 +117,7 @@ class CounterMatrixMap(QWidget):
         data = self._data_provider() if self._data_provider is not None else {}
         counter = self._counter_provider() if self._counter_provider is not None else "low"
         values = [
-            int(pixel[counter])
+            self._display_value(pixel[counter])
             for pixel in data.values()
             if counter in pixel
         ]
@@ -153,7 +153,7 @@ class CounterMatrixMap(QWidget):
                 if pixel is None:
                     color = unread_color
                 else:
-                    value = int(pixel[counter])
+                    value = self._display_value(pixel[counter])
                     if maximum == minimum:
                         position = 0.5
                     else:
