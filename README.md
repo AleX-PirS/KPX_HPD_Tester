@@ -124,6 +124,23 @@ Oscilloscope GUI defaults: CH1 only, DC 50 ohm coupling selected for all channel
 - `Write`: first stages all current `Local edit` pixels, then immediately sends `SET_PIXEL_CFG WRITE_TO_CHIP`.
 - `Update all` and `Write` execute immediately without confirmation dialogs.
 
+## Matrix JSON configuration files
+
+The **Matrix** page provides `Save config` and `Load config` below the 32-bit PX
+editor controls. Save opens a Windows `Save As` dialog in `configs/` by default
+and writes all 512 project-owned pixels as readable named fields rather than as
+packed hexadecimal words.
+
+For each pixel, saving uses the first known value in this order: Local edit,
+staged UPO value, then value written to the chip in the current GUI session.
+Saving is disabled while any pixel remains unknown. Loading validates the file
+format, all coordinates, duplicate/missing pixels and every PX field range,
+then places the complete configuration in local memory only. It does not send
+commands to UPO or the chip. A loaded value matching the known UPO value keeps
+its staged/written status; when UPO is unknown, a value matching the known chip
+value keeps its written status. Only differing or previously unknown values are
+marked `Local edit`; use `Update` or `Write` afterward when required.
+
 
 ## OMR chip-control helpers
 
@@ -245,4 +262,3 @@ transparency; the counter selector continues to control the matrix heatmap.
 The GUI application/window icon is stored in `gui/app_icon.svg`. On Windows the
 launcher also assigns a stable AppUserModelID so the running application uses
 this icon instead of the generic Python process icon.
-

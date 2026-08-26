@@ -28,6 +28,12 @@ from PyQt6.QtWidgets import (
 )
 
 import EO_cfg
+from matrix_config_io import (
+    DEFAULT_CONFIG_DIRECTORY,
+    build_matrix_config_document,
+    load_matrix_config,
+    save_matrix_config,
+)
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 from stand_controller import StandController
 from workers import HardwareTaskRunner
@@ -999,6 +1005,8 @@ class MainWindow(QMainWindow):
         self.matrix.stage_all.clicked.connect(self._stage_owned_matrix)
         self.matrix.write_chip.clicked.connect(self._write_pixel_matrix)
         self.matrix.write_zeros.clicked.connect(self._stage_full_matrix_zeros)
+        self.matrix.save_config.clicked.connect(self._save_matrix_config)
+        self.matrix.load_config.clicked.connect(self._load_matrix_config)
 
         self.matrix_operation.get_shot_button.clicked.connect(self._matrix_get_shot)
         self.matrix_operation.read_selected_button.clicked.connect(self._matrix_read_selected)
@@ -1243,6 +1251,69 @@ class MainWindow(QMainWindow):
         )
 
     # ---------------------------------------------------------------- matrix
+
+    def _save_matrix_config(self):
+        try:
+            pixel_values = self.matrix.configuration_for_save()
+            document = build_matrix_config_document(pixel_values)
+        except (KeyError, TypeError, ValueError) as error:
+            QMessageBox.warning(self, "Matrix config unavailable", str(error))
+            return
+
+        try:
+            DEFAULT_CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            QMessageBox.critical(self, "Save failed", str(error))
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save matrix configuration",
+            str(DEFAULT_CONFIG_DIRECTORY / "matrix_config.json"),
+            "JSON configuration (*.json)",
+        )
+        if not path:
+            return
+
+        target = Path(path)
+        if target.suffix.lower() != ".json":
+            target = target.with_suffix(".json")
+        try:
+            saved = save_matrix_config(target, document)
+        except (OSError, TypeError, ValueError) as error:
+            QMessageBox.critical(self, "Save failed", str(error))
+            return
+
+        self.matrix.progress.setFormat("Matrix configuration saved")
+        self.log.append("INFO", f"Matrix configuration saved: {saved}")
+
+    def _load_matrix_config(self):
+        try:
+            DEFAULT_CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+            initial_directory = DEFAULT_CONFIG_DIRECTORY
+        except OSError:
+            initial_directory = Path.cwd()
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load matrix configuration",
+            str(initial_directory),
+            "JSON configuration (*.json)",
+        )
+        if not path:
+            return
+
+        try:
+            pixel_values = load_matrix_config(path)
+            self.matrix.load_local_configuration(pixel_values)
+        except (OSError, TypeError, ValueError) as error:
+            QMessageBox.critical(self, "Load failed", str(error))
+            return
+
+        self.log.append(
+            "INFO",
+            f"Loaded {len(pixel_values)} matrix pixel configurations into local memory: {path}",
+        )
 
     def _stage_local_pixels(self):
         edits = self.matrix.local_edits()

@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from matrix_config_io import resolve_matrix_config
 from pixel_matrix import (
     DEFAULT_PIXEL_CONFIG,
     MATRIX_ROWS,
@@ -414,6 +415,7 @@ class MatrixPage(QWidget):
         self._local_baseline: dict[tuple[int, int], int] = {}
         self._updating_editor = False
         self._connected = False
+        self._busy = False
 
         self._selection: set[tuple[int, int]] = {(0, min(OWNED_COLUMNS))}
         self._anchor: tuple[int, int] | None = (0, min(OWNED_COLUMNS))
@@ -674,6 +676,20 @@ class MatrixPage(QWidget):
         editor_buttons.addWidget(self.apply_local, 1, 1)
         editor_buttons.addWidget(self.clear_local, 1, 2)
         field_card.layout_.addLayout(editor_buttons)
+
+        config_file_buttons = QHBoxLayout()
+        self.save_config = QPushButton("Save config")
+        self.save_config.setToolTip(
+            "Save all 512 project-owned pixel configurations as readable JSON."
+        )
+        self.load_config = QPushButton("Load config")
+        self.load_config.setToolTip(
+            "Load all 512 pixel configurations from JSON. Values matching known UPO/chip "
+            "state keep that status; only differences become Local edit."
+        )
+        config_file_buttons.addWidget(self.save_config)
+        config_file_buttons.addWidget(self.load_config)
+        field_card.layout_.addLayout(config_file_buttons)
         controls_layout.addWidget(field_card)
 
         operations = Card("Matrix operations")
@@ -805,6 +821,70 @@ class MatrixPage(QWidget):
             for coord in sorted(self._local_dirty)
         }
 
+    def configuration_for_save(
+        self,
+    ) -> dict[tuple[int, int], int]:
+        """Resolve every owned pixel using local -> UPO -> chip priority."""
+        return resolve_matrix_config(
+            self.local_edits(),
+            self._upo_values,
+            self._chip_values,
+        )
+
+    def load_local_configuration(
+        self,
+        pixel_values: dict[tuple[int, int], int],
+    ):
+        """Load a complete configuration without sending hardware commands."""
+        values = dict(pixel_values)
+        expected = {
+            (row, col)
+            for row in range(MATRIX_ROWS)
+            for col in OWNED_COLUMNS
+        }
+        missing = expected - set(values)
+        extra = set(values) - expected
+        if missing or extra:
+            raise ValueError(
+                "Loaded matrix configuration must contain exactly all 512 "
+                "project-owned pixels"
+            )
+        for raw in values.values():
+            PIXEL_CODEC.validate_raw(raw)
+
+        for coord in sorted(expected):
+            if coord in self._upo_values:
+                baseline = self._upo_values[coord]
+            elif coord in self._chip_values:
+                baseline = self._chip_values[coord]
+            else:
+                baseline = DEFAULT_PIXEL_CONFIG
+            self._local_baseline[coord] = baseline
+            self._values[coord] = values[coord]
+
+        local_changes: set[tuple[int, int]] = set()
+        for coord in expected:
+            if coord in self._upo_values:
+                if values[coord] != self._upo_values[coord]:
+                    local_changes.add(coord)
+            elif coord in self._chip_values:
+                if values[coord] != self._chip_values[coord]:
+                    local_changes.add(coord)
+            else:
+                # With no known lower-priority state, the loaded value is the
+                # only real configuration data and must remain a Local edit.
+                local_changes.add(coord)
+        self._local_dirty = local_changes
+        total = len(expected)
+        self.progress.setRange(0, total)
+        self.progress.setValue(total)
+        self.progress.setFormat(
+            f"Loaded {total} pixel configs: {len(local_changes)} local change(s)"
+        )
+        self.select_pixel(*self.current_coordinate(), preserve_selection=True)
+        self._refresh_field_selector()
+        self._refresh_visualization()
+
     def pixel_markers(self, row: int, col: int) -> tuple[bool, bool]:
         raw = self._values.get((row, col), DEFAULT_PIXEL_CONFIG)
         tst = PIXEL_CODEC.extract(raw, "PX_TST_EN") == 1
@@ -819,6 +899,8 @@ class MatrixPage(QWidget):
             if self._chip_values.get(coord) == self._upo_values[coord]:
                 return "written"
             return "staged"
+        if coord in self._chip_values:
+            return "written"
         return "unknown"
 
     def status_color(self, row: int, col: int) -> QColor:
@@ -909,8 +991,17 @@ class MatrixPage(QWidget):
 
     def _set_local_value(self, coord: tuple[int, int], raw: int):
         self._values[coord] = raw
-        baseline = self._local_baseline.get(coord, DEFAULT_PIXEL_CONFIG)
-        if baseline == raw:
+        if coord in self._upo_values:
+            baseline = self._upo_values[coord]
+            baseline_known = True
+        elif coord in self._chip_values:
+            baseline = self._chip_values[coord]
+            baseline_known = True
+        else:
+            baseline = self._local_baseline.get(coord, DEFAULT_PIXEL_CONFIG)
+            baseline_known = False
+        self._local_baseline[coord] = baseline
+        if baseline_known and baseline == raw:
             self._local_dirty.discard(coord)
         else:
             self._local_dirty.add(coord)
@@ -938,7 +1029,14 @@ class MatrixPage(QWidget):
     def clear_local_edits(self):
         """Discard every PX edit not yet staged to MGPDLab virtual memory."""
         for coord in tuple(self._local_dirty):
-            self._values[coord] = self._local_baseline.get(coord, DEFAULT_PIXEL_CONFIG)
+            if coord in self._upo_values:
+                self._values[coord] = self._upo_values[coord]
+            elif coord in self._chip_values:
+                self._values[coord] = self._chip_values[coord]
+            else:
+                self._values[coord] = self._local_baseline.get(
+                    coord, DEFAULT_PIXEL_CONFIG
+                )
         self._local_dirty.clear()
         self.select_pixel(*self.current_coordinate(), preserve_selection=True)
         self._refresh_field_selector()
@@ -1169,11 +1267,39 @@ class MatrixPage(QWidget):
         self._refresh_selected_status()
         self.heatmap_map.update()
         self.status_map.update()
+        self._refresh_config_actions()
+
+    def _refresh_config_actions(self):
+        unknown_count = 0
+        for row in range(MATRIX_ROWS):
+            for col in OWNED_COLUMNS:
+                coord = (row, col)
+                if (
+                    coord not in self._local_dirty
+                    and coord not in self._upo_values
+                    and coord not in self._chip_values
+                ):
+                    unknown_count += 1
+
+        self.load_config.setEnabled(not self._busy)
+        self.save_config.setEnabled(not self._busy and unknown_count == 0)
+        if unknown_count:
+            self.save_config.setToolTip(
+                "Saving is unavailable because "
+                f"{unknown_count} of {MATRIX_ROWS * len(OWNED_COLUMNS)} pixel values "
+                "are unknown. Load a configuration or establish every pixel first."
+            )
+        else:
+            self.save_config.setToolTip(
+                "Save all 512 project-owned pixel configurations as readable JSON. "
+                "Per-pixel priority: local, then UPO, then chip."
+            )
 
     # ----------------------------------------------------------- worker results
 
     def set_busy(self, busy: bool):
         busy = bool(busy)
+        self._busy = busy
         enabled = self._connected and not busy
         self.stage_local.setEnabled(enabled)
         self.send_raw.setEnabled(enabled)
@@ -1191,6 +1317,7 @@ class MatrixPage(QWidget):
         self.field_filter.setEnabled(not busy)
         self.colormap.setEnabled(not busy and (self.field_filter.currentData() != "Groups"))
         self.only_varying.setEnabled(not busy)
+        self._refresh_config_actions()
 
     def apply_selected_stage_result(self, result: dict):
         row = int(result["row"])
