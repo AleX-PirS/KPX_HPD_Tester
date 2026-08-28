@@ -299,9 +299,9 @@ REGS_FIELDS = {
 
 DEFAULT_FIELD_VALUES = {
     # CSA
-    "DAC_CSA_RES_FB": 100,
+    "DAC_CSA_RES_FB": 150,
     "DAC_CSA_RES_FB_TR": 3,
-    "DAC_CSA_VB1": 512,
+    "DAC_CSA_VB1": 800,
     "DAC_CSA_VB1_TR": 3,
     "DAC_CSA_VC1": 384,
     "DAC_CSA_VC1_TR": 3,
@@ -325,7 +325,7 @@ DEFAULT_FIELD_VALUES = {
     # Comparators
     "DAC_CMP_BIAS_LSB": 512,
     "DAC_CMP_BIAS_LSB_TR": 3,
-    "DAC_CMP_VB5": 512,
+    "DAC_CMP_VB5": 800,
     "DAC_CMP_VB5_TR": 3,
     "DAC_CMP_VC5": 600,
     "DAC_CMP_VC5_TR": 3,

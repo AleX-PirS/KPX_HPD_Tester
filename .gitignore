@@ -7,8 +7,9 @@ EDM_vis.py
 # C extensions
 *.so
 
+# dirs
+/*csv*
 # Fiels
-*.csv
 test.py
 # Distribution / packaging
 .Python
@@ -224,3 +225,6 @@ __marimo__/
 # Runtime GUI captures / AMUX sweep data
 /temp/*
 !/temp/.gitkeep
+
+# Comparator-characterization runtime data
+/results/

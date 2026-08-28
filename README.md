@@ -238,6 +238,20 @@ client.get_shot(mode_cnt=0, mode_read=0b010, crw_mode=0)
 
 The module-level default is `CONFIGURE_OMR_BEFORE_GET_SHOT_DEFAULT = False`.
 DCR and ICR are deliberately not changed by this Python pre-configuration.
+
+## Характеризация компараторов
+
+Простые запускаемые файлы для noise scan, эквализации, полного trim-sweep,
+S-кривых, сравнения режимов инжекции и повторного построения графиков находятся
+в `comparator_characterization/high_level/`. Все пользовательские пути и
+параметры собраны в
+`comparator_characterization/high_level/characterization_config.py`.
+
+Полное русскоязычное руководство находится в
+`COMPARATOR_CHARACTERIZATION.md`. Начните с команды
+`python -m comparator_characterization.high_level.preview_ref_selection`,
+которая показывает автоматически выбранные коды REF1/REF2 без подключения к
+стенду.
 MGPDLab documents `GET_SHOT` itself as beginning with its own "Load settings"
 operation, so its stored UPO/GUI OMR settings should be kept consistent with any
 Python pre-configuration.
@@ -262,3 +276,14 @@ transparency; the counter selector continues to control the matrix heatmap.
 The GUI application/window icon is stored in `gui/app_icon.svg`. On Windows the
 launcher also assigns a stable AppUserModelID so the running application uses
 this icon instead of the generic Python process icon.
+
+## Характеризация и эквализация компараторов
+
+Высокоуровневый пакет поддерживает AB/CMP_B, BC/CMP_C и CD/CMP_D, сохраняет
+отдельный raw CSV для каждого acquisition, допускает resume и изменяет только
+выбранное 5-битное trim-поле. Реализованы paired-background S-кривые,
+аппаратный burst Keysight 81150A/81160A и сравнение `all`, `tile_2x2`,
+`tile_4x4`, `tile_8x8`. Все таблицы и рисунки повторно строятся без стенда.
+
+Настройка, порядок запуска и описание выходных данных приведены в
+[COMPARATOR_CHARACTERIZATION.md](COMPARATOR_CHARACTERIZATION.md).

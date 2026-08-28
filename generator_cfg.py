@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 import time
 
 import pyvisa as visa
@@ -16,6 +17,10 @@ class GeneratorConfig:
     pulse_width_s: float | None = None
     low_level_v: float | None = None
     high_level_v: float | None = None
+    load_ohm: float | None = None
+    duty_cycle_percent: float | None = None
+    burst_cycles: int | None = None
+    trigger_source: str | None = None
 
 
 class TwoChannelGenerator:
@@ -411,6 +416,22 @@ class TwoChannelGenerator:
         sequences = self._single_param_sequences(channel, command_body)
         return self._write_first_accepted(sequences, label)
 
+    def _query_first_accepted(self, commands: list[str], label: str) -> str:
+        last_error: Exception | None = None
+        for command in commands:
+            try:
+                self.clear_errors()
+                response = self._query(command)
+                errors = self.read_errors()
+                if errors:
+                    raise RuntimeError(" | ".join(errors))
+                return response
+            except Exception as error:
+                last_error = error
+        raise RuntimeError(
+            f"No accepted SCPI query variant for {label}. Last error: {last_error}"
+        )
+
     def _send_pulse_param(
         self,
         channel: int,
@@ -440,6 +461,156 @@ class TwoChannelGenerator:
         return self._write_first_accepted(sequences, label)
 
     # ---------------- public API ----------------
+
+    def set_output_load(self, channel: int, load_ohm: float) -> float:
+        """Set/query ``OUTP:LOAD`` level scaling, not source impedance."""
+
+        self._validate_source_channel(channel)
+        value = float(load_ohm)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("load_ohm must be a positive finite value")
+        sequences = [
+            [f":OUTP{channel}:LOAD {value:.12g}"],
+            [f":INST:NSEL {channel}", f":OUTP:LOAD {value:.12g}"],
+        ]
+        if channel == 1:
+            sequences.append([f":OUTP:LOAD {value:.12g}"])
+        self._write_first_accepted(sequences, f"OUTP{channel}:LOAD")
+        response = self._query_first_accepted(
+            [f":OUTP{channel}:LOAD?", *([":OUTP:LOAD?"] if channel == 1 else [])],
+            f"OUTP{channel}:LOAD?",
+        )
+        try:
+            measured = float(response)
+        except ValueError as error:
+            raise RuntimeError(
+                f"generator returned non-numeric load query response: {response!r}"
+            ) from error
+        if not math.isclose(measured, value, rel_tol=0.02, abs_tol=1.0):
+            raise RuntimeError(
+                f"generator load queryback is {measured:g} ohm, requested {value:g} ohm"
+            )
+        return measured
+
+    def set_square_duty_cycle(self, channel: int, duty_cycle_percent: float) -> float:
+        """Set and query square-wave duty cycle in percent."""
+
+        self._validate_source_channel(channel)
+        duty = float(duty_cycle_percent)
+        if not math.isfinite(duty) or not 0 < duty < 100:
+            raise ValueError("duty_cycle_percent must be between 0 and 100")
+        sequences = [
+            [f":FUNC{channel}:SQU:DCYC {duty:.12g}"],
+            [f":SOUR{channel}:FUNC:SQU:DCYC {duty:.12g}"],
+            [f":INST:NSEL {channel}", f":FUNC:SQU:DCYC {duty:.12g}"],
+        ]
+        if channel == 1:
+            sequences.append([f":FUNC:SQU:DCYC {duty:.12g}"])
+        self._write_first_accepted(sequences, f"source {channel} square duty cycle")
+        response = self._query_first_accepted(
+            [
+                f":FUNC{channel}:SQU:DCYC?",
+                f":SOUR{channel}:FUNC:SQU:DCYC?",
+                *([":FUNC:SQU:DCYC?"] if channel == 1 else []),
+            ],
+            f"source {channel} square duty-cycle query",
+        )
+        measured = float(response)
+        if not math.isclose(measured, duty, rel_tol=0.0, abs_tol=0.05):
+            raise RuntimeError(
+                f"generator duty-cycle queryback is {measured:g}%, requested {duty:g}%"
+            )
+        return measured
+
+    def configure_triggered_burst(
+        self,
+        channel: int,
+        cycles: int,
+        *,
+        trigger_source: str = "MAN",
+    ) -> dict[str, object]:
+        """Arm an exact-cycle triggered burst for software ``*TRG``.
+
+        Keysight documents ``TRIG:COUN > 1`` as the short form enabling burst
+        state and setting ``BURS:NCYC``. Queryback verifies programming only,
+        not the number of physical edges at the DUT.
+        """
+
+        self._validate_source_channel(channel)
+        if not isinstance(cycles, int) or isinstance(cycles, bool):
+            raise TypeError("cycles must be int")
+        if not 2 <= cycles <= 1_000_000:
+            raise ValueError("Keysight burst cycles must be in 2..1,000,000")
+        source = str(trigger_source).strip().upper()
+        if source not in {"MAN", "MANUAL"}:
+            raise ValueError("software-triggered burst requires trigger_source='MAN'")
+
+        self._write_first_accepted(
+            [
+                [f":BURS{channel}:MODE TRIG"],
+                [f":INST:NSEL {channel}", ":BURS:MODE TRIG"],
+                *([[":BURS:MODE TRIG"]] if channel == 1 else []),
+            ],
+            f"source {channel} triggered burst mode",
+        )
+        self._write_first_accepted(
+            [
+                [f":TRIG{channel}:COUN {cycles}"],
+                [f":BURS{channel}:NCYC {cycles}", f":BURS{channel}:STAT ON"],
+                [f":INST:NSEL {channel}", f":TRIG:COUN {cycles}"],
+                *([[f":TRIG:COUN {cycles}"]] if channel == 1 else []),
+            ],
+            f"source {channel} burst cycle count",
+        )
+        self._write_first_accepted(
+            [
+                [f":ARM:SOUR{channel} MAN"],
+                [f":ARM{channel}:SOUR MAN"],
+                [f":INST:NSEL {channel}", ":ARM:SOUR MAN"],
+                *([[":ARM:SOUR MAN"]] if channel == 1 else []),
+            ],
+            f"source {channel} manual arm source",
+        )
+
+        count_response = self._query_first_accepted(
+            [
+                f":TRIG{channel}:COUN?",
+                f":BURS{channel}:NCYC?",
+                *([":TRIG:COUN?", ":BURS:NCYC?"] if channel == 1 else []),
+            ],
+            f"source {channel} burst count query",
+        )
+        programmed_cycles = int(round(float(count_response)))
+        if programmed_cycles != cycles:
+            raise RuntimeError(
+                f"generator burst queryback is {programmed_cycles}, requested {cycles}"
+            )
+        arm_source = self._query_first_accepted(
+            [
+                f":ARM:SOUR{channel}?",
+                f":ARM{channel}:SOUR?",
+                *([":ARM:SOUR?"] if channel == 1 else []),
+            ],
+            f"source {channel} arm-source query",
+        ).strip().upper()
+        if not arm_source.startswith("MAN"):
+            raise RuntimeError(
+                f"generator arm-source queryback is {arm_source!r}, expected MAN"
+            )
+        return {
+            "channel": channel,
+            "programmed_cycles": programmed_cycles,
+            "arm_source": arm_source,
+            "trigger_command": "*TRG",
+            "cycle_count_verification": "SCPI_queryback_not_physical_pulse_counter",
+        }
+
+    def software_trigger(self) -> None:
+        """Generate the IEEE-488.2 software trigger event ``*TRG``."""
+
+        self.clear_errors()
+        self._write("*TRG")
+        self.check_errors()
 
     def configure_channel(
         self,
@@ -752,6 +923,8 @@ class TwoChannelGenerator:
         config: GeneratorConfig,
         enable_after_config: bool = False,
     ):
+        if config.load_ohm is not None:
+            self.set_output_load(config.channel, config.load_ohm)
         self.configure_channel(
             channel=config.channel,
             frequency_hz=config.frequency_hz,
@@ -765,6 +938,16 @@ class TwoChannelGenerator:
             low_level_v=config.low_level_v,
             high_level_v=config.high_level_v,
         )
+        if config.duty_cycle_percent is not None:
+            if self._normalize_shape(config.shape) != "SQU":
+                raise ValueError("duty_cycle_percent is supported only for SQU")
+            self.set_square_duty_cycle(config.channel, config.duty_cycle_percent)
+        if config.burst_cycles is not None:
+            self.configure_triggered_burst(
+                config.channel,
+                config.burst_cycles,
+                trigger_source=config.trigger_source or "MAN",
+            )
 
     def enable_channel(self, channel: int):
         """

@@ -58,8 +58,22 @@ class LFSRDecoder:
 
         return table
 
-    def decode(self, value: int):
+    def decode(self, value: int, direction: str = "auto"):
+        """Decode one raw LFSR state.
+
+        ``auto`` preserves the historical GUI behavior: try the left-shift
+        interpretation first and then the right-shift table. Scientific
+        measurements should pass the physically verified direction explicitly,
+        because every non-zero state exists in both maximal-length sequences and
+        the shift direction cannot be inferred from one raw word.
+        """
         value = int(value)
+
+        if direction not in ("auto", "left", "right"):
+            raise ValueError("direction must be auto, left or right")
+
+        if direction in ("left", "right"):
+            return self._decode_tables[direction].get(value)
 
         result = self._decode_tables["left"].get(value)
         if result is not None:
