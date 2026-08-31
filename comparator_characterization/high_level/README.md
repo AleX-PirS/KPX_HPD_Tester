@@ -41,11 +41,15 @@ python comparator_characterization/high_level/run_scurve.py
 `PX_MASK=1` только для выбранных тестом пикселей, кроме `BAD_PIXEL_MAP`.
 Исключенные пиксели всегда имеют `MASK=0, TST_EN=0`, включая reconnect и cleanup.
 
+Для AB свипируется B, A устанавливается на верхнюю границу по LUT,
+C и D получают код 1023. Аналогично для BC компараторы вне окна A/D получают
+1023, для CD это A/B. Фиксированные пороги также восстанавливаются при reconnect.
+
 Основные новые настройки в `characterization_config.py`:
 
 ```python
 MINIMUM_REFERENCE_CODE = 401
-MAXIMUM_REFERENCE_CODE = 900  # пример; штатный default 1023
+MAXIMUM_REFERENCE_CODE = 800  # сохранено из вашей конфигурации
 NOISE_COARSE_START = 400     # пример, подберите по своему пилотному скану
 NOISE_COARSE_STOP = 900
 NOISE_COARSE_STEP = 4
@@ -57,6 +61,34 @@ BAD_PIXEL_MAP = [(16, 0), (20, 5)]  # либо путь CSV/JSON, либо None
 `bad_pixels_suggested_fit/centroid/maximum.json`. Это предложения, не применяемые
 автоматически. Причины и надежность находятся в CSV, сводка в
 `recommendation_summary.csv`, карты в `plots/`.
+
+## Параллельный анализ
+
+Дополнительных зависимостей нет. В `characterization_config.py` доступны:
+
+```python
+ANALYSIS_WORKERS = 0  # авто, до 8 процессов; 1 = последовательно
+PLOT_WORKERS = 0      # авто, до 4 процессов PNG/PDF
+RAW_READ_WORKERS = 0  # авто, до 8 потоков чтения CSV
+ANALYSIS_PARALLEL_MIN_GROUPS = 2048
+```
+
+Для офлайн-запуска используйте отдельные CLI-настройки:
+
+```bash
+python -m comparator_characterization.high_level.plot_characterization results/EXPERIMENT --workers 8 --plot-workers 4 --read-workers 8
+```
+
+Статистика повторов ускорена векторными операциями независимо от числа процессов.
+Небольшие наборы fit не распараллеливаются, чтобы избежать затрат на `spawn`.
+В собственном запускаемом Python-файле обязательно поместите вызов анализа
+в `if __name__ == "__main__":`. Все готовые скрипты это уже делают.
+Настройка касается только анализа и рисунков, команды УПО не распараллеливаются.
+Чем больше процессов отрисовки, тем больше требуется RAM.
+
+Изменение числа процессов не запрещает resume, но изменение аппаратных условий
+запрещает: старый эксперимент без фиксации неиспользуемых порогов на 1023 нужно
+пересчитывать офлайн, а новый съем проводить в новом каталоге.
 
 ## GAIN из кода или файла
 

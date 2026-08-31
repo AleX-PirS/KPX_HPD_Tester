@@ -7,7 +7,10 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.5.0"
+FRAMEWORK_VERSION = "0.6.0"
+
+COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
+INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,17 @@ class WindowSpec:
     upper_threshold_dac: str
     pixel_trim_field: str
     inferred_counter_key: str
+
+    def fixed_threshold_codes(self, upper_non_limiting_code: int) -> dict[str, int]:
+        """All non-swept thresholds; the window's upper bound still uses its LUT."""
+
+        return {
+            name: (int(upper_non_limiting_code)
+                   if name == self.upper_threshold_dac
+                   else INACTIVE_COMPARATOR_THRESHOLD_CODE)
+            for name in COMPARATOR_THRESHOLD_DACS
+            if name != self.threshold_dac
+        }
 
 
 WINDOW_SPECS: dict[str, WindowSpec] = {
@@ -339,8 +353,24 @@ class AnalysisSettings:
     plot_all_trim_heatmaps: bool = False
     plot_dpi: int = 300
     save_pdf_plots: bool = True
+    # 0 = automatic (up to 8 CPUs); 1 disables process parallelism.
+    workers: int = 0
+    # Avoid process startup overhead for small collections of independent curves.
+    parallel_min_groups: int = 2048
+    parallel_batch_size: int = 64
+    # Separate limits for memory-heavy PNG/PDF rendering and CSV reading.
+    plot_workers: int = 0
+    read_workers: int = 0
 
     def validate(self) -> None:
+        for name in ("workers", "plot_workers", "read_workers"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"analysis.{name} must be an integer >= 0 (0=auto)")
+        for name in ("parallel_min_groups", "parallel_batch_size"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"analysis.{name} must be a positive integer")
         if self.noise_min_points < 4:
             raise ValueError("noise_min_points must be at least 4")
         if not -1 <= self.gaussian_min_r2 <= 1:

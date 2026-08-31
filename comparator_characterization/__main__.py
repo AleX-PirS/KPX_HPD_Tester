@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from .analysis import analyze_saved_experiment, analyze_saved_noise_statistics
@@ -81,8 +82,16 @@ def main() -> int:
         default=300,
         help="Разрешение PNG, по умолчанию 300 dpi.",
     )
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Процессы анализа: 0=авто (до 8), 1=последовательно.")
+    parser.add_argument("--plot-workers", type=int, default=0,
+                        help="Процессы PNG/PDF: 0=авто (до 4), 1=последовательно.")
+    parser.add_argument("--read-workers", type=int, default=0,
+                        help="Потоки чтения CSV: 0=авто (до 8), 1=последовательно.")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     analysis_settings = AnalysisSettings(
+        workers=args.workers, plot_workers=args.plot_workers, read_workers=args.read_workers,
         representative_pixels=args.representative_pixels,
         plot_pixels=tuple(tuple(pixel) for pixel in (args.pixel or ())),
         plot_injection_patterns=tuple(args.pattern or ()),

@@ -149,9 +149,14 @@ def _validate_resume_inputs(
     stored_bad_pixels = normalize_bad_pixel_map(store.metadata.get("bad_pixel_mask"))
     if set(stored_bad_pixels) != set(bad_pixels):
         raise ValueError("resume bad_pixel_map differs; start a new physical experiment")
-    if _normalized_document(store.metadata.get("settings")) != _normalized_document(
-        settings.to_dict()
-    ):
+    stored_settings = copy.deepcopy(store.metadata.get("settings", {}))
+    requested_settings = settings.to_dict()
+    # Worker limits affect execution time only, not acquisition or fit semantics.
+    for document in (stored_settings, requested_settings):
+        for name in ("workers", "plot_workers", "read_workers",
+                     "parallel_min_groups", "parallel_batch_size"):
+            document.get("analysis", {}).pop(name, None)
+    if _normalized_document(stored_settings) != _normalized_document(requested_settings):
         raise ValueError(
             "resume settings differ from metadata; re-analyze offline for analysis-only changes "
             "or start a new physical experiment"
@@ -163,6 +168,13 @@ def _validate_resume_inputs(
     )
     if stored_upper is None or int(stored_upper) != int(upper_non_limiting_code):
         raise ValueError("resume upper non-limiting DAC code differs from the original experiment")
+    spec = get_window_spec(store.metadata["window"])
+    if store.metadata.get("fixed_threshold_codes") != spec.fixed_threshold_codes(upper_non_limiting_code):
+        raise ValueError(
+            "resume fixed comparator thresholds differ or were not recorded; "
+            "start a new experiment with the inactive DACs at 1023. "
+            "Old measurements remain available for offline analysis."
+        )
 
     stored_calibrations = store.metadata.get("threshold_dac_calibrations", {})
     for name, calibration in calibrations.items():
@@ -365,8 +377,10 @@ def _online_noise_analysis(
     calibration: ThresholdDacCalibration,
     settings: CharacterizationSettings,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    raw = store.load_raw("noise")
+    store.log_status("Анализ noise: чтение raw и расчет статистики")
+    raw = store.load_raw("noise", workers=settings.analysis.read_workers)
     statistics = calculate_noise_statistics(raw)
+    del raw
     fits = fit_noise_statistics(
         statistics,
         settings=settings.analysis,
@@ -827,6 +841,7 @@ def characterize_comparator(
             "threshold_dac": spec.threshold_dac,
             "upper_threshold_dac": spec.upper_threshold_dac,
             "upper_non_limiting_selection": upper_selection,
+            "fixed_threshold_codes": spec.fixed_threshold_codes(upper_non_limiting_code),
             "counter_key": counter_key,
             "counter_mapping_source": counter_mapping_source,
             "pixel_selection": [

@@ -39,7 +39,8 @@ UPO_RECONNECT_ATTEMPTS = 3
 UPO_RECONNECT_BACKOFF_S = 0.5
 
 # Перед каждым аппаратным тестом FCLK явно устанавливается в 50 МГц, затем
-# загружаются EO_cfg.DEFAULT_REGISTERS и стандартная конфигурация 512 PX.
+# загружаются EO_cfg.DEFAULT_REGISTERS и конфигурация всех 1024 PX:
+# Col 0..15 получают 0x00000000, Col 16..31 настраиваются по логике теста.
 ASIC_INITIALIZATION_FCLK_MHZ = 50
 
 # Генератор Keysight 81150A/81160A. None включает VISA-автопоиск.
@@ -185,6 +186,15 @@ REPRESENTATIVE_PIXEL_COUNT = 6
 SAVE_PDF_PLOTS = True
 PLOT_DPI = 300
 
+# Параллельный анализ. 0 = авто, 1 = последовательно; числа >1 задают лимит.
+# Авто: до 8 процессов для больших наборов кривых, до 4 для PNG/PDF,
+# до 8 потоков чтения CSV. Это не распараллеливает команды стенду.
+ANALYSIS_WORKERS = 0
+PLOT_WORKERS = 0
+RAW_READ_WORKERS = 0
+# Небольшие наборы считаются без процессов, чтобы не тратить время на spawn.
+ANALYSIS_PARALLEL_MIN_GROUPS = 2048
+
 
 def configure_runtime_logging() -> None:
     """Включить краткие статусы теста и предупреждения о восстановлении УПО."""
@@ -313,6 +323,10 @@ def build_settings(
         MAXIMUM_REFERENCE_STEP_ERROR_V
     )
     settings.analysis = AnalysisSettings(
+        workers=ANALYSIS_WORKERS,
+        plot_workers=PLOT_WORKERS,
+        read_workers=RAW_READ_WORKERS,
+        parallel_min_groups=ANALYSIS_PARALLEL_MIN_GROUPS,
         representative_pixels=REPRESENTATIVE_PIXEL_COUNT,
         plot_pixels=PLOT_PIXELS,
         plot_injection_patterns=PLOT_SCURVE_PATTERNS,

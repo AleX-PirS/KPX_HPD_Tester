@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+from collections import deque
+from contextvars import ContextVar
+from functools import wraps
+import inspect
+import logging
 import math
 from pathlib import Path
+import pickle
 import re
 from statistics import NormalDist
 from typing import Any
@@ -13,12 +19,15 @@ import pandas as pd
 from pixel_matrix import OWNED_COLUMNS
 
 from .models import AnalysisSettings
+from .parallel import process_pool, process_workers
 
 
 _NORMAL = NormalDist()
+logger = logging.getLogger(__name__)
+_FIGURE_WRITER: ContextVar = ContextVar("characterization_figure_writer", default=None)
 
 
-def _save_figure(
+def _save_figure_local(
     figure: plt.Figure,
     directory: Path,
     stem: str,
@@ -32,6 +41,110 @@ def _save_figure(
         figure.savefig(outputs[-1], bbox_inches="tight")
     plt.close(figure)
     return outputs
+
+
+def _render_pickled_figure(payload: bytes) -> list[Path]:
+    """Only accept in-memory figures produced by this process, never input files."""
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    figure, directory, stem, settings, rc = pickle.loads(payload)
+    FigureCanvasAgg(figure)
+    with plt.rc_context(rc):
+        return _save_figure_local(figure, directory, stem, settings)
+
+
+class _FigureWriter:
+    def __init__(self, settings: AnalysisSettings):
+        self.settings = settings
+        requested = settings.plot_workers
+        self.count = (
+            process_workers(requested, auto_limit=4) if requested
+            else min(4, process_workers(settings.workers, auto_limit=4))
+        )
+        if not requested and settings.plot_dpi < 150 and not settings.save_pdf_plots:
+            self.count = 1  # low-resolution preview is usually faster without spawn
+        self.pool_context = None
+        self.pool = None
+        self.pending: deque = deque()
+        self.submitted = 0
+        self.completed = 0
+
+    def save(self, figure, directory, stem, settings):
+        if self.count <= 1:
+            return _save_figure_local(figure, directory, stem, settings)
+        directory.mkdir(parents=True, exist_ok=True)
+        # Only two pending figures per process, not hundreds of 300-dpi images.
+        if len(self.pending) >= 2 * self.count:
+            self.finish_one()
+        rc = {key: value for key, value in plt.rcParams.items()
+              if key not in ("backend", "backend_fallback")}
+        try:
+            payload = pickle.dumps((figure, directory, stem, settings, rc),
+                                   protocol=pickle.HIGHEST_PROTOCOL)
+        except (pickle.PicklingError, TypeError, AttributeError):
+            logger.warning("График %s не сериализуется, сохраняется последовательно", stem)
+            return _save_figure_local(figure, directory, stem, settings)
+        if self.pool is None:
+            self.pool_context = process_pool(self.count)
+            self.pool = self.pool_context.__enter__()
+            logger.info("Графики PNG/PDF: процессов %d", self.count)
+        self.pending.append((stem, self.pool.submit(_render_pickled_figure, payload)))
+        self.submitted += 1
+        plt.close(figure)
+        return [directory / f"{stem}.{extension}" for extension in
+                (("png", "pdf") if settings.save_pdf_plots else ("png",))]
+
+    def finish_one(self):
+        stem, future = self.pending.popleft()
+        future.result()  # propagate rendering and disk errors, never report fake success
+        self.completed += 1
+        if self.completed % 5 == 0:
+            logger.info("Графики: сохранено %d, поставлено в очередь %d (%s)",
+                        self.completed, self.submitted, stem)
+
+    def close(self, *, success: bool):
+        try:
+            if success:
+                while self.pending:
+                    self.finish_one()
+                if self.submitted:
+                    logger.info("Графики: 100%% (%d/%d)", self.completed, self.submitted)
+        finally:
+            for _, future in self.pending:
+                future.cancel()
+            if self.pool_context is not None:
+                self.pool_context.__exit__(None, None, None)
+
+
+def _parallel_figures(function):
+    """Keep pyplot in one parent thread, render/save independent figures in processes."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        if _FIGURE_WRITER.get() is not None:
+            return function(*args, **kwargs)
+        settings = inspect.signature(function).bind(*args, **kwargs).arguments["settings"]
+        writer = _FigureWriter(settings)
+        token = _FIGURE_WRITER.set(writer)
+        success = False
+        try:
+            result = function(*args, **kwargs)
+            success = True
+            return result
+        finally:
+            try:
+                writer.close(success=success)
+            finally:
+                _FIGURE_WRITER.reset(token)
+    return wrapped
+
+
+def _save_figure(figure, directory, stem, settings) -> list[Path]:
+    writer = _FIGURE_WRITER.get()
+    if writer is not None:
+        return writer.save(figure, directory, stem, settings)
+    return _save_figure_local(figure, directory, stem, settings)
 
 
 def _finite_values(frame: pd.DataFrame, column: str) -> np.ndarray:
@@ -211,6 +324,7 @@ def _noise_prediction(fit: pd.Series, voltage: np.ndarray) -> np.ndarray | None:
     return None
 
 
+@_parallel_figures
 def generate_recommendation_plots(directory: Path, settings: AnalysisSettings) -> dict[str, list[Path]]:
     """Plot proposals separately from measured/verified equalization maps."""
 
@@ -263,6 +377,7 @@ def _scurve_prediction(fit: pd.Series, voltage: np.ndarray) -> np.ndarray | None
     return np.array([_NORMAL.cdf(sign * (value - v50) / sigma) for value in voltage])
 
 
+@_parallel_figures
 def generate_diagnostic_plots(
     *,
     analysis_directory: Path,

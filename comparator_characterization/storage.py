@@ -16,8 +16,17 @@ from typing import Any
 
 import pandas as pd
 
+from .parallel import map_readonly_files
+
 
 logger = logging.getLogger(__name__)
+
+
+def _read_raw_file(item: tuple[Path, str]) -> pd.DataFrame:
+    path, relative = item
+    frame = pd.read_csv(path, keep_default_na=False)
+    frame["raw_source_file"] = relative
+    return frame
 
 
 INDEX_FIELDS = (
@@ -505,6 +514,7 @@ class ExperimentStore:
         measurement_kind: str | None = None,
         *,
         stages: Iterable[str] | None = None,
+        workers: int = 1,
     ) -> pd.DataFrame:
         if not self.index_path.exists():
             return pd.DataFrame()
@@ -516,7 +526,7 @@ class ExperimentStore:
             index = index[index["stage"].isin(tuple(stages))]
         # Keep only the last complete record for a resumed acquisition key.
         index = index.drop_duplicates(subset=["acquisition_key"], keep="last")
-        frames: list[pd.DataFrame] = []
+        paths: list[tuple[Path, str]] = []
         for relative in index["relative_path"]:
             path = (self.raw_root / str(relative)).resolve()
             try:
@@ -527,11 +537,13 @@ class ExperimentStore:
                 ) from error
             if not path.exists():
                 raise FileNotFoundError(f"indexed raw acquisition is missing: {path}")
-            frame = pd.read_csv(path, keep_default_na=False)
-            frame["raw_source_file"] = str(relative)
-            frames.append(frame)
-        if not frames:
+            paths.append((path, str(relative)))
+        if not paths:
             return pd.DataFrame()
+        logger.info("Чтение raw %s: %d CSV-файлов", measurement_kind or "all", len(paths))
+        frames = map_readonly_files(_read_raw_file, paths,
+                                   workers=workers if len(paths) >= 16 else 1)
+        logger.info("Чтение raw %s: 100%%", measurement_kind or "all")
         return pd.concat(frames, ignore_index=True, sort=False)
 
     def next_analysis_directory(self) -> Path:

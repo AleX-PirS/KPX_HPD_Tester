@@ -803,13 +803,20 @@ class MGPDMeasurementBackend:
         return rows
 
     def configure_window(self, spec: WindowSpec, upper_non_limiting_code: int) -> None:
-        if not self.cfg.set_data(spec.upper_threshold_dac, int(upper_non_limiting_code)):
-            raise RuntimeError(
-                f"failed to set {spec.upper_threshold_dac}={upper_non_limiting_code}"
-            )
-        self._global_field_state[spec.upper_threshold_dac] = int(
-            upper_non_limiting_code
+        # Keep only the tested comparator free for scanning. Record each
+        # acknowledged write so reconnect restores the same fixed thresholds.
+        fixed = spec.fixed_threshold_codes(upper_non_limiting_code)
+        for name, code in fixed.items():
+            if not self.cfg.set_data(name, code):
+                raise RuntimeError(f"failed to set fixed threshold {name}={code}")
+            self._global_field_state[name] = code
+        message = (
+            f"Окно {spec.name}: свип {spec.threshold_dac}; фиксированные пороги: "
+            + ", ".join(f"{name}={code}" for name, code in fixed.items())
         )
+        logger.info(message)
+        if self.status_callback is not None:
+            self.status_callback(message)
 
     def set_threshold(self, spec: WindowSpec, code: int) -> None:
         if not self.cfg.set_data(spec.threshold_dac, int(code)):

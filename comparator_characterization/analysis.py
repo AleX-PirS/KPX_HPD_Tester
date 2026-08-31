@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import logging
 import math
 from pathlib import Path
 from statistics import NormalDist
@@ -11,7 +12,8 @@ import numpy as np
 import pandas as pd
 
 from .calibration import ThresholdDacCalibration
-from .models import AnalysisSettings
+from .models import AnalysisSettings, FRAMEWORK_VERSION
+from .parallel import map_analysis_groups
 from .pixel_masks import (
     BadPixelMapInput, bad_pixel_document, exclude_bad_pixel_rows, normalize_bad_pixel_map,
 )
@@ -20,6 +22,7 @@ from .storage import ExperimentStore, atomic_write_json, atomic_write_table, fil
 
 
 _NORMAL = NormalDist()
+logger = logging.getLogger(__name__)
 
 
 def _as_bool(series: pd.Series) -> pd.Series:
@@ -109,37 +112,36 @@ def calculate_noise_statistics(raw: pd.DataFrame) -> pd.DataFrame:
         "column",
         "row",
     ]
-    rows: list[dict[str, Any]] = []
-    for keys, group in frame.groupby(group_columns, dropna=False, sort=True):
-        valid = group[
-            group["measurement_valid_bool"] & group["selected_count"].notna()
-        ]["selected_count"].astype(float)
-        count = int(len(valid))
-        total = int(len(group))
-        std = float(valid.std(ddof=1)) if count >= 2 else float("nan")
-        row = dict(zip(group_columns, keys))
-        row.update(
-            {
-                "repeat_count_total": total,
-                "repeat_count_valid": count,
-                "repeat_count_invalid": total - count,
-                "repeat_count_saturated": int(
-                    group["counter_saturated_bool"].fillna(False).sum()
-                ),
-                "repeat_fraction_saturated": float(
-                    group["counter_saturated_bool"].fillna(False).mean()
-                ),
-                "mean_count": float(valid.mean()) if count else float("nan"),
-                "median_count": float(valid.median()) if count else float("nan"),
-                "std_count": std,
-                "sem_count": std / math.sqrt(count) if count >= 2 else float("nan"),
-                "min_count": float(valid.min()) if count else float("nan"),
-                "max_count": float(valid.max()) if count else float("nan"),
-                "mad_count": _mad(valid),
-            }
-        )
-        rows.append(row)
-    return pd.DataFrame(rows)
+    # Native grouped reductions avoid a Python DataFrame allocation/filter for
+    # every (pixel, DAC code). Invalid readings remain NaN, never zero counts.
+    frame["valid_count"] = frame["selected_count"].astype(float).where(
+        frame["measurement_valid_bool"] & frame["selected_count"].notna()
+    )
+    grouped = frame.groupby(group_columns, dropna=False, sort=True, observed=True)
+    frame["absolute_deviation"] = (
+        frame["valid_count"] - grouped["valid_count"].transform("median")
+    ).abs()
+    result = grouped.agg(
+        repeat_count_total=("selected_count", "size"),
+        repeat_count_valid=("valid_count", "count"),
+        repeat_count_saturated=("counter_saturated_bool", "sum"),
+        repeat_fraction_saturated=("counter_saturated_bool", "mean"),
+        mean_count=("valid_count", "mean"),
+        median_count=("valid_count", "median"),
+        std_count=("valid_count", "std"),
+        min_count=("valid_count", "min"),
+        max_count=("valid_count", "max"),
+        mad_count=("absolute_deviation", "median"),
+    ).reset_index()
+    result["repeat_count_invalid"] = result["repeat_count_total"] - result["repeat_count_valid"]
+    result["sem_count"] = result["std_count"] / np.sqrt(result["repeat_count_valid"].where(
+        result["repeat_count_valid"] >= 2
+    ))
+    return result[group_columns + [
+        "repeat_count_total", "repeat_count_valid", "repeat_count_invalid",
+        "repeat_count_saturated", "repeat_fraction_saturated", "mean_count",
+        "median_count", "std_count", "sem_count", "min_count", "max_count", "mad_count",
+    ]]
 
 
 def _weighted_linear_fit(
@@ -474,6 +476,20 @@ def fit_noise_curve(group: pd.DataFrame, settings: AnalysisSettings) -> dict[str
     return result
 
 
+def _fit_noise_job(job: tuple) -> dict[str, Any]:
+    row, group, settings, calibration = job
+    row.update(fit_noise_curve(group, settings))
+    if calibration is not None and math.isfinite(_finite_or_nan(row["center_selected_v"])):
+        row["center_selected_nearest_dac_code"] = calibration.voltage_to_nearest_dac_code(
+            row["center_selected_v"]
+        )
+        row["center_fit_nearest_dac_code"] = (
+            calibration.voltage_to_nearest_dac_code(row["center_fit_v"])
+            if math.isfinite(_finite_or_nan(row["center_fit_v"])) else float("nan")
+        )
+    return row
+
+
 def fit_noise_statistics(
     statistics: pd.DataFrame,
     *,
@@ -492,20 +508,20 @@ def fit_noise_statistics(
         "column",
         "row",
     ]
-    rows: list[dict[str, Any]] = []
-    for keys, group in statistics.groupby(group_columns, dropna=False, sort=True):
-        row = dict(zip(group_columns, keys))
-        row.update(fit_noise_curve(group, settings))
-        if calibration is not None and math.isfinite(_finite_or_nan(row["center_selected_v"])):
-            center_code = calibration.voltage_to_nearest_dac_code(row["center_selected_v"])
-            row["center_selected_nearest_dac_code"] = center_code
-            if math.isfinite(_finite_or_nan(row["center_fit_v"])):
-                row["center_fit_nearest_dac_code"] = calibration.voltage_to_nearest_dac_code(
-                    row["center_fit_v"]
-                )
-            else:
-                row["center_fit_nearest_dac_code"] = float("nan")
-        rows.append(row)
+    settings.validate()
+    # Workers need only the numeric curve, not all raw/metadata columns.
+    needed = [name for name in (
+        "threshold_voltage_v", "threshold_dac_code", "mean_count", "sem_count",
+        "repeat_count_saturated",
+    ) if name in statistics]
+    groups = statistics[group_columns + needed].groupby(group_columns, dropna=False, sort=True)
+
+    def jobs():
+        for keys, group in groups:
+            yield dict(zip(group_columns, keys)), group, settings, calibration
+
+    rows = map_analysis_groups(_fit_noise_job, jobs, total=groups.ngroups,
+                               settings=settings, label="Noise fit")
     return pd.DataFrame(rows)
 
 
@@ -943,29 +959,27 @@ def _paired_scurve_efficiency(
             <= paired["injections_for_analysis"]
         )
     )
-    reasons = []
-    for _, row in paired.iterrows():
-        flags = []
-        if not bool(row.get("signal_valid", False)):
-            flags.append("invalid_signal_counter")
-        if not bool(row.get("background_valid", False)):
-            flags.append("invalid_background_counter")
-        if bool(row.get("signal_counter_saturated", False)):
-            flags.append("signal_counter_saturated")
-        if bool(row.get("background_counter_saturated", False)):
-            flags.append("background_counter_saturated")
-        if not bool(row.get("active_injection_pixel_bool", False)):
-            flags.append("inactive_pixel_not_used_for_scurve_fit")
-        if not bool(row.get("background_low", False)):
-            flags.append("background_above_limit")
-        corrected = _finite_or_nan(row.get("background_corrected_detected"))
-        injections = _finite_or_nan(row.get("injections_for_analysis"))
-        if math.isfinite(corrected) and corrected < 0:
-            flags.append("negative_after_background_subtraction")
-        if math.isfinite(corrected) and math.isfinite(injections) and corrected > injections:
-            flags.append("corrected_count_exceeds_injections")
-        reasons.append(";".join(flags))
-    paired["quality_flags"] = reasons
+    # Identical flag ordering without iterrows over millions of acquisitions.
+    reasons = pd.Series("", index=paired.index, dtype=object)
+    for field, invert, label in (
+        ("signal_valid", True, "invalid_signal_counter"),
+        ("background_valid", True, "invalid_background_counter"),
+        ("signal_counter_saturated", False, "signal_counter_saturated"),
+        ("background_counter_saturated", False, "background_counter_saturated"),
+        ("active_injection_pixel_bool", True, "inactive_pixel_not_used_for_scurve_fit"),
+        ("background_low", True, "background_above_limit"),
+    ):
+        flag = paired[field].astype(bool)
+        if invert:
+            flag = ~flag
+        reasons.loc[flag] += label + ";"
+    corrected = pd.to_numeric(paired["background_corrected_detected"], errors="coerce")
+    injections = pd.to_numeric(paired["injections_for_analysis"], errors="coerce")
+    negative = np.isfinite(corrected) & (corrected < 0)
+    excess = np.isfinite(corrected) & np.isfinite(injections) & (corrected > injections)
+    reasons.loc[negative] += "negative_after_background_subtraction;"
+    reasons.loc[excess] += "corrected_count_exceeds_injections;"
+    paired["quality_flags"] = reasons.str.rstrip(";")
     return paired
 
 
@@ -1067,24 +1081,27 @@ def _fit_scurve_group(
     return result
 
 
+def _fit_scurve_job(job: tuple) -> dict[str, Any]:
+    row, group, calibration = job
+    row.update(_fit_scurve_group(group, calibration))
+    return row
+
+
 def fit_scurves(
     efficiency: pd.DataFrame,
     calibration: ThresholdDacCalibration,
+    *,
+    settings: AnalysisSettings | None = None,
 ) -> pd.DataFrame:
     if efficiency.empty:
         return pd.DataFrame()
+    selected_settings = settings or AnalysisSettings()
+    selected_settings.validate()
     group_columns = [
-        "stage",
-        "pulse_amplitude_native",
-        "injection_pattern",
-        "column",
-        "row",
-        "local_trim_code",
+        "stage", "pulse_amplitude_native", "injection_pattern",
+        "column", "row", "local_trim_code",
     ]
-    rows = []
-    for keys, group in efficiency.groupby(group_columns, dropna=False, sort=True):
-        row = dict(zip(group_columns, keys))
-        for column in (
+    metadata_columns = [column for column in (
             "injection_voltage_step_v",
             "requested_injection_voltage_step_v",
             "injection_voltage_step_error_v",
@@ -1103,11 +1120,21 @@ def fit_scurves(
             "injection_capacitance_relative_uncertainty",
             "injection_charge_status",
             "injection_count_source",
-        ):
-            if column in group:
-                row[column] = group.iloc[0][column]
-        row.update(_fit_scurve_group(group, calibration))
-        rows.append(row)
+    ) if column in efficiency]
+    numeric_columns = [
+        "fit_valid", "threshold_dac_code", "threshold_voltage_v",
+        "background_corrected_detected", "injections_for_analysis",
+    ]
+    groups = efficiency.groupby(group_columns, dropna=False, sort=True)
+
+    def jobs():
+        for keys, group in groups:
+            row = dict(zip(group_columns, keys))
+            row.update(group.iloc[0][metadata_columns].to_dict())
+            yield row, group[numeric_columns], calibration
+
+    rows = map_analysis_groups(_fit_scurve_job, jobs, total=groups.ngroups,
+                               settings=selected_settings, label="S-curve fit")
     return pd.DataFrame(rows)
 
 
@@ -1519,6 +1546,7 @@ def analyze_saved_experiment(
         analysis_dir / "analysis_settings.json",
         {
             "created_utc": utc_now_text(),
+            "analysis_framework_version": FRAMEWORK_VERSION,
             "settings": asdict(selected_settings),
             "target_voltage_override_v": target_voltage,
             "n_injections_consistency_check": n_injections,
@@ -1527,8 +1555,11 @@ def analyze_saved_experiment(
         },
     )
 
-    raw_noise = exclude_bad_pixel_rows(store.load_raw("noise"), bad_pixels)
+    store.log_status("Офлайн-анализ: чтение noise raw")
+    raw_noise = exclude_bad_pixel_rows(store.load_raw("noise", workers=selected_settings.read_workers), bad_pixels)
     noise_statistics = calculate_noise_statistics(raw_noise)
+    del raw_noise
+    store.log_status("Офлайн-анализ: статистика noise рассчитана")
     store.write_table(analysis_dir / "noise_statistics.csv", noise_statistics)
     outputs["noise_statistics"] = analysis_dir / "noise_statistics.csv"
 
@@ -1710,7 +1741,7 @@ def analyze_saved_experiment(
     })
     outputs["measurement_coverage"] = analysis_dir / "measurement_coverage.json"
 
-    raw_scurve = exclude_bad_pixel_rows(store.load_raw("scurve"), bad_pixels)
+    raw_scurve = exclude_bad_pixel_rows(store.load_raw("scurve", workers=selected_settings.read_workers), bad_pixels)
     scurve_efficiency = pd.DataFrame()
     scurve_results = pd.DataFrame()
     scurve_amplitude_summary = pd.DataFrame()
@@ -1767,9 +1798,10 @@ def analyze_saved_experiment(
             noise_statistics=scurve_noise_statistics,
             max_background_fraction=max_background_fraction,
         )
+        del raw_scurve
         store.write_table(analysis_dir / "scurve_efficiency.csv", scurve_efficiency)
         if calibration is not None:
-            scurve_results = fit_scurves(scurve_efficiency, calibration)
+            scurve_results = fit_scurves(scurve_efficiency, calibration, settings=selected_settings)
         store.write_table(analysis_dir / "scurve_results.csv", scurve_results)
         scurve_amplitude_summary = summarize_scurve_amplitudes(scurve_results)
         scurve_gain_results = fit_scurve_gain_results(scurve_results)
@@ -1914,7 +1946,8 @@ def analyze_saved_noise_statistics(
     atomic_write_json(directory / "measurement_coverage.json", coverage)
     outputs["measurement_coverage"] = directory / "measurement_coverage.json"
     atomic_write_json(directory / "analysis_settings.json", {
-        "created_utc": utc_now_text(), "settings": asdict(selected_settings),
+        "created_utc": utc_now_text(), "analysis_framework_version": FRAMEWORK_VERSION,
+        "settings": asdict(selected_settings),
         "target_voltage_override_v": target_voltage, "bad_pixel_mask": bad_pixel_document(bad_pixels),
     })
     outputs["analysis_settings"] = directory / "analysis_settings.json"
