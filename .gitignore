@@ -7,9 +7,8 @@ EDM_vis.py
 # C extensions
 *.so
 
-# dirs
-/*csv*
 # Fiels
+*.csv
 test.py
 # Distribution / packaging
 .Python

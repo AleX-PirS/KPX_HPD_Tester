@@ -33,10 +33,17 @@ from .hardware import (
     KeysightBurstSettings,
     KeysightBurstShotExecutor,
     MGPDMeasurementBackend,
+    STANDARD_CHARACTERIZATION_FCLK_MHZ,
     ShotExecutor,
+    build_standard_characterization_pixel_configs,
     load_base_pixel_configs,
 )
 from .injection import build_injection_groups, resolve_gain_map
+from .pixel_masks import (
+    BadPixelMapInput, bad_pixel_document, noise_baseline_pixel_word,
+    normalize_bad_pixel_map,
+)
+from .recommendations import save_noise_recommendations
 from .measurement import run_noise_scan as acquire_noise_scan, run_scurve_points
 from .models import (
     CharacterizationSettings,
@@ -137,7 +144,11 @@ def _validate_resume_inputs(
     reference_calibrations: Mapping[str, ReferenceDacCalibration],
     base_configs: Mapping[tuple[int, int], int],
     pixels: Sequence[tuple[int, int]],
+    bad_pixels: Sequence[tuple[int, int]] = (),
 ) -> None:
+    stored_bad_pixels = normalize_bad_pixel_map(store.metadata.get("bad_pixel_mask"))
+    if set(stored_bad_pixels) != set(bad_pixels):
+        raise ValueError("resume bad_pixel_map differs; start a new physical experiment")
     if _normalized_document(store.metadata.get("settings")) != _normalized_document(
         settings.to_dict()
     ):
@@ -365,6 +376,11 @@ def _online_noise_analysis(
     directory.mkdir(parents=True, exist_ok=True)
     store.write_table(directory / "noise_statistics.csv", statistics)
     store.write_table(directory / "noise_fit_results.csv", fits)
+    save_noise_recommendations(
+        directory, fits, statistics,
+        target_voltage=settings.equalization.target_voltage,
+        bad_pixel_map=store.metadata.get("bad_pixel_mask"),
+    )
     return statistics, fits
 
 
@@ -387,10 +403,15 @@ def _estimated_trim_map(
 def _map_with_offset(
     estimate: Mapping[tuple[int, int], int],
     offset: int,
+    *,
+    unchanged: Mapping[tuple[int, int], int] | None = None,
 ) -> dict[tuple[int, int], int]:
     return {
+        **dict(unchanged or {}),
+        **{
         coordinate: max(0, min(31, int(trim) + int(offset)))
         for coordinate, trim in estimate.items()
+        },
     }
 
 
@@ -398,11 +419,17 @@ def _select_final_trim_map(
     pixels: Sequence[tuple[int, int]],
     measured: pd.DataFrame,
     estimate: Mapping[tuple[int, int], int],
+    *,
+    unchanged: Mapping[tuple[int, int], int] | None = None,
 ) -> tuple[dict[tuple[int, int], int], pd.DataFrame]:
     measured_lookup = {
         (int(row["column"]), int(row["row"])): int(row["selected_trim_code"])
         for _, row in measured.iterrows()
         if pd.notna(row.get("selected_trim_code"))
+        and (
+            (int(row["column"]), int(row["row"])) in estimate
+            or str(row.get("selected_from_stage", "")).startswith(("trim_candidate_", "trim_expand_", "trim_full_"))
+        )
     }
     rows = []
     trim_map = {}
@@ -413,6 +440,9 @@ def _select_final_trim_map(
         elif coordinate in estimate:
             trim = int(estimate[coordinate])
             source = "endpoint_interpolation_fallback"
+        elif unchanged is not None and coordinate in unchanged:
+            trim = int(unchanged[coordinate])
+            source = "initial_trim_preserved_NO_RELIABLE_EQUALIZATION"
         else:
             raise RuntimeError(
                 f"no trim estimate is available for Col={coordinate[0]} Row={coordinate[1]}"
@@ -536,6 +566,7 @@ def characterize_comparator(
     *,
     window: str = "AB",
     pixels: str | Sequence[tuple[int, int]] = "all",
+    bad_pixel_map: BadPixelMapInput = None,
     base_pixel_config: str | Path | Mapping[tuple[int, int], int] | None = None,
     results_root: str | Path = "results",
     run_noise_scan: bool = True,
@@ -543,6 +574,10 @@ def characterize_comparator(
     run_scurve: bool = True,
     settings: CharacterizationSettings | None = None,
     n_injections: int | None = None,
+    coarse_start: int | None = None,
+    coarse_stop: int | None = None,
+    minimum_reference_code: int | None = None,
+    maximum_reference_code: int | None = None,
     reference_calibration_files: Mapping[
         str, str | Path | ReferenceDacCalibration
     ] | None = None,
@@ -560,12 +595,13 @@ def characterize_comparator(
     before_scurve: Callable[[ManualExposureChange], None] | None = None,
     resume_experiment: str | Path | None = None,
     additional_metadata: Mapping[str, Any] | None = None,
+    initialization_fclk_mhz: int = STANDARD_CHARACTERIZATION_FCLK_MHZ,
 ) -> CharacterizationResult:
     """Characterize one AB, BC or CD counting window.
 
     Public pixel coordinates are always ``(column, row)``. Real hardware runs
-    require a saved baseline pixel configuration so the selected comparator trim
-    can be modified without changing any of the other 27 pixel bits. Noise,
+    use the built-in reproducible pixel baseline unless an explicit advanced
+    baseline is supplied. Later trim changes preserve every other pixel bit. Noise,
     equalization and S-curve stages can be selected independently. ``n_injections``
     overrides the S-curve default of 1000 for this call. When measured REF1 and
     REF2 LUT paths plus ``injection_voltage_steps_v`` are supplied, native codes
@@ -577,6 +613,16 @@ def characterize_comparator(
     selected_settings = (
         copy.deepcopy(settings) if settings is not None else CharacterizationSettings()
     )
+    for name, value in (("coarse_start", coarse_start), ("coarse_stop", coarse_stop)):
+        if value is not None:
+            setattr(selected_settings.noise, name, value)
+    for name, value in (
+        ("minimum_reference_code", minimum_reference_code),
+        ("maximum_reference_code", maximum_reference_code),
+    ):
+        if value is not None:
+            setattr(selected_settings.scurve, name, value)
+    selected_settings.validate()
     if n_injections is not None:
         if (
             not isinstance(n_injections, int)
@@ -612,6 +658,9 @@ def characterize_comparator(
             minimum_reference_code=(
                 selected_settings.scurve.minimum_reference_code
             ),
+            maximum_reference_code=(
+                selected_settings.scurve.maximum_reference_code
+            ),
             minimum_reference_voltage_v=(
                 selected_settings.scurve.minimum_reference_voltage_v
             ),
@@ -631,9 +680,29 @@ def characterize_comparator(
             "reference_calibration_files requires injection_voltage_steps_v; "
             "manual native-code amplitudes do not use a LUT implicitly"
         )
+    bounded_amplitudes = []
+    for amplitude in selected_settings.scurve.pulse_amplitudes:
+        if isinstance(amplitude, Mapping) and any(
+            name in amplitude for name in ("DAC_TST_REF1", "DAC_TST_REF2")
+        ):
+            amplitude = dict(amplitude)
+            for name in ("DAC_TST_REF1", "DAC_TST_REF2"):
+                code = amplitude.get(name)
+                if not isinstance(code, int) or isinstance(code, bool) or not (
+                    selected_settings.scurve.minimum_reference_code <= code <= selected_settings.scurve.maximum_reference_code
+                ):
+                    raise ValueError(f"{name} must be within the configured inclusive REF code bounds")
+            amplitude["minimum_reference_code"] = selected_settings.scurve.minimum_reference_code
+            amplitude["maximum_reference_code"] = selected_settings.scurve.maximum_reference_code
+        bounded_amplitudes.append(amplitude)
+    selected_settings.scurve.pulse_amplitudes = tuple(bounded_amplitudes)
     selected_settings.validate()
     spec = get_window_spec(window)
-    selected_pixels = resolve_pixels(pixels, OWNED_COLUMNS)
+    requested_pixels = resolve_pixels(pixels, OWNED_COLUMNS)
+    bad_pixels = normalize_bad_pixel_map(bad_pixel_map)
+    selected_pixels = tuple(pixel for pixel in requested_pixels if pixel not in bad_pixels)
+    if not selected_pixels:
+        raise ValueError("all requested pixels are excluded by bad_pixel_map")
     calibrations = load_threshold_dac_calibrations(threshold_calibration_files)
     missing_calibrations = {
         spec.threshold_dac,
@@ -649,11 +718,17 @@ def characterize_comparator(
     _preflight_scan_coverage(threshold_calibration, selected_settings)
 
     if base_pixel_config is None:
-        raise ValueError(
-            "base_pixel_config is required because SET_PIXEL_CFG has no per-pixel readback; "
-            "provide a Matrix-page JSON or a (column, row) -> raw word mapping"
+        base_configs = build_standard_characterization_pixel_configs(
+            digital_counting_enabled=True
         )
-    base_configs = load_base_pixel_configs(base_pixel_config)
+        base_config_source = "built_in_standard_counting_baseline"
+    else:
+        base_configs = load_base_pixel_configs(base_pixel_config)
+        base_config_source = "explicit_base_pixel_config"
+    base_configs = {
+        coordinate: noise_baseline_pixel_word(raw, bad=coordinate in bad_pixels)
+        for coordinate, raw in base_configs.items()
+    }
 
     if counter_key is None:
         counter_key = spec.inferred_counter_key
@@ -725,6 +800,7 @@ def characterize_comparator(
             reference_calibrations=reference_calibrations,
             base_configs=base_configs,
             pixels=selected_pixels,
+            bad_pixels=bad_pixels,
         )
         if normalized_gain_map is not None:
             gain_relative = store.metadata.get("gain_map", {}).get("normalized_csv")
@@ -756,6 +832,10 @@ def characterize_comparator(
             "pixel_selection": [
                 {"column": column, "row": row} for column, row in selected_pixels
             ],
+            "requested_pixel_selection": [
+                {"column": column, "row": row} for column, row in requested_pixels
+            ],
+            "bad_pixel_mask": bad_pixel_document(bad_pixels),
             "matrix_ownership": {
                 "physical_rows": list(range(32)),
                 "physical_columns": list(OWNED_COLUMNS),
@@ -772,6 +852,7 @@ def characterize_comparator(
                     else None
                 ),
                 "use_reference_trim_map": use_reference_trim_map,
+                "initialization_fclk_mhz": int(initialization_fclk_mhz),
             },
             "hardware_capability_notes": {
                 "noise_acquisition": "MGPDLab GET_SHOT then GET_PIXEL",
@@ -799,7 +880,7 @@ def characterize_comparator(
                     "PX_TST_EN": "1 for current active group, 0 otherwise",
                     "PX_SH_EN": 0,
                     "PX_BUF_NEN": 1,
-                    "PX_MASK": 1,
+                    "PX_MASK": "1 for selected good pixels; 0 for permanent bad pixels",
                     "PX_SHT": 2,
                     "PX_GAIN": "per-pixel gain_map",
                 },
@@ -820,6 +901,9 @@ def characterize_comparator(
                     "minimum_reference_code": (
                         selected_settings.scurve.minimum_reference_code
                     ),
+                    "maximum_reference_code": (
+                        selected_settings.scurve.maximum_reference_code
+                    ),
                     "minimum_reference_voltage_v": (
                         selected_settings.scurve.minimum_reference_voltage_v
                     ),
@@ -835,6 +919,11 @@ def characterize_comparator(
             },
             **dict(additional_metadata or {}),
         }
+        # Safety/reproducibility fields cannot be replaced by descriptive extras.
+        metadata["bad_pixel_mask"] = bad_pixel_document(bad_pixels)
+        metadata["pixel_selection"] = [
+            {"column": c, "row": r} for c, r in selected_pixels
+        ]
         store = ExperimentStore.create(results_root, window=spec.name, metadata=metadata)
 
     backend = MGPDMeasurementBackend(
@@ -843,6 +932,8 @@ def characterize_comparator(
         counter_key=counter_key,
         noise_settings=selected_settings.noise,
         shot_executor=shot_executor,
+        status_callback=store.log_status,
+        bad_pixel_map=bad_pixels,
     )
     backend.validate_pixels(selected_pixels)
 
@@ -850,7 +941,48 @@ def characterize_comparator(
     target_voltage: float | None = None
     final_trim_map = backend.current_trim_map(spec, selected_pixels)
     try:
+        store.log_status(
+            f"Запуск теста окна {spec.name}, пикселей: {len(selected_pixels)}",
+            overall_percent_estimate=0.0,
+        )
+        store.log_status(
+            f"Постоянная маска: {len(bad_pixels)} пикселей; "
+            f"coarse DAC: {selected_settings.noise.coarse_start}.."
+            f"{selected_settings.noise.coarse_stop}, шаг {selected_settings.noise.coarse_step}"
+        )
+        initialization_record = backend.initialize_standard_configuration(
+            selected_pixels,
+            fclk_mhz=initialization_fclk_mhz,
+            progress_callback=lambda message, percent: store.log_status(
+                message,
+                stage_percent=percent,
+                overall_percent_estimate=3.0 * percent / 100.0,
+            ),
+        )
+        initialized_snapshot = backend.initial_configuration_snapshot()
+        initialization_history = list(
+            store.metadata.get("asic_initialization_history", [])
+        )
+        initialization_history.append(
+            {
+                "timestamp_utc": utc_now_text(),
+                "resume_run": resume_experiment is not None,
+                **initialization_record,
+            }
+        )
+        store.update_metadata(
+            asic_initialization_history=initialization_history,
+            initial_asic_configuration=initialized_snapshot,
+        )
+        store.log_status(
+            "Стандартная конфигурация ASIC и PX установлена",
+            overall_percent_estimate=3.0,
+        )
+
         if resume_experiment is None:
+            from .storage import atomic_write_json
+
+            atomic_write_json(store.root / "inputs" / "bad_pixels.json", bad_pixel_document(bad_pixels))
             calibration_records = _save_calibrations(store, calibrations)
             reference_calibration_records = _save_calibrations(
                 store,
@@ -875,8 +1007,11 @@ def characterize_comparator(
                         store.root
                     ).as_posix(),
                     "source_file": base_source_record,
+                    "source_policy": base_config_source,
+                    "built_in_mask_semantics": (
+                        "PX_MASK=1 enables digital counting for selected test pixels"
+                    ),
                 },
-                initial_asic_configuration=backend.initial_configuration_snapshot(),
             )
             if reference_pair_selections:
                 pair_path = store.root / "inputs" / "reference_pair_selection.csv"
@@ -896,6 +1031,7 @@ def characterize_comparator(
                                 "reference_common_mode_v": item.reference_common_mode_v,
                                 "selection_method": item.selection_method,
                                 "minimum_reference_code": item.minimum_reference_code,
+                                "maximum_reference_code": item.maximum_reference_code,
                                 "minimum_reference_voltage_v": item.minimum_reference_voltage_v,
                             }
                             for item in reference_pair_selections
@@ -950,6 +1086,10 @@ def characterize_comparator(
                 )
 
         backend.configure_window(spec, upper_non_limiting_code)
+        store.log_status(
+            f"Окно {spec.name} настроено, начинается измерительная часть",
+            overall_percent_estimate=7.0,
+        )
 
         reference_noise_statistics = pd.DataFrame()
         reference_trim_map: dict[tuple[int, int], int] | None = None
@@ -984,11 +1124,35 @@ def characterize_comparator(
             )
 
         if run_equalization:
+            primary_analysis_progress = (
+                65.0
+                if selected_settings.equalization.scan_all_trim_codes
+                else 40.0
+            )
+            candidate_completion_progress = (
+                80.0
+                if selected_settings.equalization.scan_all_trim_codes
+                else 60.0
+            )
+            final_noise_progress = (
+                85.0
+                if run_scurve
+                and selected_settings.equalization.scan_all_trim_codes
+                else 72.0
+                if run_scurve
+                else 92.0
+            )
+            progress_cursor = candidate_completion_progress
+            store.log_status(
+                "Начинается noise scan и эквализация trim-кодов",
+                overall_percent_estimate=10.0,
+            )
             if run_noise_scan:
-                for trim in (
+                endpoint_trims = (
                     selected_settings.equalization.trim_min,
                     selected_settings.equalization.trim_max,
-                ):
+                )
+                for endpoint_index, trim in enumerate(endpoint_trims):
                     stage = f"trim_{trim:02d}"
                     trim_map = {coordinate: trim for coordinate in selected_pixels}
                     acquire_noise_scan(
@@ -1001,6 +1165,12 @@ def characterize_comparator(
                         stage=stage,
                         upper_non_limiting_code=upper_non_limiting_code,
                         settings=selected_settings.noise,
+                        overall_progress_start=10.0 + 10.0 * endpoint_index,
+                        overall_progress_end=20.0 + 10.0 * endpoint_index,
+                    )
+                    store.log_status(
+                        f"Завершен endpoint noise scan при trim={trim}",
+                        overall_percent_estimate=20.0 + 10.0 * endpoint_index,
                     )
                 if selected_settings.equalization.scan_all_trim_codes:
                     store.update_metadata(
@@ -1035,10 +1205,20 @@ def characterize_comparator(
                             stage=f"trim_full_{trim:02d}",
                             upper_non_limiting_code=upper_non_limiting_code,
                             settings=selected_settings.noise,
+                            overall_progress_start=30.0 + (trim - 1),
+                            overall_progress_end=30.0 + trim,
+                        )
+                        store.log_status(
+                            f"Полный trim-sweep: завершен trim={trim}/31",
+                            overall_percent_estimate=30.0 + trim,
                         )
 
             noise_statistics, noise_fits = _online_noise_analysis(
                 store, threshold_calibration, selected_settings
+            )
+            store.log_status(
+                "Первичный анализ noise-кривых завершен",
+                overall_percent_estimate=primary_analysis_progress,
             )
             target_voltage, target_method, reachability = select_equalization_target(
                 noise_fits,
@@ -1052,12 +1232,19 @@ def characterize_comparator(
             )
             estimate = _estimated_trim_map(reachability)
             missing_estimates = set(selected_pixels) - set(estimate)
+            unresolved_baseline = {
+                coordinate: final_trim_map[coordinate] for coordinate in missing_estimates
+            }
             if missing_estimates:
-                first = sorted(missing_estimates)[0]
-                raise RuntimeError(
-                    f"trim endpoint analysis failed for {len(missing_estimates)} pixel(s); "
-                    f"first is Col={first[0]} Row={first[1]}"
+                store.log_status(
+                    f"Для {len(missing_estimates)} пикселей нет двух надежных endpoint-центров. "
+                    "Их исходный trim сохраняется; пиксели не маскируются автоматически. "
+                    f"Рекомендации: {online_directory}"
                 )
+                store.update_metadata(unresolved_equalization_pixels=[
+                    {"column": c, "row": r, "preserved_initial_trim": unresolved_baseline[(c, r)]}
+                    for c, r in sorted(missing_estimates)
+                ])
             verification_codes = _verification_codes(
                 threshold_calibration,
                 target_voltage,
@@ -1065,19 +1252,42 @@ def characterize_comparator(
             )
 
             radius = selected_settings.equalization.local_search_radius
-            for offset in range(-radius, radius + 1):
+            candidate_offsets = tuple(range(-radius, radius + 1))
+            for candidate_index, offset in enumerate(candidate_offsets, start=1):
                 acquire_noise_scan(
                     backend=backend,
                     store=store,
                     calibration=threshold_calibration,
                     spec=spec,
                     pixels=selected_pixels,
-                    trim_map=_map_with_offset(estimate, offset),
+                    trim_map=_map_with_offset(estimate, offset, unchanged=unresolved_baseline),
                     stage=_candidate_stage("trim_candidate", offset),
                     upper_non_limiting_code=upper_non_limiting_code,
                     settings=selected_settings.noise,
                     scan_codes=verification_codes,
                     auto_fine=False,
+                    overall_progress_start=(
+                        primary_analysis_progress
+                        + (candidate_completion_progress - primary_analysis_progress)
+                        * (candidate_index - 1)
+                        / max(len(candidate_offsets), 1)
+                    ),
+                    overall_progress_end=(
+                        primary_analysis_progress
+                        + (candidate_completion_progress - primary_analysis_progress)
+                        * candidate_index
+                        / max(len(candidate_offsets), 1)
+                    ),
+                )
+                store.log_status(
+                    f"Локальная проверка trim: вариант {candidate_index}/"
+                    f"{len(candidate_offsets)}",
+                    overall_percent_estimate=(
+                        primary_analysis_progress
+                        + (candidate_completion_progress - primary_analysis_progress)
+                        * candidate_index
+                        / max(len(candidate_offsets), 1)
+                    ),
                 )
 
             noise_statistics, noise_fits = _online_noise_analysis(
@@ -1087,7 +1297,7 @@ def characterize_comparator(
             measured_coordinates = {
                 (int(row["column"]), int(row["row"])) for _, row in measured.iterrows()
             }
-            expansion_needed = set(selected_pixels) - measured_coordinates
+            expansion_needed = set(estimate) - measured_coordinates
             if radius > 0 and not measured.empty:
                 boundary_suffixes = (f"_m{radius:02d}", f"_p{radius:02d}")
                 boundary = measured[
@@ -1109,20 +1319,36 @@ def characterize_comparator(
                     for offset in range(-expanded, expanded + 1)
                     if abs(offset) > radius
                 ]
-                for offset in offsets:
+                expansion_progress_end = progress_cursor + 0.20 * (
+                    final_noise_progress - progress_cursor
+                )
+                for offset_index, offset in enumerate(offsets, start=1):
                     acquire_noise_scan(
                         backend=backend,
                         store=store,
                         calibration=threshold_calibration,
                         spec=spec,
                         pixels=selected_pixels,
-                        trim_map=_map_with_offset(estimate, offset),
+                        trim_map=_map_with_offset(estimate, offset, unchanged=unresolved_baseline),
                         stage=_candidate_stage("trim_expand", offset),
                         upper_non_limiting_code=upper_non_limiting_code,
                         settings=selected_settings.noise,
                         scan_codes=verification_codes,
                         auto_fine=False,
+                        overall_progress_start=(
+                            progress_cursor
+                            + (expansion_progress_end - progress_cursor)
+                            * (offset_index - 1)
+                            / max(len(offsets), 1)
+                        ),
+                        overall_progress_end=(
+                            progress_cursor
+                            + (expansion_progress_end - progress_cursor)
+                            * offset_index
+                            / max(len(offsets), 1)
+                        ),
                     )
+                progress_cursor = expansion_progress_end
                 noise_statistics, noise_fits = _online_noise_analysis(
                     store, threshold_calibration, selected_settings
                 )
@@ -1135,6 +1361,9 @@ def characterize_comparator(
                     (int(row["column"]), int(row["row"])) for _, row in measured.iterrows()
                 }
                 if set(selected_pixels) - measured_coordinates:
+                    fallback_progress_end = progress_cursor + 0.70 * (
+                        final_noise_progress - progress_cursor
+                    )
                     for trim in range(32):
                         acquire_noise_scan(
                             backend=backend,
@@ -1148,7 +1377,20 @@ def characterize_comparator(
                             settings=selected_settings.noise,
                             scan_codes=verification_codes,
                             auto_fine=False,
+                            overall_progress_start=(
+                                progress_cursor
+                                + (fallback_progress_end - progress_cursor)
+                                * trim
+                                / 32.0
+                            ),
+                            overall_progress_end=(
+                                progress_cursor
+                                + (fallback_progress_end - progress_cursor)
+                                * (trim + 1)
+                                / 32.0
+                            ),
                         )
+                    progress_cursor = fallback_progress_end
                     noise_statistics, noise_fits = _online_noise_analysis(
                         store, threshold_calibration, selected_settings
                     )
@@ -1157,7 +1399,7 @@ def characterize_comparator(
                     )
 
             final_trim_map, trim_table = _select_final_trim_map(
-                selected_pixels, measured, estimate
+                selected_pixels, measured, estimate, unchanged=unresolved_baseline,
             )
             final_trim_path = store.root / "final_trim_map.csv"
             store.write_table(final_trim_path, trim_table)
@@ -1184,8 +1426,18 @@ def characterize_comparator(
                 stage="equalized_final",
                 upper_non_limiting_code=upper_non_limiting_code,
                 settings=selected_settings.noise,
+                overall_progress_start=progress_cursor,
+                overall_progress_end=final_noise_progress,
+            )
+            store.log_status(
+                "Финальная проверка эквализированной матрицы завершена",
+                overall_percent_estimate=final_noise_progress,
             )
         elif run_noise_scan:
+            store.log_status(
+                "Начинается отдельный baseline noise scan",
+                overall_percent_estimate=10.0,
+            )
             final_trim_map = backend.current_trim_map(spec, selected_pixels)
             acquire_noise_scan(
                 backend=backend,
@@ -1197,9 +1449,32 @@ def characterize_comparator(
                 stage="baseline_noise",
                 upper_non_limiting_code=upper_non_limiting_code,
                 settings=selected_settings.noise,
+                overall_progress_start=10.0,
+                overall_progress_end=(65.0 if run_scurve else 92.0),
+            )
+            store.log_status(
+                "Baseline noise scan завершен",
+                overall_percent_estimate=(65.0 if run_scurve else 92.0),
             )
 
         if run_scurve:
+            scurve_progress_start = (
+                85.0
+                if run_equalization
+                and selected_settings.equalization.scan_all_trim_codes
+                else 72.0
+                if run_noise_scan or run_equalization
+                else 10.0
+            )
+            total_scurve_groups = len(selected_settings.scurve.pulse_amplitudes) * sum(
+                len(build_injection_groups(selected_pixels, pattern))
+                for pattern in selected_settings.scurve.injection_patterns
+            )
+            completed_scurve_groups = 0
+            store.log_status(
+                f"Начинается S-curve: групп инжекции {total_scurve_groups}",
+                overall_percent_estimate=scurve_progress_start,
+            )
             if store.load_raw("noise").empty:
                 noise_statistics = reference_noise_statistics
             else:
@@ -1250,10 +1525,18 @@ def characterize_comparator(
                         ),
                     },
                 )
+                store.log_status(
+                    "Ожидание ручной установки S-curve экспозиции в УПО и подтверждения",
+                    overall_percent_estimate=scurve_progress_start,
+                )
                 (before_scurve or interactive_exposure_pause)(change)
                 store.update_metadata(
                     status="in_progress",
                     manual_scurve_exposure_confirmed_utc=utc_now_text(),
+                )
+                store.log_status(
+                    "Изменение экспозиции подтверждено, S-curve продолжена",
+                    overall_percent_estimate=scurve_progress_start,
                 )
 
             pixel_snapshot = backend.snapshot_pixel_configs(selected_pixels)
@@ -1389,6 +1672,21 @@ def characterize_comparator(
                                 amplitude=amplitude,
                                 amplitude_configuration=amplitude_configuration,
                             )
+                        completed_scurve_groups += len(groups)
+                        scurve_fraction = completed_scurve_groups / max(
+                            total_scurve_groups, 1
+                        )
+                        store.log_status(
+                            f"S-curve: завершено групп {completed_scurve_groups}/"
+                            f"{total_scurve_groups}, амплитуда {amplitude_index + 1}/"
+                            f"{len(selected_settings.scurve.pulse_amplitudes)}, "
+                            f"режим {pattern}",
+                            stage_percent=100.0 * scurve_fraction,
+                            overall_percent_estimate=(
+                                scurve_progress_start
+                                + (96.0 - scurve_progress_start) * scurve_fraction
+                            ),
+                        )
             finally:
                 try:
                     if isinstance(shot_executor, KeysightBurstShotExecutor):
@@ -1412,6 +1710,10 @@ def characterize_comparator(
                             }
                         )
 
+        store.log_status(
+            "Измерения завершены, начинается итоговый анализ и построение графиков",
+            overall_percent_estimate=97.0,
+        )
         store.set_status("complete")
         analysis_outputs = analyze_saved_experiment(
             store.root,
@@ -1423,6 +1725,10 @@ def characterize_comparator(
             generate_plots=True,
         )
         analysis_path = Path(analysis_outputs["analysis_directory"])
+        store.log_status(
+            f"Тест и анализ завершены: {analysis_path}",
+            overall_percent_estimate=100.0,
+        )
         return CharacterizationResult(
             experiment_path=store.root,
             analysis_path=analysis_path,
@@ -1431,9 +1737,13 @@ def characterize_comparator(
             status="complete",
         )
     except KeyboardInterrupt:
+        store.log_status("Тест остановлен пользователем")
         store.set_status("interrupted", error="user interruption")
         raise
     except BaseException as error:
+        store.log_status(
+            f"Тест завершился ошибкой: {type(error).__name__}: {error}"
+        )
         store.record_error(
             {
                 "timestamp_utc": utc_now_text(),
@@ -1454,6 +1764,7 @@ def characterize_injection_crosstalk(
     *,
     noise_reference_experiment: str | Path,
     settings: CharacterizationSettings | None = None,
+    bad_pixel_map: BadPixelMapInput = None,
     **characterization_arguments: Any,
 ) -> CharacterizationResult:
     """Run S-curves for all, 2x2, 4x4 and 8x8 injection patterns.
@@ -1493,5 +1804,6 @@ def characterize_injection_crosstalk(
         run_equalization=False,
         run_scurve=True,
         noise_reference_experiment=noise_reference_experiment,
+        bad_pixel_map=bad_pixel_map,
         **characterization_arguments,
     )

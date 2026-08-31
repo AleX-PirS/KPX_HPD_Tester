@@ -1,4 +1,4 @@
-"""Полный noise scan для каждого равномерного trim-кода 0..31."""
+"""Только пилотный noise scan: без инжекции и без подбора trim-кодов."""
 
 from __future__ import annotations
 
@@ -9,30 +9,23 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from comparator_characterization import characterize_comparator
-
 from comparator_characterization.high_level import characterization_config as config
 
 
 def main() -> None:
     config.configure_runtime_logging()
     config.require_hardware_run_enabled()
-    settings = config.build_settings(scan_all_trim_codes=True)
     with config.build_upo_client() as client:
         result = characterize_comparator(
-            client,
-            config.threshold_calibration_files(),
-            window=config.WINDOW,
-            pixels=config.PIXELS,
+            client, config.threshold_calibration_files(),
+            window=config.WINDOW, pixels=config.PIXELS,
             bad_pixel_map=config.BAD_PIXEL_MAP,
             base_pixel_config=config.base_pixel_config(),
-            results_root=config.RESULTS_ROOT,
-            settings=settings,
-            run_noise_scan=True,
-            run_equalization=True,
-            run_scurve=False,
+            results_root=config.RESULTS_ROOT, settings=config.build_settings(),
+            run_noise_scan=True, run_equalization=False, run_scurve=False,
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
         )
-    print(f"Полный trim-sweep завершен: {result.experiment_path}")
+    print(f"Пилотный noise scan завершен: {result.experiment_path}")
     config.print_recommendation_paths(result.analysis_path)
 
 

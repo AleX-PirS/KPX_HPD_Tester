@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -33,6 +35,12 @@ ENABLE_HARDWARE_RUN = False
 UPO_HOST = "127.0.0.1"
 UPO_PORT = 0xBEEB
 UPO_TIMEOUT_S = 8.0
+UPO_RECONNECT_ATTEMPTS = 3
+UPO_RECONNECT_BACKOFF_S = 0.5
+
+# Перед каждым аппаратным тестом FCLK явно устанавливается в 50 МГц, затем
+# загружаются EO_cfg.DEFAULT_REGISTERS и стандартная конфигурация 512 PX.
+ASIC_INITIALIZATION_FCLK_MHZ = 50
 
 # Генератор Keysight 81150A/81160A. None включает VISA-автопоиск.
 GENERATOR_VISA_ADDRESS: str | None = None
@@ -43,8 +51,15 @@ POST_BURST_GUARD_S = 0.1
 # Окно и пиксели. Возможные окна: AB, BC, CD.
 WINDOW = "AB"
 PIXELS: str | list[tuple[int, int]] = "all"
+# None: использовать все выбранные пиксели. Или путь к CSV/JSON либо список
+# физических (column, row): [(16, 0), (20, 7)]. True/1 в карте = ИСКЛЮЧИТЬ.
+# Эти пиксели всегда получают MASK=0 и TST_EN=0, даже при восстановлении связи.
+BAD_PIXEL_MAP: Path | list[tuple[int, int]] | None = None
 
-# JSON, сохраненный на странице Matrix. Здесь должны быть все исследуемые пиксели.
+# Необязательная расширенная замена baseline выбранных пикселей. При None
+# используется встроенная конфигурация: GAIN=10, SHT=2, MASK=1, SH_EN=0,
+# TST_EN=0, BUF_NEN=1, trims=16. Перед ее применением все 512 принадлежащих
+# пикселей всегда получают стандартную конфигурацию с MASK=0.
 BASE_PIXEL_CONFIG: Path | None = None
 
 # Полные измеренные характеристики пороговых ЦАП.
@@ -68,18 +83,75 @@ REFERENCE_LUT_VOLTAGE_UNIT = "auto"
 # Пользователь задает только требуемые положительные ступеньки REF1-REF2.
 # Единица здесь mV. Скрипт выбирает измеренные LUT-точки и всегда требует
 # физическое условие V_REF1 > V_REF2.
-INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0)
+INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 40.0, 50.0)
 
 # По умолчанию оба выбранных кода строго больше 400.
 MINIMUM_REFERENCE_CODE = 401
+# Верхняя граница включительно, также применяется к обоим REF.
+MAXIMUM_REFERENCE_CODE = 800
 # Это отдельное ограничение по измеренному напряжению, обычно оставляется None.
 MINIMUM_REFERENCE_VOLTAGE_V: float | None = None
 # Необязательная цель общего уровня (V_REF1 + V_REF2)/2.
-PREFERRED_REFERENCE_COMMON_MODE_V = 0.7
+PREFERRED_REFERENCE_COMMON_MODE_V: float | None = None
 # Максимально допустимая ошибка выбранной ступеньки, None отключает предел.
 MAXIMUM_REFERENCE_STEP_ERROR_V: float | None = None
 
-# CSV GAIN: столбцы column,row,gain с физическими координатами.
+# Выберите ровно один источник GAIN для S-curve: код ИЛИ CSV.
+# Значения GAIN: целые числа 0..31 для каждого выбранного исправного пикселя.
+_GAIN_VALUES = [
+    [7, 7, 7, 18, 7, 7, 12, 7, 18, 12, 7, 7, 11, 7, 7, 7],       # row 0
+    [12, 10, 7, 12, 10, 12, 17, 18, 11, 12, 6, 7, 10, 7, 7, 10], # row 1
+    [17, 7, 7, 18, 7, 18, 10, 18, 18, 10, 18, 7, 18, 7, 12, 12], # row 2
+    [7, 7, 12, 7, 7, 10, 18, 18, 11, 7, 7, 18, 18, 18, 18, 12], # row 3
+    [18, 18, 7, 12, 7, 7, 7, 10, 10, 18, 7, 7, 7, 7, 7, 7],    # row 4
+    [7, 7, 7, 10, 10, 18, 11, 12, 18, 18, 18, 7, 18, 18, 10, 7], # row 5
+    [12, 12, 12, 10, 10, 18, 7, 18, 7, 18, 17, 10, 7, 18, 7, 10], # row 6
+    [10, 7, 6, 10, 10, 17, 18, 7, 10, 18, 10, 12, 7, 17, 18, 7], # row 7
+    [18, 12, 18, 18, 18, 10, 7, 18, 10, 12, 7, 7, 18, 9, 10, 10], # row 8
+    [18, 7, 18, 18, 7, 18, 18, 10, 10, 18, 18, 7, 12, 7, 10, 18], # row 9
+    [7, 18, 18, 11, 12, 7, 18, 18, 17, 18, 10, 7, 18, 18, 10, 10], # row 10
+    [7, 17, 7, 6, 10, 18, 6, 18, 10, 10, 10, 18, 6, 11, 10, 6], # row 11
+    [10, 18, 10, 10, 18, 7, 10, 17, 10, 7, 9, 18, 18, 18, 17, 18], # row 12
+    [9, 17, 6, 18, 10, 12, 7, 10, 17, 10, 10, 10, 10, 7, 10, 17], # row 13
+    [10, 10, 7, 18, 9, 10, 18, 17, 18, 10, 17, 18, 10, 18, 10, 7], # row 14
+    [17, 18, 7, 17, 17, 10, 6, 10, 9, 7, 9, 18, 6, 9, 10, 17], # row 15
+    [10, 18, 18, 10, 10, 7, 10, 17, 9, 10, 10, 10, 18, 6, 6, 9], # row 16
+    [10, 17, 18, 6, 7, 17, 10, 6, 10, 17, 10, 10, 10, 10, 10, 18], # row 17
+    [17, 6, 6, 10, 6, 10, 7, 10, 17, 7, 17, 10, 18, 17, 10, 10], # row 18
+    [9, 17, 17, 18, 18, 6, 6, 10, 18, 17, 18, 10, 10, 17, 17, 7], # row 19
+    [17, 17, 10, 9, 17, 10, 10, 6, 18, 7, 10, 10, 6, 12, 7, 7], # row 20
+    [9, 10, 17, 18, 6, 6, 9, 7, 17, 9, 6, 9, 6, 18, 9, 17],     # row 21
+    [18, 17, 17, 9, 6, 18, 9, 18, 18, 10, 6, 17, 18, 17, 17, 18], # row 22
+    [10, 17, 6, 17, 10, 9, 17, 10, 10, 18, 10, 6, 10, 17, 17, 10], # row 23
+    [9, 6, 10, 17, 10, 17, 10, 17, 18, 17, 18, 6, 10, 9, 17, 10], # row 24
+    [17, 6, 6, 17, 6, 6, 10, 10, 9, 10, 18, 18, 17, 17, 9, 18], # row 25
+    [6, 9, 9, 17, 18, 9, 17, 7, 17, 17, 6, 6, 10, 10, 6, 17],   # row 26
+    [10, 10, 6, 17, 9, 18, 6, 10, 10, 17, 9, 9, 10, 17, 17, 9], # row 27
+    [6, 6, 6, 6, 9, 9, 17, 17, 10, 10, 17, 17, 17, 17, 6, 6],  # row 28
+    [6, 16, 9, 9, 17, 17, 17, 10, 10, 9, 9, 6, 17, 10, 9, 10], # row 29
+    [6, 17, 17, 17, 9, 6, 9, 6, 6, 17, 10, 17, 10, 6, 6, 6],   # row 30
+    [10, 9, 9, 17, 10, 6, 9, 17, 9, 6, 9, 17, 17, 6, 9, 17],   # row 31
+]
+
+# Формат:
+#   key   = (column, row)
+#   value = GAIN, 0..31
+GAIN_MAP: Mapping[tuple[int, int], int] = {
+    (column, row): _GAIN_VALUES[row][column - 16]
+    for row in range(32)
+    for column in range(16, 32)
+}
+# GAIN_MAP: Mapping[tuple[int, int], int] | Sequence[int] | Sequence[Sequence[int]] | None = None
+
+# Пример словаря (10 и 12 здесь только пример, задайте свои значения):
+# GAIN_MAP = {(column, row): 10 for row in range(32) for column in range(16, 32)}
+# GAIN_MAP[(20, 7)] = 12  # физические column=20, row=7
+# Или список 32x16: GAIN_MAP[row][column - 16]. Каждая строка независима.
+# GAIN_MAP = [[10 for _ in range(16)] for _ in range(32)]
+# GAIN_MAP[7][4] = 12    # тот же физический пиксель (20, 7)
+# Допустим и плоский список 512 значений: индекс row * 16 + (column - 16).
+# Для numpy-массива используйте GAIN_MAP = array.tolist().
+# CSV: столбцы column,row,gain с физическими координатами; GAIN_MAP = None.
 GAIN_MAP_CSV: Path | None = None
 
 # Режим одного обычного S-curve запуска. Можно оставить ровно один режим или
@@ -89,6 +161,15 @@ N_INJECTIONS = 1000
 NOISE_SHUTTER_DURATION_S = 0.001
 SCURVE_SHUTTER_DURATION_S = 1.0
 NOISE_REPEATS = 10
+# Ограничения coarse и автоматического fine сканирования включительно.
+# Например, 400..900 сокращает поиск, но исключенные области не измеряются.
+# Универсальный узкий диапазон неизвестен: задайте его по своему пилотному скану.
+NOISE_COARSE_START = 0
+NOISE_COARSE_STOP = 1023
+NOISE_COARSE_STEP = 16
+# После обнаружения активности три полностью пустые DAC-точки подряд завершают
+# текущую фазу noise scan. None отключает умную раннюю остановку.
+NOISE_CONSECUTIVE_EMPTY_CODES_TO_STOP: int | None = 3
 
 RESULTS_ROOT = PROJECT_ROOT / "results"
 # Нужен для отдельного S-curve/crosstalk запуска. Укажите каталог завершенного
@@ -103,6 +184,30 @@ PLOT_SCURVE_PATTERNS: tuple[str, ...] = ()
 REPRESENTATIVE_PIXEL_COUNT = 6
 SAVE_PDF_PLOTS = True
 PLOT_DPI = 300
+
+
+def configure_runtime_logging() -> None:
+    """Включить краткие статусы теста и предупреждения о восстановлении УПО."""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def print_recommendation_paths(analysis_path: Path | None) -> None:
+    """Показать итоговые предложения; ничего не записывать в ASIC автоматически."""
+
+    if analysis_path is None:
+        return
+    print(f"Анализ и графики: {analysis_path}")
+    for method in ("fit", "centroid", "maximum"):
+        trim = analysis_path / f"trim_recommendations_{method}.csv"
+        mask = analysis_path / f"bad_pixels_suggested_{method}.json"
+        if trim.is_file():
+            print(f"{method}: подстройки {trim}; предложение маски {mask}")
+    print("Это предложения. Причины и необходимость проверки указаны в CSV; новые маски автоматически не применяются.")
 
 
 def require_hardware_run_enabled() -> None:
@@ -137,13 +242,32 @@ def reference_calibration_files() -> dict[str, Path]:
     }
 
 
-def base_pixel_config_path() -> Path:
+def base_pixel_config() -> Path | None:
+    if BASE_PIXEL_CONFIG is None:
+        return None
     return _required_path(BASE_PIXEL_CONFIG, "базовая Matrix-конфигурация")
 
 
-def gain_map() -> dict[tuple[int, int], int]:
-    path = _required_path(GAIN_MAP_CSV, "GAIN-карта")
-    return load_gain_map_csv(path)
+def gain_map() -> Mapping[tuple[int, int], int] | Sequence[int] | Sequence[Sequence[int]]:
+    """Получить GAIN из кода или CSV без обращения к стенду.
+
+    Общая проверка значений и покрытия выбранных исправных пикселей выполняется
+    в characterize_comparator через resolve_gain_map до программирования ASIC.
+    """
+
+    if GAIN_MAP is not None and GAIN_MAP_CSV is not None:
+        raise ValueError(
+            "Заданы и GAIN_MAP, и GAIN_MAP_CSV. Оставьте один источник, "
+            "а второй установите в None."
+        )
+    if GAIN_MAP is not None:
+        return GAIN_MAP
+    if GAIN_MAP_CSV is not None:
+        return load_gain_map_csv(_required_path(GAIN_MAP_CSV, "GAIN-карта"))
+    raise ValueError(
+        "Не задана GAIN-карта. Укажите GAIN_MAP (словарь или список) "
+        "либо путь GAIN_MAP_CSV в characterization_config.py."
+    )
 
 
 def noise_reference_path() -> Path:
@@ -167,11 +291,20 @@ def build_settings(
     settings = CharacterizationSettings()
     settings.noise.noise_repeats = NOISE_REPEATS
     settings.noise.shutter_duration_s = NOISE_SHUTTER_DURATION_S
+    settings.noise.coarse_start = NOISE_COARSE_START
+    settings.noise.coarse_stop = NOISE_COARSE_STOP
+    settings.noise.coarse_step = NOISE_COARSE_STEP
+    settings.noise.stop_after_consecutive_empty_codes = (
+        NOISE_CONSECUTIVE_EMPTY_CODES_TO_STOP
+    )
+    settings.noise.upo_reconnect_attempts = UPO_RECONNECT_ATTEMPTS
+    settings.noise.upo_reconnect_backoff_s = UPO_RECONNECT_BACKOFF_S
     settings.equalization.scan_all_trim_codes = scan_all_trim_codes
     settings.scurve.n_injections = N_INJECTIONS
     settings.scurve.shutter_duration_s = SCURVE_SHUTTER_DURATION_S
     settings.scurve.injection_patterns = injection_patterns or SCURVE_PATTERNS
     settings.scurve.minimum_reference_code = MINIMUM_REFERENCE_CODE
+    settings.scurve.maximum_reference_code = MAXIMUM_REFERENCE_CODE
     settings.scurve.minimum_reference_voltage_v = MINIMUM_REFERENCE_VOLTAGE_V
     settings.scurve.preferred_reference_common_mode_v = (
         PREFERRED_REFERENCE_COMMON_MODE_V
@@ -193,7 +326,13 @@ def build_settings(
 def build_upo_client() -> "MGPDClient":
     from mgpd import MGPDClient
 
-    return MGPDClient(host=UPO_HOST, port=UPO_PORT, timeout=UPO_TIMEOUT_S)
+    return MGPDClient(
+        host=UPO_HOST,
+        port=UPO_PORT,
+        timeout=UPO_TIMEOUT_S,
+        reconnect_attempts=UPO_RECONNECT_ATTEMPTS,
+        reconnect_backoff_s=UPO_RECONNECT_BACKOFF_S,
+    )
 
 
 def build_generator() -> "TwoChannelGenerator":

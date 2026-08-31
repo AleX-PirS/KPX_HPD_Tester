@@ -6,7 +6,7 @@ reprocessed later with :func:`analyze_saved_experiment` without importing or
 connecting any instrument driver.
 """
 
-from .analysis import analyze_saved_experiment
+from .analysis import analyze_saved_experiment, analyze_saved_noise_statistics
 from .calibration import (
     ReferenceDacCalibration,
     ReferencePairSelection,
@@ -42,6 +42,8 @@ from .models import (
     WindowSpec,
     get_window_spec,
 )
+from .pixel_masks import BadPixelMapInput, normalize_bad_pixel_map
+from .recommendations import load_recommended_trim_map, propose_noise_trim_maps
 from .workflow import (
     CharacterizationResult,
     ManualExposureChange,
@@ -52,6 +54,7 @@ from .workflow import (
 
 __all__ = [
     "AnalysisSettings",
+    "BadPixelMapInput",
     "CallableShotExecutor",
     "CROSSTALK_INJECTION_PATTERNS",
     "CharacterizationResult",
@@ -73,6 +76,9 @@ __all__ = [
     "ThresholdDacCalibration",
     "WindowSpec",
     "analyze_saved_experiment",
+    "analyze_saved_noise_statistics",
+    "propose_noise_trim_maps",
+    "load_recommended_trim_map",
     "build_injection_groups",
     "characterize_comparator",
     "characterize_injection_crosstalk",
@@ -83,5 +89,6 @@ __all__ = [
     "ManualExposureChange",
     "interactive_exposure_pause",
     "resolve_gain_map",
+    "normalize_bad_pixel_map",
     "select_reference_dac_pairs",
 ]

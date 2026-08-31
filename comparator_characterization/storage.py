@@ -5,14 +5,19 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import shutil
 import tempfile
+import time
 from typing import Any
 
 import pandas as pd
+
+
+logger = logging.getLogger(__name__)
 
 
 INDEX_FIELDS = (
@@ -31,6 +36,10 @@ INDEX_FIELDS = (
     "relative_path",
     "error",
 )
+
+ATOMIC_REPLACE_ATTEMPTS = 15
+ATOMIC_REPLACE_INITIAL_BACKOFF_S = 0.05
+ATOMIC_REPLACE_MAX_BACKOFF_S = 0.8
 
 
 def utc_now_text() -> str:
@@ -52,6 +61,65 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _atomic_replace_with_retry(source: Path, destination: Path) -> None:
+    """Replace a file atomically, tolerating short Windows file locks.
+
+    Antivirus scanners, indexers and preview handlers can briefly open a newly
+    created or existing JSON/CSV file without delete sharing. Windows then
+    reports WinError 5/32/33 from ``os.replace``. The same already-fsynced
+    temporary file is retried, so atomicity and payload identity are preserved.
+    """
+
+    delay = ATOMIC_REPLACE_INITIAL_BACKOFF_S
+    for attempt in range(1, ATOMIC_REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as error:
+            windows_lock = isinstance(error, PermissionError) or getattr(
+                error, "winerror", None
+            ) in {5, 32, 33}
+            if not windows_lock or attempt >= ATOMIC_REPLACE_ATTEMPTS:
+                raise
+            if attempt == 1:
+                logger.warning(
+                    "Файл %s временно заблокирован Windows, запись будет повторена",
+                    destination,
+                )
+            time.sleep(delay)
+            delay = min(delay * 2.0, ATOMIC_REPLACE_MAX_BACKOFF_S)
+
+
+def _discard_temporary(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        # Do not hide the original write error merely because an external
+        # process is still holding the temporary file.
+        pass
+
+
+def _append_text_with_retry(path: Path, text: str) -> None:
+    delay = ATOMIC_REPLACE_INITIAL_BACKOFF_S
+    for attempt in range(1, ATOMIC_REPLACE_ATTEMPTS + 1):
+        try:
+            with path.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return
+        except OSError as error:
+            windows_lock = isinstance(error, PermissionError) or getattr(
+                error, "winerror", None
+            ) in {5, 32, 33}
+            if not windows_lock or attempt >= ATOMIC_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2.0, ATOMIC_REPLACE_MAX_BACKOFF_S)
+
+
 def atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(_jsonable(document), ensure_ascii=False, indent=2) + "\n"
@@ -70,10 +138,9 @@ def atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
             temporary = Path(stream.name)
-        os.replace(temporary, path)
+        _atomic_replace_with_retry(temporary, path)
     except Exception:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        _discard_temporary(temporary)
         raise
 
 
@@ -83,6 +150,28 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def atomic_write_table(path: Path, rows: pd.DataFrame | Sequence[Mapping[str, Any]]) -> Path:
+    """Save a derived CSV with the same Windows-lock handling as raw tables."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", newline="", encoding="utf-8", prefix=f".{path.name}.",
+            suffix=".tmp", dir=path.parent, delete=False,
+        ) as stream:
+            frame.to_csv(stream, index=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary = Path(stream.name)
+        _atomic_replace_with_retry(temporary, path)
+    except Exception:
+        _discard_temporary(temporary)
+        raise
+    return path
 
 
 def _safe_path_component(value: Any) -> str:
@@ -102,6 +191,8 @@ class ExperimentStore:
         self.raw_root = self.root / "raw"
         self.index_path = self.raw_root / "measurement_index.csv"
         self.error_path = self.raw_root / "errors.jsonl"
+        self.status_log_path = self.root / "experiment.log"
+        self._last_overall_percent_estimate: float | None = None
         if not self.metadata_path.exists():
             raise FileNotFoundError(f"experiment metadata not found: {self.metadata_path}")
         self.metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
@@ -233,10 +324,9 @@ class ExperimentStore:
                 stream.flush()
                 os.fsync(stream.fileno())
                 temporary = Path(stream.name)
-            os.replace(temporary, destination)
+            _atomic_replace_with_retry(temporary, destination)
         except Exception:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            _discard_temporary(temporary)
             raise
 
         self._append_index(
@@ -307,21 +397,75 @@ class ExperimentStore:
             "relative_path": relative_path,
             "error": error,
         }
-        with self.index_path.open("a", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=INDEX_FIELDS)
-            if new_file:
-                writer.writeheader()
-            writer.writerow(row)
-            stream.flush()
-            os.fsync(stream.fileno())
+        delay = ATOMIC_REPLACE_INITIAL_BACKOFF_S
+        for attempt in range(1, ATOMIC_REPLACE_ATTEMPTS + 1):
+            try:
+                with self.index_path.open(
+                    "a", newline="", encoding="utf-8"
+                ) as stream:
+                    writer = csv.DictWriter(stream, fieldnames=INDEX_FIELDS)
+                    if new_file and stream.tell() == 0:
+                        writer.writeheader()
+                    writer.writerow(row)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                break
+            except OSError as error:
+                windows_lock = isinstance(error, PermissionError) or getattr(
+                    error, "winerror", None
+                ) in {5, 32, 33}
+                if not windows_lock or attempt >= ATOMIC_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2.0, ATOMIC_REPLACE_MAX_BACKOFF_S)
         self._status_by_key[key] = status
 
     def record_error(self, document: Mapping[str, Any]) -> None:
         self.error_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.error_path.open("a", encoding="utf-8", newline="\n") as stream:
-            stream.write(json.dumps(_jsonable(document), ensure_ascii=False) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        _append_text_with_retry(
+            self.error_path,
+            json.dumps(_jsonable(document), ensure_ascii=False) + "\n",
+        )
+
+    def log_status(
+        self,
+        message: str,
+        *,
+        stage_percent: float | None = None,
+        overall_percent_estimate: float | None = None,
+    ) -> None:
+        """Write a concise progress line to both console and experiment.log."""
+
+        parts = [utc_now_text()]
+        if overall_percent_estimate is not None:
+            self._last_overall_percent_estimate = min(
+                100.0, max(0.0, float(overall_percent_estimate))
+            )
+        elif self._last_overall_percent_estimate is not None:
+            # A measurement phase can report exact local progress even when
+            # its contribution to the complete dynamic workflow is only known
+            # at the surrounding checkpoint. Keep that last approximate test
+            # value visible instead of silently dropping TEST~ from the log.
+            overall_percent_estimate = self._last_overall_percent_estimate
+        if overall_percent_estimate is not None:
+            overall = min(100.0, max(0.0, float(overall_percent_estimate)))
+            parts.append(f"TEST~{overall:5.1f}%")
+        if stage_percent is not None:
+            stage = min(100.0, max(0.0, float(stage_percent)))
+            parts.append(f"STAGE={stage:5.1f}%")
+        parts.append(str(message))
+        line = " | ".join(parts)
+        logger.info(line)
+        try:
+            _append_text_with_retry(self.status_log_path, line + "\n")
+        except OSError as error:
+            # Status telemetry must never discard an otherwise valid physical
+            # acquisition. Raw data and metadata writes remain strict.
+            logger.warning(
+                "Не удалось дополнить %s: %s",
+                self.status_log_path,
+                error,
+            )
 
     def update_metadata(self, **updates: Any) -> None:
         self.metadata.update(_jsonable(updates))
@@ -403,11 +547,4 @@ class ExperimentStore:
         return destination
 
     def write_table(self, path: Path, rows: pd.DataFrame | Sequence[Mapping[str, Any]]) -> Path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        frame = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
-        temporary = path.with_name(f".{path.name}.tmp")
-        frame.to_csv(temporary, index=False)
-        with temporary.open("r+b") as stream:
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        return path
+        return atomic_write_table(path, rows)

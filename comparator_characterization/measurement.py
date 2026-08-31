@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import time
 from typing import Any, Mapping, Sequence
@@ -22,6 +22,13 @@ class NoiseScanRun:
     coarse_codes: tuple[int, ...]
     fine_codes: tuple[int, ...]
     fine_range_diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AcquisitionOutcome:
+    newly_saved: bool
+    any_nonzero_count: bool
+    all_pixels_valid_and_zero: bool
 
 
 def _inclusive_codes(start: int, stop: int, step: int) -> tuple[int, ...]:
@@ -71,6 +78,14 @@ def _suggest_fine_codes(
     peak = float(np.nanmax(values))
     dynamic = peak - baseline
 
+    positive_pixels = per_pixel[per_pixel["selected_count_numeric"] > 0]
+    if positive_pixels.empty:
+        return (), {
+            "method": "no_coarse_activity_skip_uninformed_fine_scan",
+            "warning": "No measured coarse activity; a narrow peak between coarse points is not excluded.",
+            "fine_start": None, "fine_stop": None, "fine_step": settings.fine_step,
+        }
+
     if not np.isfinite(dynamic) or dynamic <= max(abs(peak), 1.0) * 1e-9:
         peak_code = int(codes[int(np.nanargmax(values))])
         lower = max(settings.coarse_start, peak_code - 2 * settings.coarse_step)
@@ -87,15 +102,28 @@ def _suggest_fine_codes(
         upper = min(settings.coarse_stop, max(active_codes) + settings.fine_margin_codes)
         method = "q95_pixel_envelope_above_5_percent_dynamic_range"
 
-    fine_codes = _inclusive_codes(lower, upper, settings.fine_step)
+    # The matrix q95 envelope can hide an entire minority population. Include
+    # each observed pixel maximum, but do not fill long empty gaps between peaks.
+    peak_indices = positive_pixels.groupby(["column", "row"])["selected_count_numeric"].idxmax()
+    pixel_peak_codes = sorted(set(positive_pixels.loc[peak_indices, "threshold_dac_code"].astype(int)))
+    margin = max(settings.fine_margin_codes, settings.coarse_step)
+    fine_set = set(_inclusive_codes(lower, upper, settings.fine_step))
+    for code in pixel_peak_codes:
+        fine_set.update(_inclusive_codes(
+            max(settings.coarse_start, code - margin),
+            min(settings.coarse_stop, code + margin), settings.fine_step,
+        ))
+    fine_codes = tuple(sorted(fine_set))
     return fine_codes, {
-        "method": method,
+        "method": method + "_plus_every_observed_pixel_peak",
         "coarse_envelope_quantile": 0.95,
         "baseline_count": baseline,
         "peak_count": peak,
         "active_coarse_codes": active_codes,
-        "fine_start": lower,
-        "fine_stop": upper,
+        "pixel_peak_coarse_codes": pixel_peak_codes,
+        "last_observed_peak_code": max(pixel_peak_codes),
+        "fine_start": min(fine_codes),
+        "fine_stop": max(fine_codes),
         "fine_step": settings.fine_step,
     }
 
@@ -114,7 +142,7 @@ def _raw_rows(
     shot_result: ShotExecutionResult,
     pair_id: str | None,
     injection_group: InjectionGroup | None = None,
-    injection_capacitance_f: float = 10e-15,
+    injection_capacitance_f: float = 15e-15,
     injection_capacitance_relative_uncertainty: float = 0.20,
     pulse_amplitude_configuration: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
@@ -219,14 +247,24 @@ def _acquire_point(
     request: ShotRequest,
     pair_id: str | None = None,
     injection_group: InjectionGroup | None = None,
-    injection_capacitance_f: float = 10e-15,
+    injection_capacitance_f: float = 15e-15,
     injection_capacitance_relative_uncertainty: float = 0.20,
     pulse_amplitude_configuration: Mapping[str, Any] | None = None,
-) -> bool:
+) -> AcquisitionOutcome:
     if store.is_complete(descriptor):
-        return False
+        return AcquisitionOutcome(
+            newly_saved=False,
+            any_nonzero_count=False,
+            all_pixels_valid_and_zero=False,
+        )
     try:
         samples, shot_result = backend.acquire(pixels, request)
+        recovery_events = shot_result.details.get("upo_recovery_events", [])
+        if recovery_events:
+            store.log_status(
+                f"УПО восстановлено, acquisition повторен; попыток: "
+                f"{shot_result.details.get('upo_acquisition_attempt_count', 1)}"
+            )
         rows = _raw_rows(
             store=store,
             descriptor=descriptor,
@@ -250,7 +288,236 @@ def _acquire_point(
     except BaseException as error:
         store.record_failed_acquisition(descriptor, error)
         raise
-    return True
+    valid_samples = [
+        sample for sample in samples if bool(sample.get("measurement_valid", False))
+    ]
+    any_nonzero = any(
+        int(sample["selected_count"]) > 0
+        for sample in valid_samples
+        if sample.get("selected_count") not in (None, "")
+    )
+    all_valid_and_zero = bool(samples) and len(valid_samples) == len(samples) and all(
+        int(sample["selected_count"]) == 0
+        for sample in valid_samples
+    )
+    return AcquisitionOutcome(
+        newly_saved=True,
+        any_nonzero_count=any_nonzero,
+        all_pixels_valid_and_zero=all_valid_and_zero,
+    )
+
+
+def _saved_noise_outcomes(
+    store: ExperimentStore,
+    *,
+    stage: str,
+    phase: str,
+    pixels: Sequence[tuple[int, int]],
+) -> dict[tuple[int, int], AcquisitionOutcome]:
+    """Summarize already saved repeats so resume preserves early-stop behavior."""
+
+    raw = store.load_raw("noise", stages=(stage,))
+    if raw.empty:
+        return {}
+    raw = raw[raw["scan_phase"].astype(str) == phase].copy()
+    if raw.empty:
+        return {}
+    raw["selected_count_numeric"] = pd.to_numeric(
+        raw["selected_count"], errors="coerce"
+    )
+    raw["valid_numeric"] = _valid_boolean(raw["measurement_valid"])
+    expected_coordinates = set(pixels)
+    outcomes: dict[tuple[int, int], AcquisitionOutcome] = {}
+    for (code, repeat), frame in raw.groupby(
+        ["threshold_dac_code", "repeat_index"], sort=False
+    ):
+        coordinates = {
+            (int(row["column"]), int(row["row"]))
+            for _, row in frame.iterrows()
+        }
+        valid = frame["valid_numeric"] & frame["selected_count_numeric"].notna()
+        any_nonzero = bool(
+            (frame.loc[valid, "selected_count_numeric"] > 0).any()
+        )
+        all_valid_and_zero = bool(
+            coordinates == expected_coordinates
+            and len(frame) == len(expected_coordinates)
+            and valid.all()
+            and (frame["selected_count_numeric"] == 0).all()
+        )
+        outcomes[(int(code), int(repeat))] = AcquisitionOutcome(
+            newly_saved=False,
+            any_nonzero_count=any_nonzero,
+            all_pixels_valid_and_zero=all_valid_and_zero,
+        )
+    return outcomes
+
+
+def _run_noise_phase(
+    *,
+    backend: MGPDMeasurementBackend,
+    store: ExperimentStore,
+    calibration: ThresholdDacCalibration,
+    spec: WindowSpec,
+    pixels: Sequence[tuple[int, int]],
+    trim_map: Mapping[tuple[int, int], int],
+    stage: str,
+    phase: str,
+    codes: Sequence[int],
+    upper_non_limiting_code: int,
+    settings: NoiseScanSettings,
+    overall_progress_start: float | None = None,
+    overall_progress_end: float | None = None,
+    minimum_early_stop_code: int | None = None,
+) -> tuple[int, tuple[int, ...], dict[str, Any] | None]:
+    planned_codes = tuple(dict.fromkeys(int(code) for code in codes))
+    saved_outcomes = _saved_noise_outcomes(
+        store,
+        stage=stage,
+        phase=phase,
+        pixels=pixels,
+    )
+    activity_seen = False
+    empty_streak = 0
+    completed = 0
+    executed_codes: list[int] = []
+    early_stop: dict[str, Any] | None = None
+    last_logged_bucket = -1
+
+    def overall_at(stage_percent: float) -> float | None:
+        if overall_progress_start is None or overall_progress_end is None:
+            return None
+        fraction = min(100.0, max(0.0, stage_percent)) / 100.0
+        return overall_progress_start + (
+            overall_progress_end - overall_progress_start
+        ) * fraction
+
+    store.log_status(
+        f"Noise scan {stage}/{phase}: {len(planned_codes)} DAC-точек, "
+        f"{settings.noise_repeats} повторов на точку",
+        stage_percent=0.0,
+        overall_percent_estimate=overall_at(0.0),
+    )
+
+    for code_index, code in enumerate(planned_codes):
+        calibration.lookup(code)
+        backend.set_threshold(spec, code)
+        if settings.settling_time_s:
+            time.sleep(settings.settling_time_s)
+        repeat_outcomes: list[AcquisitionOutcome] = []
+        for repeat in range(settings.noise_repeats):
+            descriptor = {
+                "measurement_kind": "noise",
+                "stage": stage,
+                "scan_phase": phase,
+                "acquisition_type": "background",
+                "threshold_dac_code": code,
+                "repeat_index": repeat,
+                "pulse_amplitude": None,
+            }
+            request = ShotRequest(
+                measurement_kind="noise",
+                acquisition_type="background",
+                shutter_duration_s=settings.shutter_duration_s,
+                test_pulses=False,
+                configure_get_shot_omr=settings.configure_get_shot_omr,
+                counter_mode_bits=settings.counter_mode_bits,
+                mode_read=settings.mode_read,
+                crw_mode=settings.crw_mode,
+            )
+            if store.is_complete(descriptor):
+                outcome = saved_outcomes.get(
+                    (code, repeat),
+                    AcquisitionOutcome(False, False, False),
+                )
+            else:
+                outcome = _acquire_point(
+                    backend=backend,
+                    store=store,
+                    calibration=calibration,
+                    spec=spec,
+                    pixels=pixels,
+                    trim_map=trim_map,
+                    upper_non_limiting_code=upper_non_limiting_code,
+                    descriptor=descriptor,
+                    request=request,
+                )
+            repeat_outcomes.append(outcome)
+            if outcome.newly_saved:
+                completed += 1
+                store.update_metadata(
+                    last_completed_acquisition={
+                        "measurement_kind": "noise",
+                        "stage": stage,
+                        "scan_phase": phase,
+                        "threshold_dac_code": code,
+                        "repeat_index": repeat,
+                        "timestamp_utc": utc_now_text(),
+                    }
+                )
+
+        executed_codes.append(code)
+        point_has_activity = any(
+            outcome.any_nonzero_count for outcome in repeat_outcomes
+        )
+        point_is_completely_empty = (
+            len(repeat_outcomes) == settings.noise_repeats
+            and all(
+                outcome.all_pixels_valid_and_zero
+                for outcome in repeat_outcomes
+            )
+        )
+        if point_has_activity:
+            activity_seen = True
+            empty_streak = 0
+        elif activity_seen and point_is_completely_empty:
+            empty_streak += 1
+        else:
+            # Invalid/incomplete readout cannot be used as evidence of zero
+            # activity and therefore breaks the empty-point sequence.
+            empty_streak = 0
+
+        stage_percent = 100.0 * (code_index + 1) / max(len(planned_codes), 1)
+        bucket = int(stage_percent // 5)
+        if bucket > last_logged_bucket or code_index + 1 == len(planned_codes):
+            last_logged_bucket = bucket
+            store.log_status(
+                f"Noise {stage}/{phase}: DAC={code}, точка "
+                f"{code_index + 1}/{len(planned_codes)}, осталось "
+                f"{len(planned_codes) - code_index - 1}",
+                stage_percent=stage_percent,
+                overall_percent_estimate=overall_at(stage_percent),
+            )
+
+        stop_count = settings.stop_after_consecutive_empty_codes
+        if (
+            stop_count is not None
+            and activity_seen
+            and empty_streak >= stop_count
+            and (minimum_early_stop_code is None or code >= minimum_early_stop_code)
+        ):
+            early_stop = {
+                "timestamp_utc": utc_now_text(),
+                "stage": stage,
+                "scan_phase": phase,
+                "reason": "consecutive_all_pixel_zero_DAC_points_after_activity",
+                "consecutive_empty_codes": empty_streak,
+                "configured_stop_count": stop_count,
+                "last_acquired_code": code,
+                "skipped_codes": list(planned_codes[code_index + 1 :]),
+                "initial_empty_codes_do_not_stop_scan": True,
+                "invalid_reads_never_count_as_empty": True,
+            }
+            store.update_metadata(last_noise_scan_early_stop=early_stop)
+            store.log_status(
+                f"Noise {stage}/{phase}: ранняя остановка после DAC={code}; "
+                f"пропущено {len(early_stop['skipped_codes'])} НЕИЗМЕРЕННЫХ хвостовых точек",
+                stage_percent=stage_percent,
+                overall_percent_estimate=overall_at(stage_percent),
+            )
+            break
+
+    return completed, tuple(executed_codes), early_stop
 
 
 def run_noise_scan(
@@ -266,153 +533,153 @@ def run_noise_scan(
     settings: NoiseScanSettings,
     scan_codes: Sequence[int] | None = None,
     auto_fine: bool = True,
+    overall_progress_start: float | None = None,
+    overall_progress_end: float | None = None,
 ) -> NoiseScanRun:
-    """Acquire repeated raw noise counts and save every shot incrementally."""
+    """Acquire repeated raw noise counts with safe trailing-empty early stop."""
 
+    pixels = backend.active_pixels(pixels)
     settings.validate()
+    if (overall_progress_start is None) != (overall_progress_end is None):
+        raise ValueError(
+            "overall_progress_start and overall_progress_end must be supplied together"
+        )
+    if (
+        overall_progress_start is not None
+        and overall_progress_end is not None
+        and overall_progress_start > overall_progress_end
+    ):
+        raise ValueError("overall progress range must be non-decreasing")
+    store.log_status(f"Noise scan {stage}: программируется trim-карта")
+    backend.program_noise_pixel_configuration(pixels)
     programmed_trim_map = backend.program_trim_map(spec, pixels, trim_map)
+    store.log_status(f"Noise scan {stage}: trim-карта записана")
+    manual_codes = (
+        tuple(int(code) for code in scan_codes)
+        if scan_codes is not None
+        else settings.manual_codes()
+    )
+    completed_acquisitions = 0
+    coarse_planned: tuple[int, ...] = ()
+    coarse_codes: tuple[int, ...] = ()
+    fine_planned: tuple[int, ...] = ()
+    fine_codes: tuple[int, ...] = ()
+    early_stops: list[dict[str, Any]] = []
 
-    manual_codes = tuple(int(code) for code in scan_codes) if scan_codes is not None else settings.manual_codes()
     if manual_codes is not None:
         if not manual_codes:
             raise ValueError("scan code sequence is empty")
-        phases = [("manual", tuple(dict.fromkeys(manual_codes)))]
         auto_fine = False
-        coarse_codes: tuple[int, ...] = ()
-        fine_codes = phases[0][1]
-        fine_diagnostics = {
+        fine_planned = tuple(dict.fromkeys(manual_codes))
+        completed, fine_codes, early_stop = _run_noise_phase(
+            backend=backend,
+            store=store,
+            calibration=calibration,
+            spec=spec,
+            pixels=pixels,
+            trim_map=programmed_trim_map,
+            stage=stage,
+            phase="manual",
+            codes=fine_planned,
+            upper_non_limiting_code=upper_non_limiting_code,
+            settings=settings,
+            overall_progress_start=overall_progress_start,
+            overall_progress_end=overall_progress_end,
+        )
+        completed_acquisitions += completed
+        if early_stop is not None:
+            early_stops.append(early_stop)
+        fine_diagnostics: dict[str, Any] = {
             "method": "explicit_scan_codes",
-            "fine_start": min(fine_codes),
-            "fine_stop": max(fine_codes),
+            "fine_start": min(fine_planned),
+            "fine_stop": max(fine_planned),
         }
     else:
-        coarse_codes = _inclusive_codes(
+        coarse_planned = _inclusive_codes(
             settings.coarse_start,
             settings.coarse_stop,
             settings.coarse_step,
         )
-        phases = [("coarse", coarse_codes)]
-        fine_codes = ()
-        fine_diagnostics: dict[str, Any] = {}
-
-    completed_acquisitions = 0
-    for phase, codes in phases:
-        for code in codes:
-            calibration.lookup(int(code))
-            backend.set_threshold(spec, int(code))
-            if settings.settling_time_s:
-                time.sleep(settings.settling_time_s)
-            for repeat in range(settings.noise_repeats):
-                descriptor = {
-                    "measurement_kind": "noise",
-                    "stage": stage,
-                    "scan_phase": phase,
-                    "acquisition_type": "background",
-                    "threshold_dac_code": int(code),
-                    "repeat_index": repeat,
-                    "pulse_amplitude": None,
-                }
-                request = ShotRequest(
-                    measurement_kind="noise",
-                    acquisition_type="background",
-                    shutter_duration_s=settings.shutter_duration_s,
-                    test_pulses=False,
-                    configure_get_shot_omr=settings.configure_get_shot_omr,
-                    counter_mode_bits=settings.counter_mode_bits,
-                    mode_read=settings.mode_read,
-                    crw_mode=settings.crw_mode,
-                )
-                if _acquire_point(
-                    backend=backend,
-                    store=store,
-                    calibration=calibration,
-                    spec=spec,
-                    pixels=pixels,
-                    trim_map=programmed_trim_map,
-                    upper_non_limiting_code=upper_non_limiting_code,
-                    descriptor=descriptor,
-                    request=request,
-                ):
-                    completed_acquisitions += 1
-                    store.update_metadata(
-                        last_completed_acquisition={
-                            "measurement_kind": "noise",
-                            "stage": stage,
-                            "scan_phase": phase,
-                            "threshold_dac_code": int(code),
-                            "repeat_index": repeat,
-                            "timestamp_utc": utc_now_text(),
-                        }
-                    )
+        coarse_progress_end = (
+            (overall_progress_start + overall_progress_end) / 2.0
+            if auto_fine
+            and overall_progress_start is not None
+            and overall_progress_end is not None
+            else overall_progress_end
+        )
+        completed, coarse_codes, early_stop = _run_noise_phase(
+            backend=backend,
+            store=store,
+            calibration=calibration,
+            spec=spec,
+            pixels=pixels,
+            trim_map=programmed_trim_map,
+            stage=stage,
+            phase="coarse",
+            codes=coarse_planned,
+            upper_non_limiting_code=upper_non_limiting_code,
+            settings=settings,
+            overall_progress_start=overall_progress_start,
+            overall_progress_end=coarse_progress_end,
+        )
+        completed_acquisitions += completed
+        if early_stop is not None:
+            early_stops.append(early_stop)
+        fine_diagnostics = {}
 
     if auto_fine:
-        fine_codes, fine_diagnostics = _suggest_fine_codes(
+        fine_planned, fine_diagnostics = _suggest_fine_codes(
             store,
             stage=stage,
             settings=settings,
         )
-        for code in fine_codes:
-            calibration.lookup(int(code))
-            backend.set_threshold(spec, int(code))
-            if settings.settling_time_s:
-                time.sleep(settings.settling_time_s)
-            for repeat in range(settings.noise_repeats):
-                descriptor = {
-                    "measurement_kind": "noise",
-                    "stage": stage,
-                    "scan_phase": "fine",
-                    "acquisition_type": "background",
-                    "threshold_dac_code": int(code),
-                    "repeat_index": repeat,
-                    "pulse_amplitude": None,
-                }
-                request = ShotRequest(
-                    measurement_kind="noise",
-                    acquisition_type="background",
-                    shutter_duration_s=settings.shutter_duration_s,
-                    test_pulses=False,
-                    configure_get_shot_omr=settings.configure_get_shot_omr,
-                    counter_mode_bits=settings.counter_mode_bits,
-                    mode_read=settings.mode_read,
-                    crw_mode=settings.crw_mode,
-                )
-                if _acquire_point(
-                    backend=backend,
-                    store=store,
-                    calibration=calibration,
-                    spec=spec,
-                    pixels=pixels,
-                    trim_map=programmed_trim_map,
-                    upper_non_limiting_code=upper_non_limiting_code,
-                    descriptor=descriptor,
-                    request=request,
-                ):
-                    completed_acquisitions += 1
-                    store.update_metadata(
-                        last_completed_acquisition={
-                            "measurement_kind": "noise",
-                            "stage": stage,
-                            "scan_phase": "fine",
-                            "threshold_dac_code": int(code),
-                            "repeat_index": repeat,
-                            "timestamp_utc": utc_now_text(),
-                        }
-                    )
+        completed, fine_codes, early_stop = _run_noise_phase(
+            backend=backend,
+            store=store,
+            calibration=calibration,
+            spec=spec,
+            pixels=pixels,
+            trim_map=programmed_trim_map,
+            stage=stage,
+            phase="fine",
+            minimum_early_stop_code=fine_diagnostics.get("last_observed_peak_code"),
+            codes=fine_planned,
+            upper_non_limiting_code=upper_non_limiting_code,
+            settings=settings,
+            overall_progress_start=(
+                (overall_progress_start + overall_progress_end) / 2.0
+                if overall_progress_start is not None
+                and overall_progress_end is not None
+                else None
+            ),
+            overall_progress_end=overall_progress_end,
+        )
+        completed_acquisitions += completed
+        if early_stop is not None:
+            early_stops.append(early_stop)
 
+    fine_diagnostics = dict(fine_diagnostics)
+    fine_diagnostics["early_stop_events"] = early_stops
     store.update_metadata(
         noise_scan_progress={
             "stage": stage,
             "new_acquisitions": completed_acquisitions,
-            "coarse_codes": list(coarse_codes),
-            "fine_codes": list(fine_codes),
+            "coarse_codes_planned": list(coarse_planned),
+            "coarse_codes_acquired": list(coarse_codes),
+            "fine_codes_planned": list(fine_planned),
+            "fine_codes_acquired": list(fine_codes),
+            "early_stop_enabled": (
+                settings.stop_after_consecutive_empty_codes is not None
+            ),
+            "early_stop_events": early_stops,
             "fine_range_diagnostics": fine_diagnostics,
         }
     )
     return NoiseScanRun(
         stage=stage,
         trim_map=dict(programmed_trim_map),
-        coarse_codes=tuple(coarse_codes),
-        fine_codes=tuple(fine_codes),
+        coarse_codes=coarse_codes,
+        fine_codes=fine_codes,
         fine_range_diagnostics=fine_diagnostics,
     )
 
@@ -438,12 +705,21 @@ def run_scurve_points(
 ) -> int:
     """Acquire paired no-pulse and exact-N-pulse shots at supplied DAC codes."""
 
+    pixels = backend.active_pixels(pixels)
+    active_pixels = tuple(pixel for pixel in injection_group.active_pixels if pixel not in backend.bad_pixels)
+    if not active_pixels:
+        raise ValueError("injection group has no unmasked pixels")
+    injection_group = replace(injection_group, active_pixels=active_pixels)
     scurve_settings.validate()
     if not scurve_settings.paired_background:
         raise NotImplementedError(
             "Only paired S-curve background acquisition is implemented because it is "
             "the robust default requested for drift control"
         )
+    store.log_status(
+        f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
+        "программируется PX-конфигурация"
+    )
     programmed_trim_map = backend.program_trim_map(spec, pixels, trim_map)
     pixel_config_rows = backend.program_scurve_pixel_configuration(
         pixels,
@@ -458,7 +734,14 @@ def run_scurve_points(
     )
     store.write_table(pixel_config_path, pd.DataFrame(pixel_config_rows))
     completed = 0
-    for code in tuple(dict.fromkeys(int(value) for value in codes)):
+    planned_codes = tuple(dict.fromkeys(int(value) for value in codes))
+    last_logged_bucket = -1
+    store.log_status(
+        f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
+        f"{len(planned_codes)} DAC-точек",
+        stage_percent=0.0,
+    )
+    for code_index, code in enumerate(planned_codes):
         calibration.lookup(code)
         backend.set_threshold(spec, code)
         if noise_settings.settling_time_s:
@@ -499,7 +782,7 @@ def run_scurve_points(
                 mode_read=noise_settings.mode_read,
                 crw_mode=noise_settings.crw_mode,
             )
-            if _acquire_point(
+            background_outcome = _acquire_point(
                 backend=backend,
                 store=store,
                 calibration=calibration,
@@ -516,7 +799,8 @@ def run_scurve_points(
                     scurve_settings.injection_capacitance_relative_uncertainty
                 ),
                 pulse_amplitude_configuration=pulse_amplitude_configuration,
-            ):
+            )
+            if background_outcome.newly_saved:
                 completed += 1
 
             signal_descriptor = {**common, "acquisition_type": "signal"}
@@ -532,7 +816,7 @@ def run_scurve_points(
                 mode_read=noise_settings.mode_read,
                 crw_mode=noise_settings.crw_mode,
             )
-            if _acquire_point(
+            signal_outcome = _acquire_point(
                 backend=backend,
                 store=store,
                 calibration=calibration,
@@ -549,7 +833,8 @@ def run_scurve_points(
                     scurve_settings.injection_capacitance_relative_uncertainty
                 ),
                 pulse_amplitude_configuration=pulse_amplitude_configuration,
-            ):
+            )
+            if signal_outcome.newly_saved:
                 completed += 1
             store.update_metadata(
                 last_completed_acquisition={
@@ -563,6 +848,16 @@ def run_scurve_points(
                     "injection_group_id": injection_group.group_id,
                     "timestamp_utc": utc_now_text(),
                 }
+            )
+        stage_percent = 100.0 * (code_index + 1) / max(len(planned_codes), 1)
+        bucket = int(stage_percent // 5)
+        if bucket > last_logged_bucket or code_index + 1 == len(planned_codes):
+            last_logged_bucket = bucket
+            store.log_status(
+                f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
+                f"DAC={code}, точка {code_index + 1}/{len(planned_codes)}, "
+                f"осталось {len(planned_codes) - code_index - 1}",
+                stage_percent=stage_percent,
             )
     store.update_metadata(
         scurve_progress={

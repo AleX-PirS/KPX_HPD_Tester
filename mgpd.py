@@ -1,5 +1,6 @@
 import logging
 import socket
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,8 @@ class MGPDClient:
         timeout: float = 5.0,
         auto_enable_kipix: bool = True,
         configure_omr_before_get_shot: bool = CONFIGURE_OMR_BEFORE_GET_SHOT_DEFAULT,
+        reconnect_attempts: int = 3,
+        reconnect_backoff_s: float = 0.5,
         trace_callback=None,
     ):
         self.host = host
@@ -82,9 +85,20 @@ class MGPDClient:
         self.timeout = timeout
         self.auto_enable_kipix = auto_enable_kipix
         self.configure_omr_before_get_shot = bool(configure_omr_before_get_shot)
+        if (
+            not isinstance(reconnect_attempts, int)
+            or isinstance(reconnect_attempts, bool)
+            or reconnect_attempts < 0
+        ):
+            raise ValueError("reconnect_attempts must be an integer >= 0")
+        if reconnect_backoff_s < 0:
+            raise ValueError("reconnect_backoff_s must be >= 0")
+        self.reconnect_attempts = reconnect_attempts
+        self.reconnect_backoff_s = float(reconnect_backoff_s)
         self.trace_callback = trace_callback
         self._socket: socket.socket | None = None
         self._connected = False
+        self._connect_in_progress = False
 
     @property
     def connected(self) -> bool:
@@ -97,6 +111,7 @@ class MGPDClient:
 
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.settimeout(self.timeout)
+        self._connect_in_progress = True
 
         try:
             self._socket.connect((self.host, self.port))
@@ -120,6 +135,8 @@ class MGPDClient:
             raise ConnectionError(
                 f"Failed to connect or enable KIPIX: {error}"
             ) from error
+        finally:
+            self._connect_in_progress = False
 
         return self
 
@@ -132,21 +149,77 @@ class MGPDClient:
         self._connected = False
         logger.info("Disconnected")
 
-    def _send_command(self, cmd: bytes) -> bytes:
+    def reconnect(self) -> int:
+        """Reconnect to MGPDLab with bounded exponential backoff.
+
+        The chip register state is not intentionally reset by this method.
+        Successful connection again enables KIPIX CONTROL through the existing
+        connection sequence.
+        """
+
+        last_error: BaseException | None = None
+        for attempt in range(1, self.reconnect_attempts + 1):
+            self.disconnect()
+            delay = min(
+                self.reconnect_backoff_s * (2 ** (attempt - 1)),
+                5.0,
+            )
+            if delay:
+                time.sleep(delay)
+            try:
+                self.connect()
+                logger.warning(
+                    "MGPDLab connection restored on attempt %d/%d",
+                    attempt,
+                    self.reconnect_attempts,
+                )
+                return attempt
+            except BaseException as error:
+                last_error = error
+                logger.warning(
+                    "MGPDLab reconnect attempt %d/%d failed: %s",
+                    attempt,
+                    self.reconnect_attempts,
+                    error,
+                )
+        raise ConnectionError(
+            f"MGPDLab reconnect failed after {self.reconnect_attempts} attempt(s)"
+        ) from last_error
+
+    def _send_command(self, cmd: bytes, *, retry_safe: bool = True) -> bytes:
         """Отправить одну команду и вернуть ответ MGPDLab."""
-        if not self._connected or self._socket is None:
-            raise RuntimeError("Not connected. Call connect() first.")
-
-        if self.trace_callback is not None:
-            self.trace_callback("TX", cmd.decode("ascii", errors="replace").strip())
-
-        self._socket.sendall(cmd)
-        response = self._socket.recv(1024)
-
-        if self.trace_callback is not None:
-            self.trace_callback("RX", self._decode_response(response))
-
-        return response
+        retry_count = 0
+        while True:
+            if not self._connected or self._socket is None:
+                raise RuntimeError("Not connected. Call connect() first.")
+            try:
+                if self.trace_callback is not None:
+                    self.trace_callback(
+                        "TX", cmd.decode("ascii", errors="replace").strip()
+                    )
+                self._socket.sendall(cmd)
+                response = self._socket.recv(1024)
+                if not response:
+                    raise ConnectionError("MGPDLab closed the TCP connection")
+                if self.trace_callback is not None:
+                    self.trace_callback("RX", self._decode_response(response))
+                return response
+            except (OSError, TimeoutError, ConnectionError) as error:
+                if (
+                    not retry_safe
+                    or self._connect_in_progress
+                    or retry_count >= self.reconnect_attempts
+                ):
+                    raise
+                retry_count += 1
+                logger.warning(
+                    "Transient MGPDLab transport failure; reconnecting before "
+                    "safe command retry %d/%d: %s",
+                    retry_count,
+                    self.reconnect_attempts,
+                    error,
+                )
+                self.reconnect()
 
     @staticmethod
     def _decode_response(response: bytes) -> str:
@@ -561,7 +634,11 @@ class MGPDClient:
                 logger.error("GET_SHOT OMR pre-configuration failed")
                 return False
 
-        response = self._send_command(b"GET_SHOT\r\n")
+        # GET_SHOT is not idempotent. A lost response does not prove that the
+        # shutter failed to run, so the low-level transport must never resend
+        # this command automatically. The characterization layer may start a
+        # new explicitly recorded acquisition attempt after reconnection.
+        response = self._send_command(b"GET_SHOT\r\n", retry_safe=False)
         if not self._check_ok(response):
             logger.error("GET_SHOT error: response=%r", response)
             return False

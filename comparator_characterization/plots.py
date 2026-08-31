@@ -10,6 +10,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from pixel_matrix import OWNED_COLUMNS
 
 from .models import AnalysisSettings
 
@@ -69,7 +70,7 @@ def _heatmap(
     if data.empty:
         return None
     pivot = data.pivot_table(index="row", columns="column", values=value_column, aggfunc="first")
-    columns = np.arange(int(data["column"].min()), int(data["column"].max()) + 1)
+    columns = np.asarray(OWNED_COLUMNS, dtype=int)
     rows = np.arange(0, 32)
     pivot = pivot.reindex(index=rows, columns=columns)
     array = pivot.to_numpy(dtype=float)
@@ -191,6 +192,8 @@ def _amplitude_label(frame: pd.DataFrame) -> str:
 
 
 def _noise_prediction(fit: pd.Series, voltage: np.ndarray) -> np.ndarray | None:
+    if fit.get("fit_status") != "ok":
+        return None
     center = _number(fit.get("center_fit_v"))
     sigma = _number(fit.get("sigma_fit_v"))
     amplitude = _number(fit.get("fit_amplitude_count"))
@@ -206,6 +209,49 @@ def _noise_prediction(fit: pd.Series, voltage: np.ndarray) -> np.ndarray | None:
             [_NORMAL.cdf(direction * (value - center) / sigma) for value in voltage]
         )
     return None
+
+
+def generate_recommendation_plots(directory: Path, settings: AnalysisSettings) -> dict[str, list[Path]]:
+    """Plot proposals separately from measured/verified equalization maps."""
+
+    outputs: dict[str, list[Path]] = {}
+    plot_directory = directory / "plots"
+    for method in ("fit", "centroid", "maximum"):
+        source = directory / f"trim_recommendations_{method}.csv"
+        if not source.exists() or source.stat().st_size < 3:
+            continue
+        data = pd.read_csv(source)
+        if data.empty:
+            continue
+        data["mask_candidate"] = data["mask_recommended"].astype(str).str.lower().isin(("true", "1")).astype(int)
+        data["unresolved_trim"] = data["recommended_trim_code"].isna().astype(int)
+        for field, stem, title, label in (
+            ("recommended_trim_code", f"proposed_trim_{method}", f"{method}: proposed trim (requires verification)", "Proposed trim code"),
+            ("mask_candidate", f"proposed_mask_{method}", f"{method}: masking candidates, NOT confirmed dead pixels", "1 = exclusion proposed; read CSV reasons"),
+            ("unresolved_trim", f"unresolved_trim_{method}", f"{method}: unresolved trim settings", "1 = no defensible trim proposal"),
+        ):
+            figure = _heatmap(data, value_column=field, title=title, colorbar_label=label)
+            if figure is not None:
+                outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
+    diagnostic_path = directory / "noise_curve_diagnostics.csv"
+    if diagnostic_path.exists() and diagnostic_path.stat().st_size > 3:
+        diagnostics = pd.read_csv(diagnostic_path)
+        for stage, data in diagnostics.groupby("stage"):
+            for field, label in (
+                ("peak_mean_count", "Peak mean count per exposure"),
+                ("peak_fano_factor", "Variance / mean at peak (not ENC)"),
+                ("no_response_in_measured_range", "1 = no counts in measured range"),
+            ):
+                if field not in data:
+                    continue
+                if field == "no_response_in_measured_range":
+                    data = data.copy()
+                    data[field] = data[field].astype(str).str.lower().isin(("true", "1")).astype(int)
+                stem = f"{stage}_{field}"
+                figure = _heatmap(data, value_column=field, title=f"{stage}: {label}", colorbar_label=label)
+                if figure is not None:
+                    outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
+    return outputs
 
 
 def _scurve_prediction(fit: pd.Series, voltage: np.ndarray) -> np.ndarray | None:
@@ -269,7 +315,13 @@ def generate_diagnostic_plots(
         "trim_00": ("Trim = 0", "#1f77b4"),
         "trim_31": ("Trim = 31", "#d62728"),
         "equalized_final": ("Equalized", "#2ca02c"),
+        "baseline_noise": ("Baseline", "#9467bd"),
     }
+    final_available = not _stage_frame(noise_fits, "equalized_final").empty
+    distribution_title = (
+        "Threshold distributions before and after equalization"
+        if final_available else "Measured noise-threshold distributions; final equalization NOT measured"
+    )
     available_distributions: dict[str, np.ndarray] = {}
     for stage in stage_styles:
         values = _finite_values(
@@ -285,19 +337,19 @@ def generate_diagnostic_plots(
         figure, axis = plt.subplots(figsize=(7.2, 4.8))
         for stage, values in available_distributions.items():
             label, color = stage_styles[stage]
-            axis.hist(values, bins=bins, histtype="step", linewidth=1.8, label=label, color=color)
+            axis.hist(values, bins=bins, histtype="step", linewidth=1.8, label=f"{label} (n={len(values)})", color=color)
         if target_voltage is not None:
             axis.axvline(float(target_voltage), color="black", linestyle="--", label="Target")
         axis.set_xlabel("Effective threshold voltage, V")
         axis.set_ylabel("Pixel count")
-        axis.set_title("Threshold distributions before and after equalization")
+        axis.set_title(distribution_title)
         axis.legend()
         outputs["threshold_distributions"] = _save_figure(
             figure, plot_directory, "threshold_distributions", settings
         )
 
         figure, axis = plt.subplots(figsize=(7.2, 4.8))
-        for stage in ("trim_00", "trim_31", "equalized_final"):
+        for stage in stage_styles:
             if stage not in available_distributions:
                 continue
             values = available_distributions[stage]
@@ -306,21 +358,21 @@ def generate_diagnostic_plots(
                 values,
                 bins=bins,
                 alpha=0.28 if stage != "equalized_final" else 0.55,
-                label=label,
+                label=f"{label} (n={len(values)})",
                 color=color,
             )
         if target_voltage is not None:
             axis.axvline(float(target_voltage), color="black", linestyle="--", linewidth=1.2)
         axis.set_xlabel("Effective threshold voltage, V")
         axis.set_ylabel("Pixel count")
-        axis.set_title("Medipix-style threshold equalization")
+        axis.set_title("Medipix-style threshold equalization" if final_available else "Measured distributions; no final equalization data")
         axis.legend()
         outputs["medipix_equalization"] = _save_figure(
             figure, plot_directory, "medipix_equalization", settings
         )
 
         figure, axis = plt.subplots(figsize=(7.2, 4.8))
-        for stage in ("trim_00", "trim_31", "equalized_final"):
+        for stage in stage_styles:
             if stage not in available_distributions:
                 continue
             values = available_distributions[stage]
@@ -330,18 +382,37 @@ def generate_diagnostic_plots(
                 bins=bins,
                 histtype="step",
                 linewidth=1.7,
-                label=label,
+                label=f"{label} (n={len(values)})",
                 color=color,
             )
         axis.set_yscale("log")
         axis.set_ylim(bottom=0.8)
         axis.set_xlabel("Effective threshold voltage, V")
         axis.set_ylabel("Pixel count, log scale")
-        axis.set_title("Threshold equalization distributions, logarithmic view")
+        axis.set_title("Measured threshold distributions, logarithmic view")
         axis.legend()
         outputs["threshold_distributions_log"] = _save_figure(
             figure, plot_directory, "threshold_distributions_log", settings
         )
+
+        # Compare the same physical pixels, so missing endpoints cannot mimic
+        # an improvement of the threshold dispersion.
+        comparable = noise_fits[noise_fits["stage"].isin(available_distributions)].pivot_table(
+            index=["column", "row"], columns="stage", values="center_selected_v", aggfunc="first"
+        ).reindex(columns=list(available_distributions)).dropna()
+        if not comparable.empty and len(comparable.columns) >= 2:
+            figure, axis = plt.subplots(figsize=(7.2, 4.8))
+            common_bins = np.histogram_bin_edges(comparable.to_numpy().ravel(), bins="auto")
+            for stage in comparable.columns:
+                label, color = stage_styles[stage]
+                axis.hist(comparable[stage], bins=common_bins, histtype="step", linewidth=1.7, color=color, label=f"{label} (n={len(comparable)})")
+            axis.set_xlabel("Effective threshold voltage, V")
+            axis.set_ylabel("Pixel count")
+            axis.set_title("Identical physical pixel population across measured stages")
+            axis.legend()
+            outputs["threshold_distributions_matched_pixels"] = _save_figure(
+                figure, plot_directory, "threshold_distributions_matched_pixels", settings
+            )
 
         dispersion_rows = []
         for stage, values in available_distributions.items():
@@ -373,7 +444,7 @@ def generate_diagnostic_plots(
                 [stage_styles[stage][0] for stage in dispersion["stage"]],
             )
             axis.set_ylabel("Threshold dispersion, mV")
-            axis.set_title("Equalization improvement metrics")
+            axis.set_title("Equalization dispersion metrics" if final_available else "Endpoint dispersion only; unequal valid-pixel populations")
             axis.legend()
             outputs["equalization_improvement"] = _save_figure(
                 figure, plot_directory, "equalization_improvement", settings
@@ -382,7 +453,10 @@ def generate_diagnostic_plots(
         figure, axis = plt.subplots(figsize=(7.2, 4.6))
         plotted_widths = False
         for stage, (label, color) in stage_styles.items():
-            widths = 1000 * _finite_values(_stage_frame(noise_fits, stage), "sigma_fit_v")
+            stage_fits = _stage_frame(noise_fits, stage)
+            if "fit_status" in stage_fits:
+                stage_fits = stage_fits[stage_fits["fit_status"] == "ok"]
+            widths = 1000 * _finite_values(stage_fits, "sigma_fit_v")
             if not len(widths):
                 continue
             axis.hist(
@@ -391,13 +465,13 @@ def generate_diagnostic_plots(
                 histtype="step",
                 linewidth=1.6,
                 color=color,
-                label=label,
+                label=f"{label} (valid fits: {len(widths)})",
             )
             plotted_widths = True
         if plotted_widths:
             axis.set_xlabel("Fitted noise width, mV")
             axis.set_ylabel("Pixel count")
-            axis.set_title("Noise-width distributions before and after equalization")
+            axis.set_title("Accepted noise-fit widths; not an input-charge ENC measurement")
             axis.legend()
             outputs["noise_width_distributions"] = _save_figure(
                 figure, plot_directory, "noise_width_distributions", settings
@@ -534,7 +608,7 @@ def generate_diagnostic_plots(
                 )
 
     matrix_curve_stages = [
-        stage for stage in ("trim_00", "trim_31", "equalized_final")
+        stage for stage in stage_styles
         if not _stage_frame(noise_statistics, stage).empty
     ]
     if matrix_curve_stages:
@@ -545,6 +619,7 @@ def generate_diagnostic_plots(
                 data.groupby("threshold_voltage_v")["mean_count"]
                 .agg(
                     median="median",
+                    mean="mean",
                     q10=lambda values: values.quantile(0.10),
                     q90=lambda values: values.quantile(0.90),
                 )
@@ -553,7 +628,8 @@ def generate_diagnostic_plots(
             )
             label, color = stage_styles[stage]
             x = envelope["threshold_voltage_v"].to_numpy(dtype=float)
-            axis.plot(x, envelope["median"], color=color, linewidth=1.5, label=label)
+            axis.plot(x, envelope["mean"], color=color, linewidth=1.5, label=f"{label}: mean")
+            axis.plot(x, envelope["median"], color=color, linewidth=1.0, linestyle="--", label=f"{label}: median")
             axis.fill_between(
                 x,
                 envelope["q10"].to_numpy(dtype=float),
@@ -563,7 +639,7 @@ def generate_diagnostic_plots(
             )
         axis.set_xlabel("Threshold voltage, V")
         axis.set_ylabel("Decoded counter value")
-        axis.set_title("Matrix noise response: median and 10-90% pixel band")
+        axis.set_title("Unaligned matrix noise: mean, median and 10-90% pixel band")
         axis.legend()
         outputs["noise_matrix_curves"] = _save_figure(
             figure, plot_directory, "noise_matrix_curves", settings
@@ -703,7 +779,7 @@ def generate_diagnostic_plots(
             for trim_code, group in uniform_stages.groupby("local_trim_code", sort=True):
                 curve = (
                     group.groupby("threshold_voltage_v")["mean_count"]
-                    .median()
+                    .mean()
                     .sort_index()
                 )
                 if curve.empty:
@@ -720,8 +796,8 @@ def generate_diagnostic_plots(
                 colorbar = figure.colorbar(scalar, ax=axis, pad=0.02)
                 colorbar.set_label("Uniform trim code")
                 axis.set_xlabel("Threshold voltage, V")
-                axis.set_ylabel("Matrix-median counter value")
-                axis.set_title("Matrix-median noise curves for every trim code")
+                axis.set_ylabel("Matrix-mean counter value")
+                axis.set_title("Unaligned matrix-mean noise curves for measured trims")
                 outputs["matrix_all_trim_noise_curves"] = _save_figure(
                     figure, plot_directory, "matrix_all_trim_noise_curves", settings
                 )
@@ -814,7 +890,10 @@ def generate_diagnostic_plots(
             if figure is not None:
                 outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
 
-    representative_stage = "equalized_final" if not final.empty else "trim_00"
+    representative_stage = next((
+        stage for stage in ("equalized_final", "trim_00", "baseline_noise", "trim_31")
+        if not _stage_frame(noise_fits, stage).empty
+    ), "trim_00")
     representative_fits = _stage_frame(noise_fits, representative_stage)
     representatives = _plot_coordinates(
         settings, representative_fits, "center_selected_v"
@@ -841,7 +920,7 @@ def generate_diagnostic_plots(
             )
         axis.set_xlabel("Threshold voltage, V")
         axis.set_ylabel("Decoded counter value")
-        axis.set_title(f"Representative raw noise curves: {representative_stage}")
+        axis.set_title(f"Noise curves (repeat mean and SEM): {representative_stage}")
         axis.legend(ncol=2)
         outputs["representative_noise_curves"] = _save_figure(
             figure, plot_directory, "representative_noise_curves", settings
@@ -850,7 +929,7 @@ def generate_diagnostic_plots(
         for column, row in representatives:
             figure, axis = plt.subplots(figsize=(7.6, 5.0))
             plotted = False
-            for stage in ("trim_00", "trim_31", "equalized_final"):
+            for stage in stage_styles:
                 curve = noise_statistics[
                     (noise_statistics["stage"] == stage)
                     & (noise_statistics["column"] == column)
@@ -896,7 +975,9 @@ def generate_diagnostic_plots(
             if plotted:
                 axis.set_xlabel("Threshold voltage, V")
                 axis.set_ylabel("Decoded counter value")
-                axis.set_title(f"Pixel C{column:02d} R{row:02d}: noise before/after equalization")
+                axis.set_title(f"Pixel C{column:02d} R{row:02d}: " + (
+                    "noise before/after equalization" if final_available else "measured noise curves"
+                ))
                 axis.legend(ncol=2)
                 stem = f"pixel_C{column:02d}_R{row:02d}_noise_before_after"
                 outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
@@ -916,7 +997,7 @@ def generate_diagnostic_plots(
                 figure, plot_directory, "noise_fit_quality", settings
             )
 
-    background_stage = "equalized_final" if "equalized_final" in set(noise_statistics.get("stage", [])) else "trim_00"
+    background_stage = representative_stage
     background = _stage_frame(noise_statistics, background_stage)
     if not background.empty:
         envelope = background.groupby("threshold_voltage_v")["mean_count"].agg(

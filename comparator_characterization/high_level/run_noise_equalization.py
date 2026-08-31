@@ -14,6 +14,7 @@ from comparator_characterization.high_level import characterization_config as co
 
 
 def main() -> None:
+    config.configure_runtime_logging()
     config.require_hardware_run_enabled()
     settings = config.build_settings(scan_all_trim_codes=False)
     with config.build_upo_client() as client:
@@ -22,14 +23,17 @@ def main() -> None:
             config.threshold_calibration_files(),
             window=config.WINDOW,
             pixels=config.PIXELS,
-            base_pixel_config=config.base_pixel_config_path(),
+            bad_pixel_map=config.BAD_PIXEL_MAP,
+            base_pixel_config=config.base_pixel_config(),
             results_root=config.RESULTS_ROOT,
             settings=settings,
             run_noise_scan=True,
             run_equalization=True,
             run_scurve=False,
+            initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
         )
     print(f"Эксперимент завершен: {result.experiment_path}")
+    config.print_recommendation_paths(result.analysis_path)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
+from .pixel_masks import BadPixelMapInput, normalize_bad_pixel_map
 
 
 ELEMENTARY_CHARGE_C = 1.602176634e-19
@@ -208,6 +209,7 @@ def build_injection_groups(
     pattern: str,
     *,
     owned_columns: Sequence[int] = OWNED_COLUMNS,
+    bad_pixel_map: BadPixelMapInput = None,
 ) -> tuple[InjectionGroup, ...]:
     """Build simultaneous groups without renumbering physical coordinates.
 
@@ -219,6 +221,8 @@ def build_injection_groups(
     if normalized not in INJECTION_PATTERN_TILE_SIZE:
         raise ValueError(f"unknown injection pattern: {pattern}")
     selected = tuple(dict.fromkeys((int(column), int(row)) for column, row in pixels))
+    bad_pixels = set(normalize_bad_pixel_map(bad_pixel_map))
+    selected = tuple(pixel for pixel in selected if pixel not in bad_pixels)
     if not selected:
         raise ValueError("pixel selection is empty")
 

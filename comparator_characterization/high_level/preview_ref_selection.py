@@ -28,6 +28,7 @@ def main() -> None:
         calibrations["DAC_TST_REF2"],
         config.injection_voltage_steps_v(),
         minimum_reference_code=config.MINIMUM_REFERENCE_CODE,
+        maximum_reference_code=config.MAXIMUM_REFERENCE_CODE,
         minimum_reference_voltage_v=config.MINIMUM_REFERENCE_VOLTAGE_V,
         preferred_reference_common_mode_v=config.PREFERRED_REFERENCE_COMMON_MODE_V,
         maximum_reference_step_error_v=config.MAXIMUM_REFERENCE_STEP_ERROR_V,

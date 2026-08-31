@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
+import math
 from pathlib import Path
 import threading
 import time
@@ -13,9 +15,16 @@ from configuration import Configuration
 from lfsr_decoder import LFSRDecoder
 from matrix_config_io import load_matrix_config
 from mgpd import MGPDClient
-from pixel_matrix import PIXEL_CODEC, PixelMatrixConfiguration
+from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS, PIXEL_CODEC, PixelMatrixConfiguration
 
 from .models import NoiseScanSettings, WindowSpec
+from .pixel_masks import (
+    BadPixelMapInput, enforce_disabled_pixel, noise_baseline_pixel_word,
+    normalize_bad_pixel_map,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -453,6 +462,38 @@ def load_base_pixel_configs(
     return result
 
 
+STANDARD_CHARACTERIZATION_FCLK_MHZ = 50
+STANDARD_CHARACTERIZATION_PIXEL_FIELDS = {
+    "PX_GAIN": 10,
+    "PX_SHT": 2,
+    # PX_MASK=0 disables the pixel digital counting path.
+    "PX_MASK": 0,
+    "PX_SH_EN": 0,
+    "PX_TST_EN": 0,
+    "PX_BUF_NEN": 1,
+    "PX_CMPD_TR": 16,
+    "PX_CMPC_TR": 16,
+    "PX_CMPB_TR": 16,
+    "PX_CMPA_TR": 16,
+}
+
+
+def build_standard_characterization_pixel_configs(
+    *,
+    digital_counting_enabled: bool,
+) -> dict[tuple[int, int], int]:
+    """Build the owned 16x32 matrix baseline in physical ``(column, row)`` order."""
+
+    fields = dict(STANDARD_CHARACTERIZATION_PIXEL_FIELDS)
+    fields["PX_MASK"] = int(bool(digital_counting_enabled))
+    raw = PIXEL_CODEC.pack(fields)
+    return {
+        (column, row): raw
+        for row in range(MATRIX_ROWS)
+        for column in OWNED_COLUMNS
+    }
+
+
 class MGPDMeasurementBackend:
     """Thin measurement adapter over the project's existing ASIC API."""
 
@@ -460,10 +501,12 @@ class MGPDMeasurementBackend:
         self,
         client: MGPDClient,
         *,
-        base_pixel_configs: str | Path | Mapping[tuple[int, int], int],
+        base_pixel_configs: str | Path | Mapping[tuple[int, int], int] | None,
         counter_key: str,
         noise_settings: NoiseScanSettings,
         shot_executor: ShotExecutor | None = None,
+        status_callback: Callable[[str], None] | None = None,
+        bad_pixel_map: BadPixelMapInput = None,
     ):
         if not client.connected:
             raise RuntimeError("MGPDClient must be connected before creating the backend")
@@ -483,9 +526,173 @@ class MGPDMeasurementBackend:
         self.counter_key = counter_key
         self.settings = noise_settings
         self.shot_executor = shot_executor or MGPDGetShotExecutor()
-        self._base_pixel_configs = load_base_pixel_configs(base_pixel_configs)
+        self.status_callback = status_callback
+        self.bad_pixels = normalize_bad_pixel_map(bad_pixel_map)
+        self._base_pixel_configs = (
+            build_standard_characterization_pixel_configs(
+                digital_counting_enabled=True
+            )
+            if base_pixel_configs is None
+            else load_base_pixel_configs(base_pixel_configs)
+        )
+        disabled_defaults = build_standard_characterization_pixel_configs(
+            digital_counting_enabled=False
+        )
+        self._base_pixel_configs = {
+            coordinate: noise_baseline_pixel_word(raw, bad=coordinate in self.bad_pixels)
+            for coordinate, raw in self._base_pixel_configs.items()
+        }
+        for coordinate in self.bad_pixels:
+            self._base_pixel_configs[coordinate] = enforce_disabled_pixel(
+                self._base_pixel_configs.get(coordinate, disabled_defaults[coordinate])
+            )
         self._current_pixel_configs = dict(self._base_pixel_configs)
         self._decoder = LFSRDecoder(noise_settings.counter_mode_bits)
+        self._initialization_fclk_mhz = STANDARD_CHARACTERIZATION_FCLK_MHZ
+        self._standard_initialization_complete = False
+        self._global_field_state: dict[str, int] = {}
+
+    def initialize_standard_configuration(
+        self,
+        pixels: Sequence[tuple[int, int]],
+        *,
+        fclk_mhz: int = STANDARD_CHARACTERIZATION_FCLK_MHZ,
+        progress_callback: Callable[[str, float], None] | None = None,
+    ) -> dict[str, Any]:
+        """Establish the reproducible global and pixel state before a test.
+
+        The full project-owned 16x32 half is first disabled with ``PX_MASK=0``.
+        Only the selected test pixels are then loaded from the test baseline,
+        whose built-in default uses ``PX_MASK=1``. OMR bytes, including
+        polarity, are neither written nor modified by this sequence.
+        """
+
+        def report(message: str, percent: float) -> None:
+            if progress_callback is not None:
+                progress_callback(message, percent)
+
+        self.validate_pixels(pixels)
+        report("Инициализация ASIC: установка FCLK", 0.0)
+        if not self.client.set_fclk(int(fclk_mhz)):
+            raise RuntimeError(f"failed to set FCLK={fclk_mhz} MHz")
+        report("Инициализация ASIC: загрузка global defaults", 10.0)
+        if not self.cfg.set_default():
+            raise RuntimeError("failed to load EO_cfg.DEFAULT_REGISTERS")
+
+        report("Инициализация ASIC: проверка global readback", 20.0)
+        verified_registers = self.cfg.read_registers(EO_cfg.DEFAULT_REGISTERS)
+        mismatches = {
+            address: {
+                "expected": int(expected),
+                "readback": int(verified_registers[address]),
+            }
+            for address, expected in EO_cfg.DEFAULT_REGISTERS.items()
+            if int(verified_registers[address]) != int(expected)
+        }
+        if mismatches:
+            first_address = min(mismatches)
+            values = mismatches[first_address]
+            raise RuntimeError(
+                "EO default readback mismatch at "
+                f"0x{first_address:04X}: expected 0x{values['expected']:02X}, "
+                f"read 0x{values['readback']:02X}"
+            )
+
+        disabled_configs = build_standard_characterization_pixel_configs(
+            digital_counting_enabled=False
+        )
+        disabled_raw = next(iter(disabled_configs.values()))
+        disabled_bucket = -1
+
+        def report_disabled(
+            current: int, total: int, _row: int, _column: int
+        ) -> None:
+            nonlocal disabled_bucket
+            bucket = min(4, (4 * current) // max(total, 1))
+            if bucket > disabled_bucket:
+                disabled_bucket = bucket
+                report(
+                    f"Инициализация PX: MASK=0, {current}/{total}",
+                    30.0 + 35.0 * current / max(total, 1),
+                )
+
+        staged_count = self.matrix.set_owned_half(
+            disabled_raw,
+            progress_callback=report_disabled,
+        )
+        if not self.matrix.write_to_chip():
+            raise RuntimeError(
+                "SET_PIXEL_CFG WRITE_TO_CHIP failed for standard disabled matrix"
+            )
+        self._current_pixel_configs = dict(disabled_configs)
+
+        selected_baseline = {
+            coordinate: self._base_pixel_configs[coordinate]
+            for coordinate in pixels
+        }
+        selected_bucket = -1
+
+        def report_selected(
+            current: int, total: int, _row: int, _column: int
+        ) -> None:
+            nonlocal selected_bucket
+            bucket = min(4, (4 * current) // max(total, 1))
+            if bucket > selected_bucket:
+                selected_bucket = bucket
+                report(
+                    f"Инициализация PX: тестовые пиксели {current}/{total}",
+                    65.0 + 35.0 * current / max(total, 1),
+                )
+
+        self.restore_pixel_configs(
+            selected_baseline,
+            progress_callback=report_selected,
+        )
+        self._initialization_fclk_mhz = int(fclk_mhz)
+        self._global_field_state = {
+            name: int(value) for name, value in EO_cfg.DEFAULT_FIELD_VALUES.items()
+        }
+        self._standard_initialization_complete = True
+
+        return {
+            "fclk_mhz": int(fclk_mhz),
+            "fclk_acknowledged_no_readback_command": True,
+            "global_configuration_source": "EO_cfg.DEFAULT_REGISTERS",
+            "global_logical_defaults": dict(EO_cfg.DEFAULT_FIELD_VALUES),
+            "global_register_count": len(EO_cfg.DEFAULT_REGISTERS),
+            "global_register_readback_verified": True,
+            "standard_owned_pixel_count": staged_count,
+            "standard_owned_pixel_raw_hex": f"0x{disabled_raw:08X}",
+            "standard_owned_pixel_fields": dict(
+                STANDARD_CHARACTERIZATION_PIXEL_FIELDS
+            ),
+            "standard_pixel_digital_state": (
+                "PX_MASK=0 disables digital counting"
+            ),
+            "selected_test_pixel_count": len(selected_baseline),
+            "selected_test_pixels_loaded_after_standard_disable": True,
+            "selected_test_pixel_mask_policy": (
+                "PX_MASK=1 for selected good pixels, 0 for bad pixels; PX_TST_EN=0"
+            ),
+            "pixel_write_verification": (
+                "MGPDLab command acknowledgement; no per-pixel readback exists"
+            ),
+            "omr_written": False,
+            "polarity_modified": False,
+            "permanently_disabled_pixel_count": len(self.bad_pixels),
+            "bad_pixel_policy": "PX_MASK=0 and PX_TST_EN=0 on every pixel write",
+        }
+
+    def active_pixels(
+        self, pixels: Sequence[tuple[int, int]]
+    ) -> tuple[tuple[int, int], ...]:
+        active = tuple(coordinate for coordinate in pixels if coordinate not in self.bad_pixels)
+        if not active:
+            raise ValueError("all requested pixels are excluded by bad_pixel_map")
+        return active
+
+    def _masked_pixel_word(self, coordinate: tuple[int, int], raw: int) -> int:
+        return enforce_disabled_pixel(raw) if coordinate in self.bad_pixels else raw
 
     def validate_pixels(self, pixels: Sequence[tuple[int, int]]) -> None:
         missing = [coordinate for coordinate in pixels if coordinate not in self._base_pixel_configs]
@@ -564,10 +771,14 @@ class MGPDMeasurementBackend:
             raise RuntimeError(
                 f"failed to set {spec.upper_threshold_dac}={upper_non_limiting_code}"
             )
+        self._global_field_state[spec.upper_threshold_dac] = int(
+            upper_non_limiting_code
+        )
 
     def set_threshold(self, spec: WindowSpec, code: int) -> None:
         if not self.cfg.set_data(spec.threshold_dac, int(code)):
             raise RuntimeError(f"failed to set {spec.threshold_dac}={code}")
+        self._global_field_state[spec.threshold_dac] = int(code)
 
     def program_trim_map(
         self,
@@ -586,7 +797,7 @@ class MGPDMeasurementBackend:
             current_raw = self._current_pixel_configs[(column, row)]
             fields = PIXEL_CODEC.unpack(current_raw)
             fields[spec.pixel_trim_field] = trim
-            updated_raw = PIXEL_CODEC.pack(fields)
+            updated_raw = self._masked_pixel_word((column, row), PIXEL_CODEC.pack(fields))
             staged[(row, column)] = updated_raw
 
         self.matrix.set_pixels(staged)
@@ -618,16 +829,19 @@ class MGPDMeasurementBackend:
         return {coordinate: self._current_pixel_configs[coordinate] for coordinate in pixels}
 
     def restore_pixel_configs(
-        self, pixel_configs: Mapping[tuple[int, int], int]
+        self,
+        pixel_configs: Mapping[tuple[int, int], int],
+        *,
+        progress_callback: Callable[[int, int, int, int], None] | None = None,
     ) -> None:
-        """Restore exact pixel words after temporary S-curve setup."""
+        """Restore pixel words, with the permanent bad-pixel mask taking priority."""
 
         self.validate_pixels(tuple(pixel_configs))
         staged: dict[tuple[int, int], int] = {}
         for (column, row), raw in pixel_configs.items():
             PIXEL_CODEC.validate_raw(int(raw))
-            staged[(row, column)] = int(raw)
-        self.matrix.set_pixels(staged)
+            staged[(row, column)] = self._masked_pixel_word((column, row), int(raw))
+        self.matrix.set_pixels(staged, progress_callback=progress_callback)
         if not self.matrix.write_to_chip():
             raise RuntimeError("SET_PIXEL_CFG WRITE_TO_CHIP failed while restoring pixels")
         for (row, column), raw in staged.items():
@@ -643,21 +857,23 @@ class MGPDMeasurementBackend:
         """Apply GAIN and documented test fields while preserving all trims."""
 
         self.validate_pixels(pixels)
-        active = set(active_injection_pixels)
-        unknown_active = active - set(pixels)
+        unknown_active = set(active_injection_pixels) - set(pixels)
         if unknown_active:
             coordinate = sorted(unknown_active)[0]
             raise ValueError(
                 f"active injection pixel Col={coordinate[0]} Row={coordinate[1]} "
                 "is outside the selected pixel set"
             )
+        active = set(active_injection_pixels) - set(self.bad_pixels)
         staged: dict[tuple[int, int], int] = {}
         rows: list[dict[str, Any]] = []
         for column, row in pixels:
             coordinate = (column, row)
-            if coordinate not in gain_map:
+            if coordinate not in gain_map and coordinate not in self.bad_pixels:
                 raise ValueError(f"GAIN map is missing Col={column} Row={row}")
-            gain = int(gain_map[coordinate])
+            gain = int(gain_map.get(coordinate, PIXEL_CODEC.extract(
+                self._current_pixel_configs[coordinate], "PX_GAIN"
+            )))
             if not 0 <= gain <= 31:
                 raise ValueError(f"GAIN at Col={column} Row={row} is outside 0..31")
             fields = PIXEL_CODEC.unpack(self._current_pixel_configs[coordinate])
@@ -665,13 +881,13 @@ class MGPDMeasurementBackend:
                 {
                     "PX_GAIN": gain,
                     "PX_SHT": 2,
-                    "PX_MASK": 1,
+                    "PX_MASK": int(coordinate not in self.bad_pixels),
                     "PX_SH_EN": 0,
                     "PX_TST_EN": int(coordinate in active),
                     "PX_BUF_NEN": 1,
                 }
             )
-            raw = PIXEL_CODEC.pack(fields)
+            raw = self._masked_pixel_word(coordinate, PIXEL_CODEC.pack(fields))
             staged[(row, column)] = raw
             rows.append(
                 {
@@ -690,6 +906,17 @@ class MGPDMeasurementBackend:
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
         return rows
+
+    def program_noise_pixel_configuration(self, pixels: Sequence[tuple[int, int]]) -> None:
+        """Explicitly disable injection before every noise stage, preserving trims/GAIN."""
+
+        configs = {}
+        for coordinate in pixels:
+            fields = PIXEL_CODEC.unpack(self._current_pixel_configs[coordinate])
+            fields.update(PX_TST_EN=0, PX_MASK=int(coordinate not in self.bad_pixels),
+                          PX_SH_EN=0, PX_BUF_NEN=1, PX_SHT=2)
+            configs[coordinate] = PIXEL_CODEC.pack(fields)
+        self.restore_pixel_configs(configs)
 
     def configure_test_pulse_amplitude(self, pulse_amplitude: Any) -> dict[str, Any]:
         """Program native REF1/REF2 codes and preserve calibrated levels."""
@@ -723,6 +950,13 @@ class MGPDMeasurementBackend:
                 raise ValueError(
                     f"selected REF code is below minimum_reference_code={minimum_code}"
                 )
+        maximum_code = pulse_amplitude.get("maximum_reference_code")
+        if maximum_code is not None:
+            maximum_code = int(maximum_code)
+            if any(value > maximum_code for value in programmed.values()):
+                raise ValueError(
+                    f"selected REF code is above maximum_reference_code={maximum_code}"
+                )
         calibrated_levels: dict[str, Any] = {}
         if "ref1_voltage_v" in pulse_amplitude or "ref2_voltage_v" in pulse_amplitude:
             if not all(name in pulse_amplitude for name in ("ref1_voltage_v", "ref2_voltage_v")):
@@ -731,7 +965,7 @@ class MGPDMeasurementBackend:
                 )
             ref1_voltage = float(pulse_amplitude["ref1_voltage_v"])
             ref2_voltage = float(pulse_amplitude["ref2_voltage_v"])
-            if not ref1_voltage > ref2_voltage:
+            if not all(math.isfinite(v) for v in (ref1_voltage, ref2_voltage)) or not ref1_voltage > ref2_voltage:
                 raise ValueError("physical REF levels must satisfy V_REF1 > V_REF2")
             calibrated_levels = {
                 "ref1_voltage_v": ref1_voltage,
@@ -742,6 +976,7 @@ class MGPDMeasurementBackend:
         for name, value in programmed.items():
             if not self.cfg.set_data(name, value):
                 raise RuntimeError(f"failed to set {name}={value}")
+            self._global_field_state[name] = int(value)
         return {
             "configuration_method": "Configuration.set_data_native_REF_codes",
             **programmed,
@@ -763,13 +998,124 @@ class MGPDMeasurementBackend:
             return None, False
         return int(decoded), True
 
+    @staticmethod
+    def _contains_transport_error(error: BaseException) -> bool:
+        visited: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            if isinstance(current, (OSError, TimeoutError, ConnectionError)):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _report_status(self, message: str) -> None:
+        if self.status_callback is None:
+            return
+        try:
+            self.status_callback(message)
+        except Exception as error:
+            logger.warning("Status callback failed: %s", error)
+
+    def _execute_shot_with_recovery(
+        self,
+        request: ShotRequest,
+    ) -> tuple[ShotExecutionResult | int | None, list[dict[str, Any]]]:
+        recovery_events: list[dict[str, Any]] = []
+        for acquisition_attempt in range(self.settings.upo_reconnect_attempts + 1):
+            try:
+                result = self.shot_executor.execute(self.client, request)
+                return result, recovery_events
+            except BaseException as error:
+                retryable = self._contains_transport_error(error) or (
+                    "MGPDLab GET_SHOT" in str(error)
+                    or "GET_SHOT failed" in str(error)
+                )
+                if (
+                    not retryable
+                    or acquisition_attempt >= self.settings.upo_reconnect_attempts
+                ):
+                    raise
+                retry_number = acquisition_attempt + 1
+                delay = max(
+                    self.settings.upo_reconnect_backoff_s
+                    * (2 ** acquisition_attempt),
+                    float(request.shutter_duration_s or 0.0) + 0.1,
+                )
+                logger.warning(
+                    "GET_SHOT acquisition failed; waiting %.3f s, reconnecting "
+                    "and repeating acquisition %d/%d: %s",
+                    delay,
+                    retry_number,
+                    self.settings.upo_reconnect_attempts,
+                    error,
+                )
+                self._report_status(
+                    f"Сбой GET_SHOT: новая попытка {retry_number}/"
+                    f"{self.settings.upo_reconnect_attempts} после ожидания "
+                    f"{delay:.3f} с"
+                )
+                time.sleep(delay)
+                reconnect_attempt = self.client.reconnect()
+                self._restore_programmed_state_after_reconnect()
+                self._report_status(
+                    f"УПО переподключено, конфигурация ASIC/PX восстановлена; "
+                    f"попытка соединения {reconnect_attempt}"
+                )
+                recovery_events.append(
+                    {
+                        "timestamp_utc": datetime.now(timezone.utc)
+                        .isoformat(timespec="milliseconds")
+                        .replace("+00:00", "Z"),
+                        "failed_acquisition_attempt": acquisition_attempt + 1,
+                        "retry_number": retry_number,
+                        "configured_retry_limit": self.settings.upo_reconnect_attempts,
+                        "wait_before_retry_s": delay,
+                        "reconnect_attempt_used": reconnect_attempt,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "failed_shot_data_discarded": True,
+                    }
+                )
+        raise RuntimeError("unreachable acquisition retry state")
+
+    def _restore_programmed_state_after_reconnect(self) -> None:
+        """Reapply the last acknowledged test state before retrying GET_SHOT."""
+
+        if not self._standard_initialization_complete:
+            return
+        if not self.client.set_fclk(self._initialization_fclk_mhz):
+            raise RuntimeError("failed to restore FCLK after UPO reconnect")
+        if not self.cfg.set_default():
+            raise RuntimeError("failed to restore EO defaults after UPO reconnect")
+        for name, value in self._global_field_state.items():
+            if EO_cfg.DEFAULT_FIELD_VALUES.get(name) == value:
+                continue
+            if not self.cfg.set_data(name, value):
+                raise RuntimeError(
+                    f"failed to restore {name}={value} after UPO reconnect"
+                )
+        staged = {
+            (row, column): self._masked_pixel_word((column, row), raw)
+            for (column, row), raw in self._current_pixel_configs.items()
+        }
+        self.matrix.set_pixels(staged)
+        if not self.matrix.write_to_chip():
+            raise RuntimeError("failed to restore pixel matrix after UPO reconnect")
+        for (row, column), raw in staged.items():
+            self._current_pixel_configs[(column, row)] = raw
+        logger.warning(
+            "Last acknowledged ASIC configuration restored after UPO reconnect"
+        )
+
     def acquire(
         self,
         pixels: Sequence[tuple[int, int]],
         request: ShotRequest,
     ) -> tuple[list[dict[str, Any]], ShotExecutionResult]:
+        pixels = self.active_pixels(pixels)
         self.validate_pixels(pixels)
-        executor_result = self.shot_executor.execute(self.client, request)
+        executor_result, recovery_events = self._execute_shot_with_recovery(request)
         if isinstance(executor_result, ShotExecutionResult):
             shot_result = executor_result
         elif executor_result is None:
@@ -792,6 +1138,19 @@ class MGPDMeasurementBackend:
             )
         else:
             raise RuntimeError("ShotExecutor returned an unsupported result type")
+        if recovery_events:
+            shot_result = ShotExecutionResult(
+                requested_injections=shot_result.requested_injections,
+                programmed_injections=shot_result.programmed_injections,
+                actual_injections=shot_result.actual_injections,
+                injections_for_analysis=shot_result.injections_for_analysis,
+                injection_count_source=shot_result.injection_count_source,
+                details={
+                    **dict(shot_result.details),
+                    "upo_acquisition_attempt_count": len(recovery_events) + 1,
+                    "upo_recovery_events": recovery_events,
+                },
+            )
         if request.test_pulses:
             if shot_result.injections_for_analysis is None:
                 raise RuntimeError("test-pulse shot did not report an injection denominator")

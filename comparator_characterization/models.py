@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.3.0"
+FRAMEWORK_VERSION = "0.5.0"
 
 
 @dataclass(frozen=True)
@@ -135,6 +135,12 @@ class NoiseScanSettings:
     mode_read: int = 0b010
     crw_mode: int = 0
     continue_after_pixel_read_error: bool = True
+    # Stop only on the trailing empty side of an already observed noise peak.
+    # Initial zero-count DAC points never trigger early termination.
+    stop_after_consecutive_empty_codes: int | None = 3
+    # Number of reconnect-and-retry cycles after a transient UPO failure.
+    upo_reconnect_attempts: int = 3
+    upo_reconnect_backoff_s: float = 0.5
 
     def validate(self) -> None:
         if self.noise_repeats < 2:
@@ -147,8 +153,8 @@ class NoiseScanSettings:
             ("coarse_start", self.coarse_start),
             ("coarse_stop", self.coarse_stop),
         ):
-            if not 0 <= code <= 1023:
-                raise ValueError(f"{name} must be in 0..1023")
+            if not isinstance(code, int) or isinstance(code, bool) or not 0 <= code <= 1023:
+                raise ValueError(f"{name} must be an integer in 0..1023")
         if self.coarse_start > self.coarse_stop:
             raise ValueError("coarse_start must not exceed coarse_stop")
         if self.coarse_step <= 0 or self.fine_step <= 0:
@@ -174,6 +180,23 @@ class NoiseScanSettings:
             raise ValueError("mode_read must be in 0..7")
         if self.crw_mode not in (0, 1):
             raise ValueError("crw_mode must be 0 or 1")
+        if self.stop_after_consecutive_empty_codes is not None:
+            if (
+                not isinstance(self.stop_after_consecutive_empty_codes, int)
+                or isinstance(self.stop_after_consecutive_empty_codes, bool)
+                or self.stop_after_consecutive_empty_codes < 2
+            ):
+                raise ValueError(
+                    "stop_after_consecutive_empty_codes must be None or an integer >= 2"
+                )
+        if (
+            not isinstance(self.upo_reconnect_attempts, int)
+            or isinstance(self.upo_reconnect_attempts, bool)
+            or self.upo_reconnect_attempts < 0
+        ):
+            raise ValueError("upo_reconnect_attempts must be an integer >= 0")
+        if self.upo_reconnect_backoff_s < 0:
+            raise ValueError("upo_reconnect_backoff_s must be >= 0")
 
     def manual_codes(self) -> tuple[int, ...] | None:
         if self.dac_start is None:
@@ -220,11 +243,13 @@ class ScurveSettings:
     pulse_amplitudes: tuple[Any, ...] = field(default_factory=tuple)
     shutter_duration_s: float | None = None
     injection_patterns: tuple[str, ...] = ("all",)
-    injection_capacitance_f: float = 10e-15
+    injection_capacitance_f: float = 15e-15
     injection_capacitance_relative_uncertainty: float = 0.20
     # Code 401 implements the requested strict condition REF1/REF2 code > 400.
     # A physical-voltage floor can be enabled independently when required.
     minimum_reference_code: int = 401
+    # Inclusive upper bound for BOTH REF DACs, independent of voltage polarity.
+    maximum_reference_code: int = 1023
     minimum_reference_voltage_v: float | None = None
     preferred_reference_common_mode_v: float | None = None
     maximum_reference_step_error_v: float | None = None
@@ -270,6 +295,14 @@ class ScurveSettings:
             or not 0 <= self.minimum_reference_code <= 1023
         ):
             raise ValueError("minimum_reference_code must be an integer in 0..1023")
+        if (
+            not isinstance(self.maximum_reference_code, int)
+            or isinstance(self.maximum_reference_code, bool)
+            or not 0 <= self.maximum_reference_code <= 1023
+        ):
+            raise ValueError("maximum_reference_code must be an integer in 0..1023")
+        if self.minimum_reference_code > self.maximum_reference_code:
+            raise ValueError("minimum_reference_code must not exceed maximum_reference_code")
         for name, value in (
             ("minimum_reference_voltage_v", self.minimum_reference_voltage_v),
             ("preferred_reference_common_mode_v", self.preferred_reference_common_mode_v),

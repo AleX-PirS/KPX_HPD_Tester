@@ -12,7 +12,11 @@ import pandas as pd
 
 from .calibration import ThresholdDacCalibration
 from .models import AnalysisSettings
-from .storage import ExperimentStore, atomic_write_json, utc_now_text
+from .pixel_masks import (
+    BadPixelMapInput, bad_pixel_document, exclude_bad_pixel_rows, normalize_bad_pixel_map,
+)
+from .recommendations import save_noise_recommendations
+from .storage import ExperimentStore, atomic_write_json, atomic_write_table, file_sha256, utc_now_text
 
 
 _NORMAL = NormalDist()
@@ -307,6 +311,12 @@ def fit_noise_curve(group: pd.DataFrame, settings: AnalysisSettings) -> dict[str
         "center_selected_v": float("nan"),
         "center_selected_method": "none",
         "diagnostic_flags": "[]",
+        "scan_min_voltage_v": float(np.min(voltage)) if len(voltage) else float("nan"),
+        "scan_max_voltage_v": float(np.max(voltage)) if len(voltage) else float("nan"),
+        "nonzero_points": int(np.sum(counts > 0)),
+        "candidate_center_fit_v": float("nan"),
+        "candidate_sigma_fit_v": float("nan"),
+        "centroid_weighting": "trapezoidal_voltage_integral",
     }
     if len(voltage) < settings.noise_min_points:
         return result
@@ -359,9 +369,16 @@ def fit_noise_curve(group: pd.DataFrame, settings: AnalysisSettings) -> dict[str
         flags.append("statistical_maximum_plateau")
 
     centroid_weights = np.clip(counts - baseline, 0, np.inf)
-    if float(np.sum(centroid_weights)) > 0:
+    # Coarse and fine points have unequal voltage spacing. Summing counts per
+    # sample would spuriously favor the densely scanned region.
+    dv = np.diff(voltage)
+    area = float(np.sum(0.5 * (centroid_weights[:-1] + centroid_weights[1:]) * dv))
+    if area > 0:
+        first_moment = float(np.sum(0.5 * (
+            voltage[:-1] * centroid_weights[:-1] + voltage[1:] * centroid_weights[1:]
+        ) * dv))
         result["center_centroid_v"] = float(
-            np.sum(voltage * centroid_weights) / np.sum(centroid_weights)
+            first_moment / area
         )
 
     half = baseline + 0.5 * dynamic
@@ -409,11 +426,19 @@ def fit_noise_curve(group: pd.DataFrame, settings: AnalysisSettings) -> dict[str
             flags.append(f"gaussian_fit_failed:{error}")
 
     if fit is not None:
+        physical_fit = (
+            math.isfinite(float(fit["center"]))
+            and math.isfinite(float(fit["sigma"]))
+            and float(voltage.min()) <= float(fit["center"]) <= float(voltage.max())
+            and 0 < float(fit["sigma"]) <= float(np.ptp(voltage))
+        )
         result.update(
             {
-                "center_fit_v": fit["center"],
+                "candidate_center_fit_v": fit["center"],
+                "candidate_sigma_fit_v": fit["sigma"],
+                "center_fit_v": fit["center"] if physical_fit else float("nan"),
                 "center_fit_uncertainty_v": fit["center_uncertainty"],
-                "sigma_fit_v": fit["sigma"],
+                "sigma_fit_v": fit["sigma"] if physical_fit else float("nan"),
                 "sigma_fit_uncertainty_v": fit["sigma_uncertainty"],
                 "fit_r2": fit["r2"],
                 "fit_rmse_count": fit["rmse"],
@@ -429,8 +454,12 @@ def fit_noise_curve(group: pd.DataFrame, settings: AnalysisSettings) -> dict[str
                 ),
             }
         )
+        if not physical_fit:
+            result["fit_status"] = "unphysical_fit"
+            flags.append("fit_center_outside_scan_or_invalid_sigma")
         if result["fit_status"] != "ok":
-            flags.append("fit_below_r2_threshold")
+            if physical_fit:
+                flags.append("fit_below_r2_threshold")
 
     if result["fit_status"] == "ok" and math.isfinite(result["center_fit_v"]):
         result["center_selected_v"] = result["center_fit_v"]
@@ -498,10 +527,10 @@ def select_equalization_target(
     )
     merged["reachable_min_v"] = merged[
         ["center_selected_v_trim0", "center_selected_v_trim31"]
-    ].min(axis=1)
+    ].min(axis=1, skipna=False)
     merged["reachable_max_v"] = merged[
         ["center_selected_v_trim0", "center_selected_v_trim31"]
-    ].max(axis=1)
+    ].max(axis=1, skipna=False)
     valid = merged[
         np.isfinite(merged["reachable_min_v"])
         & np.isfinite(merged["reachable_max_v"])
@@ -511,6 +540,8 @@ def select_equalization_target(
 
     if requested_target_voltage is not None:
         target = float(requested_target_voltage)
+        if not math.isfinite(target):
+            raise ValueError("requested target voltage must be finite")
         method = "user_supplied_target_voltage"
     else:
         endpoints = np.unique(
@@ -613,6 +644,9 @@ def choose_measured_trim_map(
     candidates = noise_fits[
         stages.str.startswith(prefixes) | stages.isin(exact_names)
     ].copy()
+    candidates = candidates[np.isfinite(pd.to_numeric(
+        candidates["center_selected_v"], errors="coerce"
+    ))].copy()
     if candidates.empty:
         return pd.DataFrame()
     candidates["absolute_residual_v"] = abs(
@@ -1455,6 +1489,7 @@ def analyze_saved_experiment(
     target_voltage: float | None = None,
     n_injections: int | None = None,
     generate_plots: bool = True,
+    bad_pixel_map: BadPixelMapInput = None,
 ) -> dict[str, Any]:
     """Re-analyze a saved experiment without importing or accessing hardware.
 
@@ -1472,6 +1507,10 @@ def analyze_saved_experiment(
     ):
         raise ValueError("n_injections must be a positive integer when supplied")
     store = ExperimentStore(path)
+    # Additional offline exclusions cannot re-enable pixels excluded at acquisition.
+    bad_pixels = tuple(sorted(set(normalize_bad_pixel_map(bad_pixel_map)) | set(
+        normalize_bad_pixel_map(store.metadata.get("bad_pixel_mask"))
+    )))
     analysis_dir = store.next_analysis_directory()
     calibration = _load_primary_calibration(store)
     outputs: dict[str, Any] = {"analysis_directory": analysis_dir}
@@ -1484,10 +1523,11 @@ def analyze_saved_experiment(
             "target_voltage_override_v": target_voltage,
             "n_injections_consistency_check": n_injections,
             "source_experiment": str(store.root),
+            "bad_pixel_mask": bad_pixel_document(bad_pixels),
         },
     )
 
-    raw_noise = store.load_raw("noise")
+    raw_noise = exclude_bad_pixel_rows(store.load_raw("noise"), bad_pixels)
     noise_statistics = calculate_noise_statistics(raw_noise)
     store.write_table(analysis_dir / "noise_statistics.csv", noise_statistics)
     outputs["noise_statistics"] = analysis_dir / "noise_statistics.csv"
@@ -1522,10 +1562,14 @@ def analyze_saved_experiment(
     reachability = pd.DataFrame()
     stages = set(noise_fits.get("stage", pd.Series(dtype=str)).astype(str))
     if {"trim_00", "trim_31"}.issubset(stages):
-        selected_target, target_method, reachability = select_equalization_target(
-            noise_fits,
-            requested_target_voltage=target_voltage,
-        )
+        try:
+            selected_target, target_method, reachability = select_equalization_target(
+                noise_fits,
+                requested_target_voltage=target_voltage,
+            )
+        except RuntimeError as error:
+            # Still produce diagnostics/proposals for an unsuccessful or partial scan.
+            selected_target, target_method = target_voltage, str(error)
         store.write_table(analysis_dir / "reachable_range_per_pixel.csv", reachability)
         atomic_write_json(
             analysis_dir / "equalization_target.json",
@@ -1533,7 +1577,7 @@ def analyze_saved_experiment(
                 "target_voltage_v": selected_target,
                 "target_selection_method": target_method,
                 "pixels_total": int(len(reachability)),
-                "pixels_not_reaching_target": int((~reachability["target_reachable"]).sum()),
+                "pixels_not_reaching_target": int((~reachability["target_reachable"]).sum()) if not reachability.empty else None,
             },
         )
         outputs["equalization_target"] = analysis_dir / "equalization_target.json"
@@ -1563,8 +1607,19 @@ def analyze_saved_experiment(
                 "selected_center_method",
                 "fit_status",
             ]
-            store.write_table(analysis_dir / "trim_map.csv", measured_trim[trim_columns])
-            outputs["trim_map"] = analysis_dir / "trim_map.csv"
+            # A nearest measured endpoint is not an equalized map. Preserve it
+            # as a diagnostic, clearly separate from per-method predictions.
+            filename = "best_measured_trim_map.csv"
+            store.write_table(analysis_dir / filename, measured_trim[trim_columns])
+            outputs["best_measured_trim_map"] = analysis_dir / filename
+            if "equalized_final" in stages:
+                final_map = noise_fits[noise_fits["stage"] == "equalized_final"].rename(columns={
+                    "local_trim_code": "selected_trim_code", "center_selected_v": "selected_measured_center_v",
+                    "center_selected_method": "selected_center_method", "stage": "selected_from_stage",
+                }).copy()
+                final_map["selected_measured_residual_v"] = final_map["selected_measured_center_v"] - float(selected_target)
+                store.write_table(analysis_dir / "trim_map.csv", final_map[trim_columns])
+                outputs["trim_map"] = analysis_dir / "trim_map.csv"
 
     if noise_fits.empty or "stage" not in noise_fits:
         final = pd.DataFrame()
@@ -1633,10 +1688,29 @@ def analyze_saved_experiment(
             if not summary_source.empty:
                 break
     summary = _summary_from_final(summary_source, target_voltage=selected_target)
+    if not summary.empty:
+        summary["summary_source_stage"] = str(summary_source.iloc[0]["stage"])
+        summary["equalized_final_measured"] = not final.empty
+        summary["equalization_improvement_verified"] = not final.empty
+        if final.empty:
+            # Endpoint trims of 0/31 are intentional, not saturated equalization.
+            summary["saturated_trim_count"] = np.nan
+            summary["saturated_trim_fraction"] = np.nan
     store.write_table(analysis_dir / "summary.csv", summary)
     outputs["summary"] = analysis_dir / "summary.csv"
+    outputs.update(save_noise_recommendations(
+        analysis_dir, noise_fits, noise_statistics,
+        target_voltage=target_voltage, bad_pixel_map=bad_pixels,
+    ))
+    atomic_write_json(analysis_dir / "measurement_coverage.json", {
+        "source_kind": "raw_acquisitions", "source_status": store.metadata.get("status"),
+        "available_noise_stages": sorted(stages),
+        "equalized_final_measured": not final.empty,
+        "warning_ru": "При отсутствии equalized_final карты подстроек являются предложениями, а не результатом проверенной эквализации.",
+    })
+    outputs["measurement_coverage"] = analysis_dir / "measurement_coverage.json"
 
-    raw_scurve = store.load_raw("scurve")
+    raw_scurve = exclude_bad_pixel_rows(store.load_raw("scurve"), bad_pixels)
     scurve_efficiency = pd.DataFrame()
     scurve_results = pd.DataFrame()
     scurve_amplitude_summary = pd.DataFrame()
@@ -1685,6 +1759,7 @@ def analyze_saved_experiment(
                     f"saved noise-reference statistics are missing: {reference_path}"
                 )
             reference_statistics = pd.read_csv(reference_path, keep_default_na=False)
+            reference_statistics = exclude_bad_pixel_rows(reference_statistics, bad_pixels)
             if scurve_noise_statistics.empty:
                 scurve_noise_statistics = reference_statistics
         scurve_efficiency = _paired_scurve_efficiency(
@@ -1751,6 +1826,9 @@ def analyze_saved_experiment(
             settings=selected_settings,
         )
         outputs["plots"] = plot_paths
+        from .plots import generate_recommendation_plots
+
+        outputs["plots"].update(generate_recommendation_plots(analysis_dir, selected_settings))
 
     atomic_write_json(
         analysis_dir / "analysis_manifest.json",
@@ -1767,4 +1845,94 @@ def analyze_saved_experiment(
         },
     )
     outputs["analysis_manifest"] = analysis_dir / "analysis_manifest.json"
+    return outputs
+
+
+def analyze_saved_noise_statistics(
+    path: str | Path,
+    *,
+    settings: AnalysisSettings | None = None,
+    target_voltage: float | None = None,
+    bad_pixel_map: BadPixelMapInput = None,
+    output_root: str | Path | None = None,
+    generate_plots: bool = True,
+) -> dict[str, Any]:
+    """Re-fit a saved noise_statistics.csv when original raw data are unavailable.
+
+    Input files are never overwritten. A new reanalysis/vNNN directory records
+    that raw repetitions, calibration provenance and hardware state cannot be
+    reconstructed from aggregates. This output is NOT a hardware noise reference.
+    """
+
+    source = Path(path).resolve()
+    if source.is_dir():
+        source = source / "noise_statistics.csv"
+    statistics = pd.read_csv(source)
+    required = {
+        "stage", "window", "comparator_under_test", "threshold_dac",
+        "local_trim_field", "local_trim_code", "column", "row",
+        "threshold_dac_code", "threshold_voltage_v", "mean_count", "sem_count",
+        "median_count", "std_count", "repeat_count_total", "repeat_count_valid",
+        "repeat_count_invalid", "repeat_count_saturated",
+    }
+    if not required.issubset(statistics):
+        raise ValueError("noise statistics CSV is missing columns: " + ", ".join(sorted(required - set(statistics))))
+    if statistics["window"].nunique() > 1:
+        raise ValueError("analyze one comparator window at a time")
+    selected_settings = settings or AnalysisSettings()
+    selected_settings.validate()
+    bad_pixels = normalize_bad_pixel_map(bad_pixel_map)
+    statistics = exclude_bad_pixel_rows(statistics, bad_pixels)
+    parent = Path(output_root).resolve() if output_root is not None else source.parent / "reanalysis"
+    parent.mkdir(parents=True, exist_ok=True)
+    version = 1
+    while (parent / f"v{version:03d}").exists():
+        version += 1
+    directory = parent / f"v{version:03d}"
+    directory.mkdir()
+    fits = fit_noise_statistics(statistics, settings=selected_settings)
+    trim_data = uniform_trim_characterization(fits)
+    trim_summary = summarize_uniform_trim_characterization(trim_data)
+    outputs: dict[str, Any] = {"analysis_directory": directory}
+    for stem, table in (
+        ("noise_statistics", statistics), ("noise_fit_results", fits),
+        ("uniform_trim_characterization", trim_data), ("uniform_trim_summary", trim_summary),
+    ):
+        outputs[stem] = atomic_write_table(directory / f"{stem}.csv", table)
+    outputs.update(save_noise_recommendations(
+        directory, fits, statistics, target_voltage=target_voltage, bad_pixel_map=bad_pixels,
+    ))
+    stages = sorted(set(statistics["stage"].astype(str)))
+    coverage = {
+        "source_kind": "processed_statistics_only_NO_RAW",
+        "source_statistics_path": str(source), "source_statistics_sha256": file_sha256(source),
+        "available_noise_stages": stages, "equalized_final_measured": "equalized_final" in stages,
+        "raw_repetitions_available": False, "calibration_provenance_verified": False,
+        "hardware_configuration_verified": False,
+        "warning_ru": "Повторный анализ средних/дисперсий. Порядок отдельных shots, reset, OMR, реальные настройки УПО и насыщение исходных слов проверить нельзя.",
+    }
+    atomic_write_json(directory / "measurement_coverage.json", coverage)
+    outputs["measurement_coverage"] = directory / "measurement_coverage.json"
+    atomic_write_json(directory / "analysis_settings.json", {
+        "created_utc": utc_now_text(), "settings": asdict(selected_settings),
+        "target_voltage_override_v": target_voltage, "bad_pixel_mask": bad_pixel_document(bad_pixels),
+    })
+    outputs["analysis_settings"] = directory / "analysis_settings.json"
+    if generate_plots:
+        from .plots import generate_diagnostic_plots, generate_recommendation_plots
+
+        outputs["plots"] = generate_diagnostic_plots(
+            analysis_directory=directory, noise_statistics=statistics, noise_fits=fits,
+            trim_characterization=trim_data, trim_characterization_summary=trim_summary,
+            scurve_efficiency=pd.DataFrame(), scurve_results=pd.DataFrame(),
+            scurve_amplitude_summary=pd.DataFrame(), scurve_gain_results=pd.DataFrame(),
+            crosstalk_pixel_metrics=pd.DataFrame(), crosstalk_summary=pd.DataFrame(),
+            target_voltage=target_voltage, settings=selected_settings,
+        )
+        outputs["plots"].update(generate_recommendation_plots(directory, selected_settings))
+    atomic_write_json(directory / "analysis_manifest.json", {
+        "created_utc": utc_now_text(), **coverage,
+        "files": {key: value.relative_to(directory).as_posix() for key, value in outputs.items() if isinstance(value, Path) and value.is_file()},
+    })
+    outputs["analysis_manifest"] = directory / "analysis_manifest.json"
     return outputs

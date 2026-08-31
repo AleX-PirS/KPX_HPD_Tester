@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .analysis import analyze_saved_experiment
+from .analysis import analyze_saved_experiment, analyze_saved_noise_statistics
 from .models import AnalysisSettings
 
 
@@ -13,7 +13,11 @@ def main() -> int:
         description="Офлайн-анализ сохраненного эксперимента компараторов."
     )
     parser.add_argument(
-        "experiment", type=Path, help="Каталог эксперимента с metadata.json"
+        "experiment", type=Path, help="Каталог с metadata.json или noise_statistics.csv (также допустим сам CSV)"
+    )
+    parser.add_argument(
+        "--bad-pixels", type=Path, default=None,
+        help="Дополнительная маска CSV/JSON: bad=True исключает пиксель из анализа; raw не изменяется.",
     )
     parser.add_argument(
         "--target-voltage",
@@ -86,13 +90,16 @@ def main() -> int:
         plot_dpi=args.dpi,
         save_pdf_plots=not args.no_pdf,
     )
-    outputs = analyze_saved_experiment(
-        args.experiment,
-        settings=analysis_settings,
-        target_voltage=args.target_voltage,
-        n_injections=args.n_injections,
-        generate_plots=not args.no_plots,
+    common = dict(
+        settings=analysis_settings, target_voltage=args.target_voltage,
+        bad_pixel_map=args.bad_pixels, generate_plots=not args.no_plots,
     )
+    if (args.experiment / "metadata.json").is_file():
+        outputs = analyze_saved_experiment(args.experiment, n_injections=args.n_injections, **common)
+    else:
+        if args.n_injections is not None:
+            parser.error("Для noise_statistics.csv число S-curve инжекций не применяется")
+        outputs = analyze_saved_noise_statistics(args.experiment, **common)
     serializable = {}
     for key, value in outputs.items():
         if isinstance(value, Path):

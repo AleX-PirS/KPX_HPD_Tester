@@ -333,6 +333,7 @@ class ReferencePairSelection:
     selection_method: str
     minimum_reference_code: int
     minimum_reference_voltage_v: float | None
+    maximum_reference_code: int = 1023
 
     def to_pulse_amplitude(self) -> dict[str, Any]:
         return {
@@ -348,6 +349,7 @@ class ReferencePairSelection:
             "ref1_voltage_above_ref2": True,
             "reference_pair_selection_method": self.selection_method,
             "minimum_reference_code": self.minimum_reference_code,
+            "maximum_reference_code": self.maximum_reference_code,
             "minimum_reference_voltage_v": self.minimum_reference_voltage_v,
         }
 
@@ -402,6 +404,7 @@ def select_reference_dac_pairs(
     requested_voltage_steps_v: Sequence[float],
     *,
     minimum_reference_code: int = 401,
+    maximum_reference_code: int = 1023,
     minimum_reference_voltage_v: float | None = None,
     preferred_reference_common_mode_v: float | None = None,
     maximum_reference_step_error_v: float | None = None,
@@ -418,6 +421,12 @@ def select_reference_dac_pairs(
         minimum_reference_code, bool
     ) or not 0 <= minimum_reference_code <= 1023:
         raise ValueError("minimum_reference_code must be an integer in 0..1023")
+    if not isinstance(maximum_reference_code, int) or isinstance(
+        maximum_reference_code, bool
+    ) or not 0 <= maximum_reference_code <= 1023:
+        raise ValueError("maximum_reference_code must be an integer in 0..1023")
+    if minimum_reference_code > maximum_reference_code:
+        raise ValueError("minimum_reference_code must not exceed maximum_reference_code")
     if minimum_reference_voltage_v is not None:
         minimum_reference_voltage_v = float(minimum_reference_voltage_v)
         if not math.isfinite(minimum_reference_voltage_v):
@@ -439,8 +448,8 @@ def select_reference_dac_pairs(
     if len(set(requested)) != len(requested):
         raise ValueError("requested REF voltage steps must not contain duplicates")
 
-    ref1_mask = ref1.codes >= minimum_reference_code
-    ref2_mask = ref2.codes >= minimum_reference_code
+    ref1_mask = (ref1.codes >= minimum_reference_code) & (ref1.codes <= maximum_reference_code)
+    ref2_mask = (ref2.codes >= minimum_reference_code) & (ref2.codes <= maximum_reference_code)
     if minimum_reference_voltage_v is not None:
         ref1_mask &= ref1.voltages >= minimum_reference_voltage_v
         ref2_mask &= ref2.voltages >= minimum_reference_voltage_v
@@ -450,7 +459,7 @@ def select_reference_dac_pairs(
     ref2_voltages = ref2.voltages[ref2_mask]
     if not len(ref1_codes) or not len(ref2_codes):
         raise ValueError(
-            "no measured REF codes satisfy the configured minimum code/voltage constraints"
+            "no measured REF codes satisfy the configured code bounds/voltage constraints"
         )
 
     delta = ref1_voltages[:, None] - ref2_voltages[None, :]
@@ -528,6 +537,7 @@ def select_reference_dac_pairs(
                 reference_common_mode_v=0.5 * (voltage1 + voltage2),
                 selection_method=method,
                 minimum_reference_code=minimum_reference_code,
+                maximum_reference_code=maximum_reference_code,
                 minimum_reference_voltage_v=minimum_reference_voltage_v,
             )
         )

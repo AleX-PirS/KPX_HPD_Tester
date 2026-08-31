@@ -252,6 +252,13 @@ S-кривых, сравнения режимов инжекции и повто
 `python -m comparator_characterization.high_level.preview_ref_selection`,
 которая показывает автоматически выбранные коды REF1/REF2 без подключения к
 стенду.
+
+Верхнеуровневые аппаратные тесты перед измерением устанавливают FCLK 50 МГц,
+загружают `EO_cfg.DEFAULT_REGISTERS` и стандартно отключают цифровой счет всех
+512 принадлежащих пикселей через `PX_MASK=0`. Цифровая часть включается через
+`PX_MASK=1` только у выбранных тестом пикселей. Консольный статус дублируется в
+`experiment.log`; transient timeout УПО вызывает ограниченное переподключение,
+а noise scan умеет завершать пустой хвост после уже найденной активной области.
 MGPDLab documents `GET_SHOT` itself as beginning with its own "Load settings"
 operation, so its stored UPO/GUI OMR settings should be kept consistent with any
 Python pre-configuration.
