@@ -15,7 +15,9 @@ from configuration import Configuration
 from lfsr_decoder import LFSRDecoder
 from matrix_config_io import load_matrix_config
 from mgpd import MGPDClient
-from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS, PIXEL_CODEC, PixelMatrixConfiguration
+from pixel_matrix import (
+    MATRIX_COLS, MATRIX_ROWS, OWNED_COLUMNS, PIXEL_CODEC, PixelMatrixConfiguration,
+)
 
 from .models import NoiseScanSettings, WindowSpec
 from .pixel_masks import (
@@ -523,6 +525,14 @@ class MGPDMeasurementBackend:
             EO_cfg.AMUX_MAP,
         )
         self.matrix = PixelMatrixConfiguration(client)
+        # Separate adapter for the explicitly requested zero-only half.
+        # The normal measurement adapter retains its owned-column restriction.
+        self._zeroed_columns = tuple(
+            column for column in range(MATRIX_COLS) if column not in OWNED_COLUMNS
+        )
+        self._zeroed_matrix = PixelMatrixConfiguration(
+            client, owned_columns=self._zeroed_columns
+        )
         self.counter_key = counter_key
         self.settings = noise_settings
         self.shot_executor = shot_executor or MGPDGetShotExecutor()
@@ -561,7 +571,8 @@ class MGPDMeasurementBackend:
     ) -> dict[str, Any]:
         """Establish the reproducible global and pixel state before a test.
 
-        The full project-owned 16x32 half is first disabled with ``PX_MASK=0``.
+        The other 16x32 half is first staged with literal 32-bit zero words.
+        The full project-owned 16x32 half is then disabled with ``PX_MASK=0``.
         Only the selected test pixels are then loaded from the test baseline,
         whose built-in default uses ``PX_MASK=1``. OMR bytes, including
         polarity, are neither written nor modified by this sequence.
@@ -602,6 +613,23 @@ class MGPDMeasurementBackend:
             digital_counting_enabled=False
         )
         disabled_raw = next(iter(disabled_configs.values()))
+        zeroed_bucket = -1
+
+        def report_zeroed(
+            current: int, total: int, _row: int, _column: int
+        ) -> None:
+            nonlocal zeroed_bucket
+            bucket = min(4, (4 * current) // max(total, 1))
+            if bucket > zeroed_bucket:
+                zeroed_bucket = bucket
+                report(
+                    f"Инициализация PX: другая половина 0x00000000, {current}/{total}",
+                    30.0 + 15.0 * current / max(total, 1),
+                )
+
+        zeroed_count = self._zeroed_matrix.set_owned_half(
+            0x00000000, progress_callback=report_zeroed
+        )
         disabled_bucket = -1
 
         def report_disabled(
@@ -613,7 +641,7 @@ class MGPDMeasurementBackend:
                 disabled_bucket = bucket
                 report(
                     f"Инициализация PX: MASK=0, {current}/{total}",
-                    30.0 + 35.0 * current / max(total, 1),
+                    45.0 + 20.0 * current / max(total, 1),
                 )
 
         staged_count = self.matrix.set_owned_half(
@@ -661,6 +689,14 @@ class MGPDMeasurementBackend:
             "global_logical_defaults": dict(EO_cfg.DEFAULT_FIELD_VALUES),
             "global_register_count": len(EO_cfg.DEFAULT_REGISTERS),
             "global_register_readback_verified": True,
+            "zeroed_unowned_pixel_count": zeroed_count,
+            "zeroed_unowned_columns": list(self._zeroed_columns),
+            "zeroed_unowned_rows": list(range(MATRIX_ROWS)),
+            "zeroed_unowned_pixel_raw_hex": "0x00000000",
+            "zeroed_unowned_policy": (
+                "literal 32-bit zero words at initialization and reconnect; "
+                "not included in acquisition or owned pixel restore"
+            ),
             "standard_owned_pixel_count": staged_count,
             "standard_owned_pixel_raw_hex": f"0x{disabled_raw:08X}",
             "standard_owned_pixel_fields": dict(
@@ -1099,6 +1135,9 @@ class MGPDMeasurementBackend:
             (row, column): self._masked_pixel_word((column, row), raw)
             for (column, row), raw in self._current_pixel_configs.items()
         }
+        # WRITE_TO_CHIP transfers the complete UPO matrix. Recreate the zero
+        # half too, since its virtual memory may have changed across reconnect.
+        self._zeroed_matrix.set_owned_half(0x00000000)
         self.matrix.set_pixels(staged)
         if not self.matrix.write_to_chip():
             raise RuntimeError("failed to restore pixel matrix after UPO reconnect")
