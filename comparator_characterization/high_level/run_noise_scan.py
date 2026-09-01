@@ -16,7 +16,7 @@ def main() -> None:
     config.configure_runtime_logging()
     config.require_hardware_run_enabled()
     with config.build_upo_client() as client:
-        result = characterize_comparator(
+        result = config.run_characterization(
             client, config.threshold_calibration_files(),
             window=config.WINDOW, pixels=config.PIXELS,
             bad_pixel_map=config.BAD_PIXEL_MAP,
@@ -26,7 +26,7 @@ def main() -> None:
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
         )
     print(f"Пилотный noise scan завершен: {result.experiment_path}")
-    config.print_recommendation_paths(result.analysis_path)
+    config.print_result_paths(result)
 
 
 if __name__ == "__main__":

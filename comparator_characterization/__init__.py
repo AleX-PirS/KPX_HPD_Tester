@@ -51,9 +51,17 @@ from .workflow import (
     characterize_injection_crosstalk,
     interactive_exposure_pause,
 )
+from .sweep import (
+    ParameterSweepResult, SweepNoiseExposure, characterize_parameter_sweep,
+    interactive_noise_exposure_pause,
+)
 
 __all__ = [
     "AnalysisSettings",
+    "ParameterSweepResult",
+    "SweepNoiseExposure",
+    "characterize_parameter_sweep",
+    "interactive_noise_exposure_pause",
     "BadPixelMapInput",
     "CallableShotExecutor",
     "CROSSTALK_INJECTION_PATTERNS",

@@ -31,6 +31,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # Защита от случайного запуска реального стенда.
 ENABLE_HARDWARE_RUN = False
 
+# None/{}: один обычный тест. Иначе декартово произведение значений EO_cfg.
+# Например: {"DAC_CMP_BIAS_LSB": [200, 500], "DAC_CMP_VB5": [500, 1000]}.
+# Каждая комбинация получает свои raw, noise, S-curve, trim-карты и plots.
+EO_PARAMETER_GRID = None
+EO_OVERRIDES = None  # Необязательные фиксированные EO-параметры одиночного теста.
+RESUME_EXPERIMENT = None  # Папка одиночного эксперимента с metadata.json.
+RESUME_SWEEP = None  # Папка всей серии с sweep.json; grid/настройки не менять.
+
 # Соединение с УПО / MGPDLab.
 UPO_HOST = "127.0.0.1"
 UPO_PORT = 0xBEEB
@@ -46,7 +54,11 @@ ASIC_INITIALIZATION_FCLK_MHZ = 50
 # Генератор Keysight 81150A/81160A. None включает VISA-автопоиск.
 GENERATOR_VISA_ADDRESS: str | None = None
 GENERATOR_CHANNEL = 1
-SHUTTER_START_DELAY_S = 0.5
+SHUTTER_START_DELAY_S = 0.8
+# ВАЖНО: задержка от вызова GET_SHOT, НЕ от открытия shutter. В GET_SHOT
+# входит загрузка всей матрицы. Значение 0.8 с выбрано с запасом относительно
+# наблюдавшейся загрузки около 0.63 с. Это временная оценка, а не измеренный
+# сигнал shutter; окончательно проверьте взаимное положение SHUTTER/CTRL.
 POST_BURST_GUARD_S = 0.1
 
 # Окно и пиксели. Возможные окна: AB, BC, CD.
@@ -366,3 +378,30 @@ def build_burst_settings() -> KeysightBurstSettings:
         shutter_start_delay_s=SHUTTER_START_DELAY_S,
         post_burst_guard_s=POST_BURST_GUARD_S,
     )
+
+
+def run_characterization(client, calibration_files, **kwargs):
+    """Общий вход run_*.py: одиночный запуск либо возобновляемая EO-серия."""
+    from comparator_characterization import characterize_comparator, characterize_parameter_sweep
+    if EO_PARAMETER_GRID or RESUME_SWEEP is not None:
+        if RESUME_EXPERIMENT is not None or EO_OVERRIDES:
+            raise ValueError("Для EO-серии используйте только EO_PARAMETER_GRID и RESUME_SWEEP")
+        return characterize_parameter_sweep(
+            client, calibration_files, eo_parameter_grid=EO_PARAMETER_GRID,
+            resume_sweep=RESUME_SWEEP, **kwargs,
+        )
+    return characterize_comparator(
+        client, calibration_files, resume_experiment=RESUME_EXPERIMENT,
+        eo_overrides=EO_OVERRIDES, **kwargs,
+    )
+
+
+def print_result_paths(result):
+    if hasattr(result, "combinations"):
+        for entry in result.combinations:
+            print(f"EO {entry['eo_overrides']}: {entry['status']}")
+            if entry.get("analysis"):
+                print_recommendation_paths(result.experiment_path / entry["analysis"])
+        print(f"Сводка серии: {result.experiment_path / 'sweep_summary.csv'}")
+    else:
+        print_recommendation_paths(result.analysis_path)

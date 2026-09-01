@@ -154,6 +154,17 @@ def _finite_values(frame: pd.DataFrame, column: str) -> np.ndarray:
     return values[np.isfinite(values)]
 
 
+def _save_noise_zoom(figure, axis, data, directory, stem, settings):
+    """Additional view of ALL observed nonzero response, without changing fits."""
+    active = data[pd.to_numeric(data["mean_count"], errors="coerce") > 0]
+    x = _finite_values(active, "threshold_voltage_v")
+    if len(x) < 2 or x.max() <= x.min():
+        return []
+    margin = 0.08 * (x.max() - x.min())
+    axis.set_xlim(x.min() - margin, x.max() + margin)
+    return _save_figure(figure, directory, stem, settings)
+
+
 def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
     if column not in frame:
         return pd.Series(np.nan, index=frame.index, dtype=float)
@@ -339,10 +350,18 @@ def generate_recommendation_plots(directory: Path, settings: AnalysisSettings) -
             continue
         data["mask_candidate"] = data["mask_recommended"].astype(str).str.lower().isin(("true", "1")).astype(int)
         data["unresolved_trim"] = data["recommended_trim_code"].isna().astype(int)
+        data["review_required_map"] = data.get(
+            "review_required", pd.Series(False, index=data.index)
+        ).astype(str).str.lower().isin(("true", "1")).astype(int)
+        data["trim_range_limited_map"] = data.get(
+            "trim_range_limited", pd.Series(False, index=data.index)
+        ).astype(str).str.lower().isin(("true", "1")).astype(int)
         for field, stem, title, label in (
             ("recommended_trim_code", f"proposed_trim_{method}", f"{method}: proposed trim (requires verification)", "Proposed trim code"),
             ("mask_candidate", f"proposed_mask_{method}", f"{method}: masking candidates, NOT confirmed dead pixels", "1 = exclusion proposed; read CSV reasons"),
             ("unresolved_trim", f"unresolved_trim_{method}", f"{method}: unresolved trim settings", "1 = no defensible trim proposal"),
+            ("trim_range_limited_map", f"trim_range_limited_{method}", f"{method}: target outside measured trim range", "1 = trim range limited; NOT a dead-pixel claim"),
+            ("review_required_map", f"review_required_{method}", f"{method}: pixels requiring review", "1 = inspect reason_codes"),
         ):
             figure = _heatmap(data, value_column=field, title=title, colorbar_label=label)
             if figure is not None:
@@ -508,6 +527,42 @@ def generate_diagnostic_plots(
         axis.legend()
         outputs["threshold_distributions_log"] = _save_figure(
             figure, plot_directory, "threshold_distributions_log", settings
+        )
+
+        # A common x axis is useful for the physical trim displacement, but it
+        # visually hides the much narrower equalized population. Keep both
+        # views and give every measured stage an independent, data-driven scale.
+        displayed_stages = [
+            stage for stage in ("trim_00", "equalized_final", "trim_31", "baseline_noise")
+            if stage in available_distributions
+        ]
+        figure, axes = plt.subplots(
+            1,
+            len(displayed_stages),
+            figsize=(4.4 * len(displayed_stages), 4.5),
+            squeeze=False,
+        )
+        for axis, stage in zip(axes[0], displayed_stages):
+            values = available_distributions[stage]
+            stage_bins = np.histogram_bin_edges(values, bins="auto")
+            if len(stage_bins) < 21 and float(np.max(values)) > float(np.min(values)):
+                stage_bins = np.linspace(
+                    float(np.min(values)), float(np.max(values)), 21
+                )
+            label, color = stage_styles[stage]
+            axis.hist(values, bins=stage_bins, color=color, alpha=0.55, edgecolor=color)
+            median = float(np.median(values))
+            mad = float(np.median(np.abs(values - median)))
+            std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+            axis.axvline(median, color="black", linestyle="--", linewidth=1.0)
+            axis.set_title(f"{label}\nstd={1000 * std:.2f} mV, MAD={1000 * mad:.2f} mV")
+            axis.set_xlabel("Effective threshold, V")
+            axis.set_ylabel("Pixel count")
+        outputs["threshold_distributions_individual_scale"] = _save_figure(
+            figure,
+            plot_directory,
+            "threshold_distributions_individual_scale",
+            settings,
         )
 
         # Compare the same physical pixels, so missing endpoints cannot mimic
@@ -759,6 +814,11 @@ def generate_diagnostic_plots(
         outputs["noise_matrix_curves"] = _save_figure(
             figure, plot_directory, "noise_matrix_curves", settings
         )
+        zoom = _save_noise_zoom(figure, axis, noise_statistics[
+            noise_statistics["stage"].isin(matrix_curve_stages)],
+            plot_directory, "noise_matrix_curves_zoom", settings)
+        if zoom:
+            outputs["noise_matrix_curves_zoom"] = zoom
 
     if not trim_characterization_summary.empty:
         summary = trim_characterization_summary.sort_values("trim_code")
@@ -1096,6 +1156,20 @@ def generate_diagnostic_plots(
                 axis.legend(ncol=2)
                 stem = f"pixel_C{column:02d}_R{row:02d}_noise_before_after"
                 outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
+                zoom = _save_noise_zoom(
+                    figure,
+                    axis,
+                    noise_statistics[
+                        (noise_statistics["column"] == column)
+                        & (noise_statistics["row"] == row)
+                        & noise_statistics["stage"].isin(stage_styles)
+                    ],
+                    plot_directory,
+                    stem + "_zoom",
+                    settings,
+                )
+                if zoom:
+                    outputs[stem + "_zoom"] = zoom
             else:
                 plt.close(figure)
 

@@ -18,7 +18,7 @@ def main() -> None:
     config.require_hardware_run_enabled()
     settings = config.build_settings()
     with config.build_generator() as generator, config.build_upo_client() as client:
-        result = characterize_comparator(
+        result = config.run_characterization(
             client,
             config.threshold_calibration_files(),
             window=config.WINDOW,
@@ -39,7 +39,7 @@ def main() -> None:
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
         )
     print(f"Полная характеризация завершена: {result.experiment_path}")
-    config.print_recommendation_paths(result.analysis_path)
+    config.print_result_paths(result)
 
 
 if __name__ == "__main__":

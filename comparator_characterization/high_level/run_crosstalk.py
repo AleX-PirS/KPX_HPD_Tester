@@ -16,6 +16,11 @@ from comparator_characterization.high_level import characterization_config as co
 def main() -> None:
     config.configure_runtime_logging()
     config.require_hardware_run_enabled()
+    if config.EO_PARAMETER_GRID or config.RESUME_SWEEP is not None:
+        raise ValueError(
+            "run_crosstalk.py использует одну noise reference и поэтому не запускает "
+            "EO-серию. Для каждой EO-комбинации сначала нужен собственный noise scan."
+        )
     settings = config.build_settings(
         injection_patterns=("all", "tile_2x2", "tile_4x4", "tile_8x8")
     )
@@ -37,6 +42,8 @@ def main() -> None:
             keysight_generator=generator,
             keysight_burst_settings=config.build_burst_settings(),
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
+            eo_overrides=config.EO_OVERRIDES,
+            resume_experiment=config.RESUME_EXPERIMENT,
         )
     print(f"Тест наводок завершен: {result.experiment_path}")
     config.print_recommendation_paths(result.analysis_path)

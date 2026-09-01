@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -44,6 +45,7 @@ from .pixel_masks import (
     normalize_bad_pixel_map,
 )
 from .recommendations import save_noise_recommendations
+from .parameters import validate_eo_overrides
 from .measurement import run_noise_scan as acquire_noise_scan, run_scurve_points
 from .models import (
     CharacterizationSettings,
@@ -610,6 +612,7 @@ def characterize_comparator(
     resume_experiment: str | Path | None = None,
     additional_metadata: Mapping[str, Any] | None = None,
     initialization_fclk_mhz: int = STANDARD_CHARACTERIZATION_FCLK_MHZ,
+    eo_overrides: Mapping[str, int] | None = None,
 ) -> CharacterizationResult:
     """Characterize one AB, BC or CD counting window.
 
@@ -624,6 +627,7 @@ def characterize_comparator(
     experiment through ``noise_reference_experiment``.
     """
 
+    eo_overrides = validate_eo_overrides(eo_overrides, run_scurve=run_scurve)
     selected_settings = (
         copy.deepcopy(settings) if settings is not None else CharacterizationSettings()
     )
@@ -795,8 +799,35 @@ def characterize_comparator(
             "calibration_direction": upper_calibration.direction,
         }
 
+    # Reject an incompatible external noise reference before creating a new
+    # experiment or sending any command to UPO. The complete raw-data check and
+    # immutable copy still happen later, once the destination store exists.
+    if noise_reference_experiment is not None:
+        reference_preflight = ExperimentStore(noise_reference_experiment).metadata
+        if reference_preflight.get("eo_overrides", {}) != eo_overrides:
+            raise ValueError(
+                "noise reference EO overrides differ; each EO combination needs its own noise scan"
+            )
+        if reference_preflight.get("window") != spec.name:
+            raise ValueError("noise-reference window does not match the S-curve window")
+        reference_pixels = {
+            (int(item["column"]), int(item["row"]))
+            for item in reference_preflight.get("pixel_selection", [])
+        }
+        if not set(selected_pixels).issubset(reference_pixels):
+            raise ValueError("noise reference does not cover every selected pixel")
+        reference_curve = reference_preflight.get(
+            "threshold_dac_calibrations", {}
+        ).get(spec.threshold_dac, {})
+        if reference_curve.get("curve_sha256") != threshold_calibration.to_metadata()[
+            "curve_sha256"
+        ]:
+            raise ValueError("noise-reference threshold-DAC calibration curve differs")
+
     if resume_experiment is not None:
         store = ExperimentStore(resume_experiment)
+        if store.metadata.get("eo_overrides", {}) != eo_overrides:
+            raise ValueError("resume EO overrides differ from the original experiment")
         if store.metadata.get("window") != spec.name:
             raise ValueError("resume experiment window does not match requested window")
         stored_pixels = {
@@ -936,6 +967,7 @@ def characterize_comparator(
         }
         # Safety/reproducibility fields cannot be replaced by descriptive extras.
         metadata["bad_pixel_mask"] = bad_pixel_document(bad_pixels)
+        metadata["eo_overrides"] = eo_overrides
         metadata["pixel_selection"] = [
             {"column": c, "row": r} for c, r in selected_pixels
         ]
@@ -968,6 +1000,7 @@ def characterize_comparator(
         initialization_record = backend.initialize_standard_configuration(
             selected_pixels,
             fclk_mhz=initialization_fclk_mhz,
+            eo_overrides=eo_overrides,
             progress_callback=lambda message, percent: store.log_status(
                 message,
                 stage_percent=percent,
@@ -988,9 +1021,18 @@ def characterize_comparator(
         store.update_metadata(
             asic_initialization_history=initialization_history,
             initial_asic_configuration=initialized_snapshot,
+            acquisition_sequence={
+                "version": 2, "upo_execution": "calling_thread_only",
+                "pixel_commit": "GET_SHOT_only; cleanup_stages_PX_for_next_shot",
+                "ctrl_execution": "generator_only_worker",
+                "burst_settings": (dict(vars(shot_executor.settings))
+                    if isinstance(shot_executor, KeysightBurstShotExecutor) else None),
+                "shutter_open_observed": False,
+            },
         )
         store.log_status(
-            "Стандартная конфигурация ASIC и PX установлена",
+            "Global-конфигурация установлена, все PX подготовлены в кеше УПО; "
+            "единственная загрузка матрицы в чип выполняется внутри GET_SHOT",
             overall_percent_estimate=3.0,
         )
 
@@ -1487,7 +1529,9 @@ def characterize_comparator(
             )
             completed_scurve_groups = 0
             store.log_status(
-                f"Начинается S-curve: групп инжекции {total_scurve_groups}",
+                f"Начинается S-curve: групп инжекции {total_scurve_groups}. "
+                "УПО обслуживается только вызывающим потоком: GET_SHOT полностью "
+                "завершается до GET_PIXEL; фоновый поток управляет только CTRL",
                 overall_percent_estimate=scurve_progress_start,
             )
             if store.load_raw("noise").empty:
@@ -1703,23 +1747,34 @@ def characterize_comparator(
                             ),
                         )
             finally:
+                original_error = sys.exc_info()[1]
                 try:
                     if isinstance(shot_executor, KeysightBurstShotExecutor):
                         shot_executor.return_to_idle()
+                except Exception as cleanup_error:
+                    store.record_error({"scope": "generator_cleanup", "error": str(cleanup_error)})
+                    if original_error is None:
+                        raise
                 finally:
                     if (
-                        not isinstance(shot_executor, KeysightBurstShotExecutor)
-                        or not shot_executor.upo_command_in_flight
+                        original_error is None
+                        and backend.safe_for_pixel_cleanup
+                        and (not isinstance(shot_executor, KeysightBurstShotExecutor)
+                             or not shot_executor.upo_command_in_flight)
                     ):
                         backend.restore_pixel_configs(pixel_snapshot)
+                        store.update_metadata(pixel_cleanup={
+                            "staged_in_upo": True, "committed_to_chip": False,
+                            "note": "next GET_SHOT commits staged pixels; CTRL output disabled",
+                        })
                     else:
                         store.record_error(
                             {
                                 "timestamp_utc": utc_now_text(),
                                 "scope": "scurve_cleanup",
                                 "error": (
-                                    "pixel configuration restoration was skipped because "
-                                    "the GET_SHOT worker still owns the UPO connection"
+                                    "pixel restoration skipped after failed/cancelled acquisition; "
+                                    "no cleanup commands are sent to uncertain UPO state"
                                 ),
                                 "error_type": "UnsafeUpoCleanupPrevented",
                             }

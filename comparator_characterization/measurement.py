@@ -287,6 +287,13 @@ def _acquire_point(
         store.write_acquisition(descriptor, rows)
     except BaseException as error:
         store.record_failed_acquisition(descriptor, error)
+        store.record_error({
+            "timestamp_utc": utc_now_text(), "scope": "acquisition_transport_context",
+            "descriptor": dict(descriptor),
+            "error_type": type(error).__name__, "error": str(error),
+            "last_upo_command": getattr(backend.client, "last_command_trace", {}),
+            "pixel_cleanup_safe": backend.safe_for_pixel_cleanup,
+        })
         raise
     valid_samples = [
         sample for sample in samples if bool(sample.get("measurement_valid", False))

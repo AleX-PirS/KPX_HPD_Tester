@@ -14,6 +14,7 @@ python -m comparator_characterization.high_level.run_noise_equalization
 python -m comparator_characterization.high_level.run_full_trim_sweep
 python -m comparator_characterization.high_level.run_scurve
 python -m comparator_characterization.high_level.run_full_characterization
+python -m comparator_characterization.high_level.run_eo_parameter_sweep
 python -m comparator_characterization.high_level.run_crosstalk
 python -m comparator_characterization.high_level.plot_characterization results/EXPERIMENT
 ```
@@ -40,6 +41,12 @@ python comparator_characterization/high_level/run_scurve.py
 измерениях. `PX_MASK=0` отключает цифровой счет, поэтому скрипт включает
 `PX_MASK=1` только для выбранных тестом пикселей, кроме `BAD_PIXEL_MAP`.
 Исключенные пиксели всегда имеют `MASK=0, TST_EN=0`, включая reconnect и cleanup.
+PX сначала полностью ставятся в виртуальную память УПО. Отдельный
+`WRITE_TO_CHIP` перед съемом не вызывается: единственную загрузку матрицы в ASIC
+делает `GET_SHOT` в своей фазе `Load settings`. Сам `GET_SHOT` выполняется в
+основном потоке и полностью завершается до первого `GET_PIXEL`; параллельный
+поток управляет только `*TRG` генератора. Во время теста не нажимайте команды в
+отдельном GUI УПО, поскольку межпроцессную конкуренцию Python заблокировать не может.
 
 Для AB свипируется B, A устанавливается на верхнюю границу по LUT,
 C и D получают код 1023. Аналогично для BC компараторы вне окна A/D получают
@@ -55,6 +62,30 @@ NOISE_COARSE_STOP = 900
 NOISE_COARSE_STEP = 4
 BAD_PIXEL_MAP = [(16, 0), (20, 5)]  # либо путь CSV/JSON, либо None
 ```
+
+Серия по параметрам EO_CFG задается декартовым произведением:
+
+```python
+EO_PARAMETER_GRID = {
+    "DAC_CMP_BIAS_LSB": [200, 500],
+    "DAC_CMP_VB5": [500, 1000],
+}
+EO_OVERRIDES = None
+RESUME_SWEEP = None
+```
+
+Это четыре последовательных независимых эксперимента в папках
+`DAC_CMP_BIAS_LSB=.../DAC_CMP_VB5=...`, у каждого свои raw, графики и
+рекомендации. После сбоя укажите корневую папку серии в `RESUME_SWEEP`, не меняя
+grid и остальные входы. Завершенные комбинации будут проверены и пропущены,
+незавершенная продолжится с сохраненных acquisition. Для одного набора вместо
+grid используйте `EO_OVERRIDES`. Пороговые ЦАП и REF, которыми владеет внутренний
+scan, а также OMR/ICR/DCR через этот интерфейс свипировать нельзя.
+
+Для CTRL стандартная задержка от вызова `GET_SHOT` равна 0.8 с. Она увеличена
+по присланному логу, где `Load settings` занимал около 0.63 с. Физическое начало
+shutter скрипт не видит, поэтому экспозицию 1 с и эту задержку нужно подтвердить
+осциллографом; это не универсальная измеренная синхронизация.
 
 Не исключайте пиксели только из-за одного нулевого endpoint или неудачного fit.
 В конце печатаются пути к `trim_recommendations_fit/centroid/maximum.csv` и

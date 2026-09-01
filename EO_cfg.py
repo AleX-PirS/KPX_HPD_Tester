@@ -323,11 +323,11 @@ DEFAULT_FIELD_VALUES = {
     "DAC_SH_VC4_TR": 3,
 
     # Comparators
-    "DAC_CMP_BIAS_LSB": 512,
+    "DAC_CMP_BIAS_LSB": 400,
     "DAC_CMP_BIAS_LSB_TR": 3,
     "DAC_CMP_VB5": 800,
     "DAC_CMP_VB5_TR": 3,
-    "DAC_CMP_VC5": 600,
+    "DAC_CMP_VC5": 520,
     "DAC_CMP_VC5_TR": 3,
     "DAC_CMP_A": 850,
     "DAC_CMP_A_TR": 3,

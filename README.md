@@ -259,6 +259,12 @@ S-кривых, сравнения режимов инжекции и повто
 `PX_MASK=1` только у выбранных тестом пикселей. Консольный статус дублируется в
 `experiment.log`; transient timeout УПО вызывает ограниченное переподключение,
 а noise scan умеет завершать пустой хвост после уже найденной активной области.
+PX-команды сначала ставят полную матрицу в кеш УПО; отдельный `WRITE_TO_CHIP`
+перед acquisition не используется, поскольку сам `GET_SHOT` начинает работу с
+`Load settings`. В S-curve `GET_SHOT` остается в вызывающем потоке и полностью
+возвращается до `GET_PIXEL`; рабочий поток управляет только генератором CTRL.
+Для серий по логическим EO-полям предусмотрены декартов grid, отдельные каталоги
+каждой комбинации и возобновление всей серии.
 MGPDLab documents `GET_SHOT` itself as beginning with its own "Load settings"
 operation, so its stored UPO/GUI OMR settings should be kept consistent with any
 Python pre-configuration.

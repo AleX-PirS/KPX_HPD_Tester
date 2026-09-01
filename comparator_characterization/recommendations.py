@@ -186,7 +186,7 @@ def propose_noise_trim_maps(
                 "verified_in_equalized_final": False,
                 "usable_trim_setting_count": int(usable["local_trim_code"].nunique()) if not usable.empty else 0,
                 "permanent_bad_pixel": always_bad, "mask_recommended": mask_candidate,
-                "review_required": False,
+                "trim_range_limited": False, "review_required": False,
             }
             if always_bad:
                 reasons.append("user_permanent_bad_pixel")
@@ -219,7 +219,10 @@ def propose_noise_trim_maps(
                         target_reachable=reachable, verified_in_equalized_final=verified,
                     )
                     if not reachable:
-                        record["mask_recommended"] = True
+                        # A healthy responding pixel can simply have insufficient
+                        # trim range. Keep it enabled and expose this as a separate
+                        # review class instead of calling it a dead-pixel candidate.
+                        record["trim_range_limited"] = True
                         reasons.append("target_outside_measured_trim_reach_not_a_dead_pixel_claim")
                     if source.startswith("linear"):
                         reasons.append("verify_prediction_with_local_trim_scan")

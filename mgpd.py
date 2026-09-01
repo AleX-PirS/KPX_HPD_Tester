@@ -1,6 +1,8 @@
 import logging
 import socket
+import threading
 import time
+from functools import wraps
 
 logger = logging.getLogger(__name__)
 
@@ -8,6 +10,15 @@ logger = logging.getLogger(__name__)
 # immediately before issuing GET_SHOT and MGPDLab/UPO settings are trusted.
 # It can be overridden per client instance or per get_shot() call.
 CONFIGURE_OMR_BEFORE_GET_SHOT_DEFAULT = False
+
+
+def _serialized(method):
+    """One request/reply owner, including reconnect and socket shutdown."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._io_lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class MGPDClient:
@@ -96,6 +107,8 @@ class MGPDClient:
         self.reconnect_attempts = reconnect_attempts
         self.reconnect_backoff_s = float(reconnect_backoff_s)
         self.trace_callback = trace_callback
+        self._io_lock = threading.RLock()
+        self.last_command_trace = {}
         self._socket: socket.socket | None = None
         self._connected = False
         self._connect_in_progress = False
@@ -104,6 +117,7 @@ class MGPDClient:
     def connected(self) -> bool:
         return self._connected
 
+    @_serialized
     def connect(self):
         """Установить TCP-соединение с MGPDLab."""
         if self._connected:
@@ -140,6 +154,7 @@ class MGPDClient:
 
         return self
 
+    @_serialized
     def disconnect(self):
         """Закрыть TCP-соединение."""
         if self._socket is not None:
@@ -149,6 +164,7 @@ class MGPDClient:
         self._connected = False
         logger.info("Disconnected")
 
+    @_serialized
     def reconnect(self) -> int:
         """Reconnect to MGPDLab with bounded exponential backoff.
 
@@ -186,6 +202,7 @@ class MGPDClient:
             f"MGPDLab reconnect failed after {self.reconnect_attempts} attempt(s)"
         ) from last_error
 
+    @_serialized
     def _send_command(self, cmd: bytes, *, retry_safe: bool = True) -> bytes:
         """Отправить одну команду и вернуть ответ MGPDLab."""
         retry_count = 0
@@ -193,6 +210,12 @@ class MGPDClient:
             if not self._connected or self._socket is None:
                 raise RuntimeError("Not connected. Call connect() first.")
             try:
+                started = time.monotonic()
+                self.last_command_trace = {
+                    "command": cmd.decode("ascii", errors="replace").strip(),
+                    "thread_name": threading.current_thread().name,
+                    "status": "awaiting_reply",
+                }
                 if self.trace_callback is not None:
                     self.trace_callback(
                         "TX", cmd.decode("ascii", errors="replace").strip()
@@ -203,13 +226,23 @@ class MGPDClient:
                     raise ConnectionError("MGPDLab closed the TCP connection")
                 if self.trace_callback is not None:
                     self.trace_callback("RX", self._decode_response(response))
+                self.last_command_trace.update(
+                    status="reply_received", response=self._decode_response(response),
+                    elapsed_s=time.monotonic() - started,
+                )
                 return response
             except (OSError, TimeoutError, ConnectionError) as error:
+                self.last_command_trace.update(
+                    status="transport_error", error=str(error),
+                    elapsed_s=time.monotonic() - started,
+                )
                 if (
                     not retry_safe
                     or self._connect_in_progress
                     or retry_count >= self.reconnect_attempts
                 ):
+                    # A late reply must never be consumed by a later command.
+                    self.disconnect()
                     raise
                 retry_count += 1
                 logger.warning(
@@ -220,6 +253,10 @@ class MGPDClient:
                     error,
                 )
                 self.reconnect()
+            except BaseException:
+                # Cancellation can interrupt recv while UPO still owns a shot.
+                self.disconnect()
+                raise
 
     @staticmethod
     def _decode_response(response: bytes) -> str:
@@ -600,6 +637,7 @@ class MGPDClient:
             return False
         return True
 
+    @_serialized
     def get_shot(
         self,
         *,

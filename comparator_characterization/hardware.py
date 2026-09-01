@@ -29,6 +29,23 @@ from .pixel_masks import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_blocking_shot_elapsed(request: ShotRequest, elapsed_s: float) -> None:
+    """Fail closed if UPO returns implausibly before the declared exposure."""
+
+    expected = request.shutter_duration_s
+    if expected is None or expected < 0.05:
+        return
+    # GET_SHOT also performs configuration and matrix readout, so its wall time
+    # should not be shorter than the manually configured exposure. A 10% margin
+    # avoids turning timer granularity into a false hardware failure.
+    if elapsed_s < 0.90 * expected:
+        raise RuntimeError(
+            "GET_SHOT returned implausibly early: "
+            f"elapsed={elapsed_s:.6g} s, declared UPO exposure={expected:.6g} s; "
+            "GET_PIXEL is blocked"
+        )
+
+
 @dataclass(frozen=True)
 class ShotRequest:
     """One complete counter acquisition requested from the stand."""
@@ -78,20 +95,30 @@ class MGPDGetShotExecutor:
                 "The existing project has no API that injects an exact number of test pulses "
                 "during a shutter. Supply a verified ShotExecutor for S-curve acquisition."
             )
-        if not client.get_shot(
+        started = time.monotonic()
+        shot_ok = client.get_shot(
             configure_omr=request.configure_get_shot_omr,
             mode_cnt=0 if request.counter_mode_bits == 16 else 1,
             mode_read=request.mode_read,
             crw_mode=request.crw_mode,
-        ):
+        )
+        elapsed = time.monotonic() - started
+        if not shot_ok:
             raise RuntimeError("MGPDLab GET_SHOT failed")
+        _validate_blocking_shot_elapsed(request, elapsed)
         return ShotExecutionResult(
             requested_injections=request.n_injections,
             programmed_injections=0,
             actual_injections=0,
             injections_for_analysis=0,
             injection_count_source="no_test_pulses",
-            details={"executor": type(self).__name__},
+            details={
+                "executor": type(self).__name__,
+                "get_shot_elapsed_s": elapsed,
+                "get_shot_minimum_elapsed_check": (
+                    "at_least_90_percent_of_declared_exposure_when_exposure_at_least_50ms"
+                ),
+            },
         )
 
 
@@ -137,7 +164,7 @@ class KeysightBurstSettings:
     low_level_v: float = 0.0
     high_level_v: float = 3.3
     load_ohm: float = 1_000_000.0
-    shutter_start_delay_s: float = 0.5
+    shutter_start_delay_s: float = 0.8
     post_burst_guard_s: float = 0.1
     get_shot_timeout_margin_s: float = 2.0
 
@@ -177,9 +204,9 @@ class KeysightBurstGenerator(Protocol):
 
 
 class KeysightBurstShotExecutor:
-    """Run blocking UPO ``GET_SHOT`` around a software-triggered burst.
+    """Run UPO synchronously; a worker controls ONLY the external generator.
 
-    The main thread sends no UPO command while the worker is inside GET_SHOT.
+    The delay is measured from GET_SHOT invocation, not observed shutter-open.
     Generator queryback proves the programmed number of periods but is not an
     independent physical edge counter. Raw data preserve this distinction.
     """
@@ -194,16 +221,13 @@ class KeysightBurstShotExecutor:
         self.settings.validate()
         self._prepared_cycles: int | None = None
         self._preparation: dict[str, Any] = {}
-        self._active_get_shot_thread: threading.Thread | None = None
+        self._get_shot_in_flight = False
+        self._active_trigger_thread: threading.Thread | None = None
 
     @property
     def upo_command_in_flight(self) -> bool:
-        """Whether the worker is still inside the blocking UPO ``GET_SHOT``."""
-
-        return bool(
-            self._active_get_shot_thread is not None
-            and self._active_get_shot_thread.is_alive()
-        )
+        """Whether the calling thread is inside blocking UPO GET_SHOT."""
+        return self._get_shot_in_flight
 
     @staticmethod
     def _utc_now() -> str:
@@ -264,7 +288,8 @@ class KeysightBurstShotExecutor:
 
     def return_to_idle(self) -> None:
         """Disable the CTRL output after GET_SHOT has completed."""
-
+        if self._active_trigger_thread is not None and self._active_trigger_thread.is_alive():
+            raise RuntimeError("CTRL worker still owns the generator; cleanup deferred")
         self.generator.disable_channel(self.settings.channel)
         self._prepared_cycles = None
         self._preparation = {}
@@ -281,6 +306,11 @@ class KeysightBurstShotExecutor:
         )
 
     def execute(self, client: MGPDClient, request: ShotRequest) -> ShotExecutionResult:
+        if self._get_shot_in_flight or (
+            self._active_trigger_thread is not None
+            and self._active_trigger_thread.is_alive()
+        ):
+            raise RuntimeError("previous shot/CTRL worker has not finished")
         if request.configure_get_shot_omr:
             if not client.configure_get_shot_omr(
                 mode_cnt=0 if request.counter_mode_bits == 16 else 1,
@@ -297,8 +327,15 @@ class KeysightBurstShotExecutor:
                 # then re-enable the already armed burst only after GET_SHOT has
                 # returned and before the subsequent signal acquisition.
                 self.generator.disable_channel(self.settings.channel)
-            if not self._get_shot(client, request):
-                raise RuntimeError("MGPDLab GET_SHOT failed")
+            self._get_shot_in_flight = True
+            background_started = time.monotonic()
+            try:
+                if not self._get_shot(client, request):
+                    raise RuntimeError("MGPDLab GET_SHOT failed")
+            finally:
+                background_elapsed = time.monotonic() - background_started
+                self._get_shot_in_flight = False
+            _validate_blocking_shot_elapsed(request, background_elapsed)
             if generator_was_prepared:
                 self.generator.enable_channel(self.settings.channel)
             return ShotExecutionResult(
@@ -312,6 +349,10 @@ class KeysightBurstShotExecutor:
                     "generator_prepared_for_signal": generator_was_prepared,
                     "generator_output_disabled_during_background": (
                         generator_was_prepared
+                    ),
+                    "get_shot_elapsed_s": background_elapsed,
+                    "get_shot_minimum_elapsed_check": (
+                        "at_least_90_percent_of_declared_exposure_when_exposure_at_least_50ms"
                     ),
                     **self._preparation,
                 },
@@ -346,74 +387,53 @@ class KeysightBurstShotExecutor:
             )
 
         state: dict[str, Any] = {}
+        cancelled = threading.Event()
         started = threading.Event()
 
-        def worker() -> None:
-            state["get_shot_call_utc"] = self._utc_now()
-            state["get_shot_call_monotonic_s"] = time.monotonic()
-            started.set()
+        def trigger_worker() -> None:
+            # No client, register, pixel or reconnect calls in this worker.
             try:
-                state["get_shot_ok"] = self._get_shot(client, request)
+                started.wait()
+                if cancelled.wait(self.settings.shutter_start_delay_s):
+                    return
+                state["software_trigger_utc"] = self._utc_now()
+                state["trigger_monotonic_s"] = time.monotonic()
+                self.generator.software_trigger()
+                time.sleep(burst_duration_s + self.settings.post_burst_guard_s)
             except BaseException as error:
-                state["get_shot_error"] = error
-            finally:
-                state["get_shot_return_utc"] = self._utc_now()
-                state["get_shot_return_monotonic_s"] = time.monotonic()
+                state["trigger_error"] = error
 
-        thread = threading.Thread(target=worker, name="mgpd-get-shot", daemon=True)
-        self._active_get_shot_thread = thread
+        thread = threading.Thread(target=trigger_worker, name="ctrl-burst", daemon=True)
+        self._active_trigger_thread = thread
         thread.start()
+        start_monotonic = time.monotonic()
+        call_utc = self._utc_now()
+        self._get_shot_in_flight = True
         try:
-            if not started.wait(timeout=1.0):
-                raise RuntimeError("GET_SHOT worker did not start")
-            time.sleep(self.settings.shutter_start_delay_s)
-            if not thread.is_alive():
-                error = state.get("get_shot_error")
-                if error is not None:
-                    raise RuntimeError("GET_SHOT failed before CTRL burst") from error
-                raise RuntimeError(
-                    "GET_SHOT returned before the configured CTRL start delay"
-                )
-
-            trigger_utc = self._utc_now()
-            trigger_monotonic = time.monotonic()
-            self.generator.software_trigger()
-            time.sleep(burst_duration_s + self.settings.post_burst_guard_s)
-            returned_at = state.get("get_shot_return_monotonic_s")
-            if returned_at is not None and float(returned_at) < (
-                trigger_monotonic + burst_duration_s
-            ):
-                raise RuntimeError(
-                    "GET_SHOT exposure ended before the CTRL burst completed"
-                )
+            started.set()
+            # This is the SAME thread that stages PX and later calls GET_PIXEL.
+            shot_ok = self._get_shot(client, request)
         finally:
-            # Even if *TRG or a sleep is interrupted, do not let the caller send
-            # another UPO command while GET_SHOT still owns the connection. The
-            # client socket timeout bounds this wait under normal failure modes.
-            start_monotonic = float(
-                state.get("get_shot_call_monotonic_s", time.monotonic())
-            )
-            worker_budget_s = max(
-                float(client.timeout) + self.settings.get_shot_timeout_margin_s,
-                request.shutter_duration_s
-                + self.settings.get_shot_timeout_margin_s,
-            )
-            deadline = start_monotonic + worker_budget_s
-            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            return_monotonic = time.monotonic()
+            return_utc = self._utc_now()
+            self._get_shot_in_flight = False
+            cancelled.set()
+            thread.join(timeout=float(client.timeout) + self.settings.get_shot_timeout_margin_s)
             if not thread.is_alive():
-                self._active_get_shot_thread = None
+                self._active_trigger_thread = None
 
         if thread.is_alive():
-            raise TimeoutError(
-                "GET_SHOT worker is still active after the UPO socket-timeout budget; "
-                "no further UPO command is safe until that worker exits"
-            )
-        if "get_shot_error" in state:
-            raise RuntimeError("MGPDLab GET_SHOT raised an exception") from state[
-                "get_shot_error"
-            ]
-        if not state.get("get_shot_ok"):
+            raise RuntimeError("CTRL worker did not finish; no new acquisition is safe")
+        if not shot_ok:
             raise RuntimeError("MGPDLab GET_SHOT failed")
+        elapsed = return_monotonic - start_monotonic
+        _validate_blocking_shot_elapsed(request, elapsed)
+        if "trigger_error" in state:
+            raise RuntimeError("CTRL trigger failed after waiting for GET_SHOT") from state["trigger_error"]
+        if "trigger_monotonic_s" not in state:
+            raise RuntimeError("GET_SHOT returned before the configured CTRL start delay")
+        if return_monotonic < state["trigger_monotonic_s"] + burst_duration_s:
+            raise RuntimeError("GET_SHOT returned before the CTRL burst completed")
 
         return ShotExecutionResult(
             requested_injections=cycles,
@@ -431,11 +451,16 @@ class KeysightBurstShotExecutor:
                 "shutter_start_delay_s": self.settings.shutter_start_delay_s,
                 "burst_duration_s": burst_duration_s,
                 "post_burst_guard_s": self.settings.post_burst_guard_s,
-                "get_shot_call_utc": state["get_shot_call_utc"],
-                "software_trigger_utc": trigger_utc,
-                "get_shot_return_utc": state["get_shot_return_utc"],
-                "get_shot_elapsed_s": float(state["get_shot_return_monotonic_s"])
-                - start_monotonic,
+                "get_shot_call_utc": call_utc,
+                "software_trigger_utc": state["software_trigger_utc"],
+                "get_shot_return_utc": return_utc,
+                "get_shot_elapsed_s": elapsed,
+                "get_shot_minimum_elapsed_check": (
+                    "at_least_90_percent_of_declared_exposure_when_exposure_at_least_50ms"
+                ),
+                "upo_thread": threading.current_thread().name,
+                "delay_origin": "GET_SHOT_invocation_not_shutter_open",
+                "burst_inside_shutter_physically_verified": False,
             },
         )
 
@@ -560,6 +585,7 @@ class MGPDMeasurementBackend:
         self._decoder = LFSRDecoder(noise_settings.counter_mode_bits)
         self._initialization_fclk_mhz = STANDARD_CHARACTERIZATION_FCLK_MHZ
         self._standard_initialization_complete = False
+        self._upo_state_uncertain = False
         self._global_field_state: dict[str, int] = {}
 
     def initialize_standard_configuration(
@@ -568,6 +594,7 @@ class MGPDMeasurementBackend:
         *,
         fclk_mhz: int = STANDARD_CHARACTERIZATION_FCLK_MHZ,
         progress_callback: Callable[[str, float], None] | None = None,
+        eo_overrides: Mapping[str, int] | None = None,
     ) -> dict[str, Any]:
         """Establish the reproducible global and pixel state before a test.
 
@@ -582,6 +609,11 @@ class MGPDMeasurementBackend:
             if progress_callback is not None:
                 progress_callback(message, percent)
 
+        # Validate the complete logical EO request before the first hardware
+        # command. Direct users of the backend therefore get the same fail-fast
+        # guarantee as the public workflow.
+        from .parameters import validate_eo_overrides
+        overrides = validate_eo_overrides(eo_overrides, run_scurve=False)
         self.validate_pixels(pixels)
         report("Инициализация ASIC: установка FCLK", 0.0)
         if not self.client.set_fclk(int(fclk_mhz)):
@@ -608,6 +640,12 @@ class MGPDMeasurementBackend:
                 f"0x{first_address:04X}: expected 0x{values['expected']:02X}, "
                 f"read 0x{values['readback']:02X}"
             )
+
+        for name, value in overrides.items():
+            if not self.cfg.set_data(name, value) or self.cfg.get_data(name) != value:
+                raise RuntimeError(f"EO override write/readback failed: {name}={value}")
+        if overrides:
+            report("EO параметры: " + ", ".join(f"{k}={v}" for k, v in overrides.items()), 25.0)
 
         disabled_configs = build_standard_characterization_pixel_configs(
             digital_counting_enabled=False
@@ -648,10 +686,8 @@ class MGPDMeasurementBackend:
             disabled_raw,
             progress_callback=report_disabled,
         )
-        if not self.matrix.write_to_chip():
-            raise RuntimeError(
-                "SET_PIXEL_CFG WRITE_TO_CHIP failed for standard disabled matrix"
-            )
+        # GET_SHOT commits the staged full matrix. A separate WRITE_TO_CHIP
+        # acknowledges acceptance only and could overlap UPO's next operation.
         self._current_pixel_configs = dict(disabled_configs)
 
         selected_baseline = {
@@ -680,6 +716,7 @@ class MGPDMeasurementBackend:
         self._global_field_state = {
             name: int(value) for name, value in EO_cfg.DEFAULT_FIELD_VALUES.items()
         }
+        self._global_field_state.update(overrides)
         self._standard_initialization_complete = True
 
         return {
@@ -687,6 +724,8 @@ class MGPDMeasurementBackend:
             "fclk_acknowledged_no_readback_command": True,
             "global_configuration_source": "EO_cfg.DEFAULT_REGISTERS",
             "global_logical_defaults": dict(EO_cfg.DEFAULT_FIELD_VALUES),
+            "eo_overrides": overrides,
+            "eo_override_readback_verified": True,
             "global_register_count": len(EO_cfg.DEFAULT_REGISTERS),
             "global_register_readback_verified": True,
             "zeroed_unowned_pixel_count": zeroed_count,
@@ -707,6 +746,7 @@ class MGPDMeasurementBackend:
             ),
             "selected_test_pixel_count": len(selected_baseline),
             "selected_test_pixels_loaded_after_standard_disable": True,
+            "pixel_commit_policy": "stage_only_until_GET_SHOT",
             "selected_test_pixel_mask_policy": (
                 "PX_MASK=1 for selected good pixels, 0 for bad pixels; PX_TST_EN=0"
             ),
@@ -844,8 +884,6 @@ class MGPDMeasurementBackend:
             staged[(row, column)] = updated_raw
 
         self.matrix.set_pixels(staged)
-        if not self.matrix.write_to_chip():
-            raise RuntimeError("SET_PIXEL_CFG WRITE_TO_CHIP failed after staging trim map")
 
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
@@ -876,6 +914,7 @@ class MGPDMeasurementBackend:
         pixel_configs: Mapping[tuple[int, int], int],
         *,
         progress_callback: Callable[[int, int, int, int], None] | None = None,
+        commit: bool = False,
     ) -> None:
         """Restore pixel words, with the permanent bad-pixel mask taking priority."""
 
@@ -885,7 +924,7 @@ class MGPDMeasurementBackend:
             PIXEL_CODEC.validate_raw(int(raw))
             staged[(row, column)] = self._masked_pixel_word((column, row), int(raw))
         self.matrix.set_pixels(staged, progress_callback=progress_callback)
-        if not self.matrix.write_to_chip():
+        if commit and not self.matrix.write_to_chip():
             raise RuntimeError("SET_PIXEL_CFG WRITE_TO_CHIP failed while restoring pixels")
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
@@ -942,10 +981,6 @@ class MGPDMeasurementBackend:
                 }
             )
         self.matrix.set_pixels(staged)
-        if not self.matrix.write_to_chip():
-            raise RuntimeError(
-                "SET_PIXEL_CFG WRITE_TO_CHIP failed after staging S-curve fields"
-            )
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
         return rows
@@ -1067,7 +1102,13 @@ class MGPDMeasurementBackend:
         recovery_events: list[dict[str, Any]] = []
         for acquisition_attempt in range(self.settings.upo_reconnect_attempts + 1):
             try:
+                self._upo_state_uncertain = True
+                logger.debug("GET_SHOT begin: %s/%s, thread=%s",
+                             request.measurement_kind, request.acquisition_type,
+                             threading.current_thread().name)
                 result = self.shot_executor.execute(self.client, request)
+                self._upo_state_uncertain = False
+                logger.debug("GET_SHOT complete; pixel readout permitted")
                 return result, recovery_events
             except BaseException as error:
                 retryable = self._contains_transport_error(error) or (
@@ -1076,6 +1117,9 @@ class MGPDMeasurementBackend:
                 )
                 if (
                     not retryable
+                    or (isinstance(self.shot_executor, KeysightBurstShotExecutor)
+                        and (self.shot_executor.upo_command_in_flight or
+                             self.shot_executor._active_trigger_thread is not None))
                     or acquisition_attempt >= self.settings.upo_reconnect_attempts
                 ):
                     raise
@@ -1142,17 +1186,19 @@ class MGPDMeasurementBackend:
             (row, column): self._masked_pixel_word((column, row), raw)
             for (column, row), raw in self._current_pixel_configs.items()
         }
-        # WRITE_TO_CHIP transfers the complete UPO matrix. Recreate the zero
-        # half too, since its virtual memory may have changed across reconnect.
+        # Recreate both halves in UPO virtual memory after reconnect. The next
+        # GET_SHOT performs the only full-matrix transfer to the chip.
         self._zeroed_matrix.set_owned_half(0x00000000)
         self.matrix.set_pixels(staged)
-        if not self.matrix.write_to_chip():
-            raise RuntimeError("failed to restore pixel matrix after UPO reconnect")
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
         logger.warning(
-            "Last acknowledged ASIC configuration restored after UPO reconnect"
+            "KIPIX restored and PX staged after reconnect; commit occurs in GET_SHOT"
         )
+
+    @property
+    def safe_for_pixel_cleanup(self) -> bool:
+        return not self._upo_state_uncertain and bool(self.client.connected)
 
     def acquire(
         self,
