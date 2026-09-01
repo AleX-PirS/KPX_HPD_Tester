@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from comparator_characterization import (
     AnalysisSettings,
     CharacterizationSettings,
     KeysightBurstSettings,
+    UpoPwmSettings,
+    UpoPwmShotExecutor,
     load_gain_map_csv,
 )
 
@@ -51,7 +54,17 @@ UPO_RECONNECT_BACKOFF_S = 0.5
 # Col 0..15 получают 0x00000000, Col 16..31 настраиваются по логике теста.
 ASIC_INITIALIZATION_FCLK_MHZ = 50
 
-# Генератор Keysight 81150A/81160A. None включает VISA-автопоиск.
+# Основной источник CTRL: "upo_pwm". Резервный вариант: "keysight_burst".
+# В UPO PWM параметр N_INJECTIONS игнорируется: число фронтов для анализа
+# автоматически вычисляется из Freal и SCURVE_SHUTTER_DURATION_S.
+CTRL_INJECTION_SOURCE = "upo_pwm"
+UPO_CTRL_FREQUENCY_KHZ = 100
+UPO_CTRL_HIGH_TIME_NS = 5_000
+UPO_CTRL_EDGE_COUNT_UNCERTAINTY = 1
+
+# Резервный внешний генератор Keysight 81150A/81160A.
+# GENERATOR_VISA_ADDRESS=None включает VISA-автопоиск только при выборе
+# CTRL_INJECTION_SOURCE="keysight_burst". В режиме upo_pwm VISA не открывается.
 GENERATOR_VISA_ADDRESS: str | None = None
 GENERATOR_CHANNEL = 1
 SHUTTER_START_DELAY_S = 0.8
@@ -170,9 +183,14 @@ GAIN_MAP_CSV: Path | None = None
 # Режим одного обычного S-curve запуска. Можно оставить ровно один режим или
 # перечислить несколько. Сравнение всех четырех вынесено в run_crosstalk.py.
 SCURVE_PATTERNS = ("all",)
+# Используется только в режиме keysight_burst. Для upo_pwm это значение не
+# влияет ни на управление, ни на анализ.
 N_INJECTIONS = 1000
 NOISE_SHUTTER_DURATION_S = 0.001
-SCURVE_SHUTTER_DURATION_S = 1.0
+# Это единственное значение экспозиции, по которому upo_pwm вычисляет
+# N_nom=round(Freal*T). Оно должно совпадать с ручной настройкой GUI УПО.
+# При 100 кГц и 0.010 с получается номинально 1000 отрицательных фронтов.
+SCURVE_SHUTTER_DURATION_S = 0.010
 NOISE_REPEATS = 10
 # Ограничения coarse и автоматического fine сканирования включительно.
 # Например, 400..900 сокращает поиск, но исключенные области не измеряются.
@@ -322,7 +340,9 @@ def build_settings(
     settings.noise.upo_reconnect_attempts = UPO_RECONNECT_ATTEMPTS
     settings.noise.upo_reconnect_backoff_s = UPO_RECONNECT_BACKOFF_S
     settings.equalization.scan_all_trim_codes = scan_all_trim_codes
-    settings.scurve.n_injections = N_INJECTIONS
+    settings.scurve.n_injections = (
+        N_INJECTIONS if _normalized_ctrl_source() == "keysight_burst" else 1
+    )
     settings.scurve.shutter_duration_s = SCURVE_SHUTTER_DURATION_S
     settings.scurve.injection_patterns = injection_patterns or SCURVE_PATTERNS
     settings.scurve.minimum_reference_code = MINIMUM_REFERENCE_CODE
@@ -361,7 +381,20 @@ def build_upo_client() -> "MGPDClient":
     )
 
 
-def build_generator() -> "TwoChannelGenerator":
+def _normalized_ctrl_source() -> str:
+    source = str(CTRL_INJECTION_SOURCE).strip().lower()
+    if source not in {"upo_pwm", "keysight_burst"}:
+        raise ValueError(
+            "CTRL_INJECTION_SOURCE must be 'upo_pwm' or 'keysight_burst'"
+        )
+    return source
+
+
+def build_generator():
+    """Return a context manager; upo_pwm deliberately performs no VISA scan."""
+
+    if _normalized_ctrl_source() == "upo_pwm":
+        return nullcontext(None)
     from generator_cfg import TwoChannelGenerator
 
     return TwoChannelGenerator(
@@ -378,6 +411,29 @@ def build_burst_settings() -> KeysightBurstSettings:
         shutter_start_delay_s=SHUTTER_START_DELAY_S,
         post_burst_guard_s=POST_BURST_GUARD_S,
     )
+
+
+def build_upo_pwm_settings() -> UpoPwmSettings:
+    return UpoPwmSettings(
+        frequency_khz=UPO_CTRL_FREQUENCY_KHZ,
+        high_time_ns=UPO_CTRL_HIGH_TIME_NS,
+        edge_count_uncertainty=UPO_CTRL_EDGE_COUNT_UNCERTAINTY,
+    )
+
+
+def injection_hardware_arguments(generator: Any) -> dict[str, Any]:
+    """Build exactly one S-curve CTRL backend from the selected source."""
+
+    if _normalized_ctrl_source() == "upo_pwm":
+        if generator is not None:
+            raise RuntimeError("upo_pwm must not open an external generator")
+        return {"shot_executor": UpoPwmShotExecutor(build_upo_pwm_settings())}
+    if generator is None:
+        raise RuntimeError("keysight_burst requires an opened generator")
+    return {
+        "keysight_generator": generator,
+        "keysight_burst_settings": build_burst_settings(),
+    }
 
 
 def run_characterization(client, calibration_files, **kwargs):

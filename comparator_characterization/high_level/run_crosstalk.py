@@ -39,11 +39,10 @@ def main() -> None:
             injection_voltage_steps_v=config.injection_voltage_steps_v(),
             reference_calibration_voltage_unit=config.REFERENCE_LUT_VOLTAGE_UNIT,
             gain_map=config.gain_map(),
-            keysight_generator=generator,
-            keysight_burst_settings=config.build_burst_settings(),
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
             eo_overrides=config.EO_OVERRIDES,
             resume_experiment=config.RESUME_EXPERIMENT,
+            **config.injection_hardware_arguments(generator),
         )
     print(f"Тест наводок завершен: {result.experiment_path}")
     config.print_recommendation_paths(result.analysis_path)

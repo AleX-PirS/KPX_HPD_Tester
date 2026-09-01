@@ -36,6 +36,7 @@ from .hardware import (
     MGPDMeasurementBackend,
     STANDARD_CHARACTERIZATION_FCLK_MHZ,
     ShotExecutor,
+    UpoPwmShotExecutor,
     build_standard_characterization_pixel_configs,
     load_base_pixel_configs,
 )
@@ -73,7 +74,10 @@ class ManualExposureChange:
     noise_shutter_duration_s: float | None
     scurve_shutter_duration_s: float
     n_injections: int
-    burst_duration_s_at_100khz: float
+    injection_count_source: str
+    burst_duration_s_at_100khz: float | None = None
+    upo_pwm_frequency_khz: float | None = None
+    upo_pwm_high_time_ns: int | None = None
 
 
 def interactive_exposure_pause(change: ManualExposureChange) -> None:
@@ -82,6 +86,8 @@ def interactive_exposure_pause(change: ManualExposureChange) -> None:
     message = (
         "Установите в УПО экспозицию "
         f"{change.scurve_shutter_duration_s:g} с для S-кривой и нажмите Enter. "
+        f"Номинальное число инжекций для анализа: {change.n_injections} "
+        f"({change.injection_count_source}). "
         f"Эксперимент уже сохранен в {change.experiment_path}."
     )
     try:
@@ -620,17 +626,25 @@ def characterize_comparator(
     use the built-in reproducible pixel baseline unless an explicit advanced
     baseline is supplied. Later trim changes preserve every other pixel bit. Noise,
     equalization and S-curve stages can be selected independently. ``n_injections``
-    overrides the S-curve default of 1000 for this call. When measured REF1 and
-    REF2 LUT paths plus ``injection_voltage_steps_v`` are supplied, native codes
-    are selected automatically with the mandatory physical order
-    ``V_REF1 > V_REF2``. S-curve-only runs may freeze and reuse a previous noise
-    experiment through ``noise_reference_experiment``.
+    controls only finite-burst executors. It is ignored for ``UpoPwmShotExecutor``:
+    that denominator is derived from real PWM frequency and the manually matched
+    shutter exposure. When measured REF1 and REF2 LUT paths plus
+    ``injection_voltage_steps_v`` are supplied, native codes are selected
+    automatically with the mandatory physical order ``V_REF1 > V_REF2``.
+    S-curve-only runs may freeze and reuse a previous noise experiment through
+    ``noise_reference_experiment``.
     """
 
     eo_overrides = validate_eo_overrides(eo_overrides, run_scurve=run_scurve)
     selected_settings = (
         copy.deepcopy(settings) if settings is not None else CharacterizationSettings()
     )
+    upo_pwm_mode = run_scurve and isinstance(shot_executor, UpoPwmShotExecutor)
+    if upo_pwm_mode:
+        # A continuous UPO PWM has no user-programmed burst count. Put a benign
+        # placeholder in the copied settings before generic validation; the real
+        # nominal denominator is calculated after shutter validation below.
+        selected_settings.scurve.n_injections = 1
     for name, value in (("coarse_start", coarse_start), ("coarse_stop", coarse_stop)):
         if value is not None:
             setattr(selected_settings.noise, name, value)
@@ -641,7 +655,7 @@ def characterize_comparator(
         if value is not None:
             setattr(selected_settings.scurve, name, value)
     selected_settings.validate()
-    if n_injections is not None:
+    if n_injections is not None and not upo_pwm_mode:
         if (
             not isinstance(n_injections, int)
             or isinstance(n_injections, bool)
@@ -771,6 +785,18 @@ def characterize_comparator(
         raise ValueError(
             "run_scurve=True requires settings.scurve.shutter_duration_s matching UPO"
         )
+    upo_pwm_count_metadata: dict[str, Any] | None = None
+    if run_scurve and isinstance(shot_executor, UpoPwmShotExecutor):
+        # In continuous-PWM mode there is no finite burst count. The analysis
+        # denominator is derived solely from the real UPO PWM frequency and the
+        # one manual shutter exposure recorded in ScurveSettings. Any public
+        # n_injections argument is intentionally irrelevant in this mode.
+        derived_injections, upo_pwm_count_metadata = shot_executor.nominal_injections(
+            selected_settings.scurve.shutter_duration_s,
+            counter_mode_bits=selected_settings.noise.counter_mode_bits,
+        )
+        selected_settings.scurve.n_injections = derived_injections
+        selected_settings.validate()
     normalized_gain_map: dict[tuple[int, int], int] | None = None
     if run_scurve:
         if gain_map is None:
@@ -826,6 +852,28 @@ def characterize_comparator(
 
     if resume_experiment is not None:
         store = ExperimentStore(resume_experiment)
+        if run_scurve:
+            expected_ctrl_source = (
+                "MGPDLab_UPO_PWM"
+                if isinstance(shot_executor, UpoPwmShotExecutor)
+                else "Keysight_or_custom_executor"
+            )
+            stored_injection = store.metadata.get(
+                "test_injection_configuration", {}
+            )
+            if stored_injection.get("ctrl_source") != expected_ctrl_source:
+                raise ValueError(
+                    "resume CTRL injection source differs or was not recorded; "
+                    "reuse the old noise experiment as NOISE_REFERENCE_EXPERIMENT "
+                    "and start a new S-curve experiment"
+                )
+            if isinstance(shot_executor, UpoPwmShotExecutor) and (
+                stored_injection.get("upo_pwm_count_derivation")
+                != upo_pwm_count_metadata
+            ):
+                raise ValueError(
+                    "resume UPO PWM frequency, high time or manual shutter differs"
+                )
         if store.metadata.get("eo_overrides", {}) != eo_overrides:
             raise ValueError("resume EO overrides differ from the original experiment")
         if store.metadata.get("window") != spec.name:
@@ -906,7 +954,9 @@ def characterize_comparator(
                     "externally configured in MGPDLab; no Python protocol command found"
                 ),
                 "exact_test_pulse_sequence": (
-                    "caller ShotExecutor or Keysight 81150A/81160A MAN burst triggered by *TRG"
+                    "continuous MGPDLab/UPO PWM around blocking GET_SHOT"
+                    if isinstance(shot_executor, UpoPwmShotExecutor)
+                    else "caller ShotExecutor or Keysight 81150A/81160A MAN burst triggered by *TRG"
                 ),
                 "shutter_state_readback": "not_available",
                 "counter_overflow": "counter_stops_at_maximum_and_does_not_wrap",
@@ -915,13 +965,35 @@ def characterize_comparator(
                 "asic_polarity": "recorded from OMR and never modified by this pipeline",
             },
             "test_injection_configuration": {
+                "ctrl_source": (
+                    "MGPDLab_UPO_PWM"
+                    if isinstance(shot_executor, UpoPwmShotExecutor)
+                    else "Keysight_or_custom_executor"
+                ),
                 "ctrl_low_v": 0.0,
                 "ctrl_high_v": 3.3,
                 "event_edge": "falling",
                 "events_per_square_period": 1,
-                "generator_load_setting_ohm": 1_000_000.0,
-                "default_frequency_hz": 100_000.0,
-                "default_duty_cycle_percent": 50.0,
+                "finite_burst_n_injections_argument_used": (
+                    not isinstance(shot_executor, UpoPwmShotExecutor)
+                ),
+                "generator_load_setting_ohm": (
+                    None
+                    if isinstance(shot_executor, UpoPwmShotExecutor)
+                    else 1_000_000.0
+                ),
+                "default_frequency_hz": (
+                    shot_executor.settings.real_frequency_khz * 1_000.0
+                    if isinstance(shot_executor, UpoPwmShotExecutor)
+                    else 100_000.0
+                ),
+                "default_duty_cycle_percent": (
+                    shot_executor.settings.high_time_ns
+                    * shot_executor.settings.real_frequency_khz
+                    / 10_000.0
+                    if isinstance(shot_executor, UpoPwmShotExecutor)
+                    else 50.0
+                ),
                 "pixel_fields": {
                     "PX_TST_EN": "1 for current active group, 0 otherwise",
                     "PX_SH_EN": 0,
@@ -934,6 +1006,7 @@ def characterize_comparator(
                 "injection_capacitance_relative_uncertainty": (
                     selected_settings.scurve.injection_capacitance_relative_uncertainty
                 ),
+                "upo_pwm_count_derivation": upo_pwm_count_metadata,
                 "reference_pair_selection": {
                     "source": (
                         "measured_REF1_REF2_LUTs"
@@ -997,6 +1070,12 @@ def characterize_comparator(
             f"coarse DAC: {selected_settings.noise.coarse_start}.."
             f"{selected_settings.noise.coarse_stop}, шаг {selected_settings.noise.coarse_step}"
         )
+        if isinstance(shot_executor, UpoPwmShotExecutor):
+            # A previous interrupted process could have left the standalone UPO
+            # PWM generator running. Establish the safe idle state before any
+            # EO or pixel initialization in every new or resumed test.
+            shot_executor.recover_safe_state(client)
+            store.log_status("CTRL через УПО установлен в 0 перед конфигурацией ASIC")
         initialization_record = backend.initialize_standard_configuration(
             selected_pixels,
             fclk_mhz=initialization_fclk_mhz,
@@ -1022,11 +1101,18 @@ def characterize_comparator(
             asic_initialization_history=initialization_history,
             initial_asic_configuration=initialized_snapshot,
             acquisition_sequence={
-                "version": 2, "upo_execution": "calling_thread_only",
+                "version": 3, "upo_execution": "calling_thread_only",
                 "pixel_commit": "GET_SHOT_only; cleanup_stages_PX_for_next_shot",
-                "ctrl_execution": "generator_only_worker",
+                "ctrl_execution": (
+                    "same_UPO_thread: PWM_before_GET_SHOT, CTRL0_after_response, then_GET_PIXEL"
+                    if isinstance(shot_executor, UpoPwmShotExecutor)
+                    else "generator_only_worker"
+                ),
                 "burst_settings": (dict(vars(shot_executor.settings))
                     if isinstance(shot_executor, KeysightBurstShotExecutor) else None),
+                "upo_pwm_settings": (dict(vars(shot_executor.settings))
+                    if isinstance(shot_executor, UpoPwmShotExecutor) else None),
+                "upo_pwm_count_derivation": upo_pwm_count_metadata,
                 "shutter_open_observed": False,
             },
         )
@@ -1528,10 +1614,20 @@ def characterize_comparator(
                 for pattern in selected_settings.scurve.injection_patterns
             )
             completed_scurve_groups = 0
+            ctrl_sequence_text = (
+                "CTRL PWM, GET_SHOT, CTRL=0 и GET_PIXEL выполняются последовательно "
+                "в вызывающем потоке УПО. "
+                f"Freal={shot_executor.settings.real_frequency_khz:g} кГц, "
+                f"T={selected_settings.scurve.shutter_duration_s:g} с, "
+                f"Nnom={selected_settings.scurve.n_injections}; внешний "
+                "n_injections игнорируется"
+                if isinstance(shot_executor, UpoPwmShotExecutor)
+                else "GET_SHOT полностью завершается до GET_PIXEL; фоновый поток "
+                "управляет только CTRL генератора"
+            )
             store.log_status(
                 f"Начинается S-curve: групп инжекции {total_scurve_groups}. "
-                "УПО обслуживается только вызывающим потоком: GET_SHOT полностью "
-                "завершается до GET_PIXEL; фоновый поток управляет только CTRL",
+                f"{ctrl_sequence_text}",
                 overall_percent_estimate=scurve_progress_start,
             )
             if store.load_raw("noise").empty:
@@ -1569,8 +1665,25 @@ def characterize_comparator(
                         selected_settings.scurve.shutter_duration_s
                     ),
                     n_injections=selected_settings.scurve.n_injections,
+                    injection_count_source=(
+                        "Freal * manual UPO shutter, actual count uncertainty recorded"
+                        if isinstance(shot_executor, UpoPwmShotExecutor)
+                        else "finite Keysight burst cycles"
+                    ),
                     burst_duration_s_at_100khz=(
-                        selected_settings.scurve.n_injections / 100_000.0
+                        None
+                        if isinstance(shot_executor, UpoPwmShotExecutor)
+                        else selected_settings.scurve.n_injections / 100_000.0
+                    ),
+                    upo_pwm_frequency_khz=(
+                        shot_executor.settings.real_frequency_khz
+                        if isinstance(shot_executor, UpoPwmShotExecutor)
+                        else None
+                    ),
+                    upo_pwm_high_time_ns=(
+                        shot_executor.settings.high_time_ns
+                        if isinstance(shot_executor, UpoPwmShotExecutor)
+                        else None
                     ),
                 )
                 store.update_metadata(
@@ -1579,9 +1692,12 @@ def characterize_comparator(
                         "noise_shutter_duration_s": change.noise_shutter_duration_s,
                         "scurve_shutter_duration_s": change.scurve_shutter_duration_s,
                         "n_injections": change.n_injections,
+                        "injection_count_source": change.injection_count_source,
                         "burst_duration_s_at_100khz": (
                             change.burst_duration_s_at_100khz
                         ),
+                        "upo_pwm_frequency_khz": change.upo_pwm_frequency_khz,
+                        "upo_pwm_high_time_ns": change.upo_pwm_high_time_ns,
                     },
                 )
                 store.log_status(
@@ -1603,6 +1719,15 @@ def characterize_comparator(
                 shot_executor.prepare_injections(
                     selected_settings.scurve.n_injections
                 )
+            elif isinstance(shot_executor, UpoPwmShotExecutor):
+                nominal, _ = shot_executor.nominal_injections(
+                    selected_settings.scurve.shutter_duration_s,
+                    counter_mode_bits=selected_settings.noise.counter_mode_bits,
+                )
+                if nominal != selected_settings.scurve.n_injections:
+                    raise RuntimeError(
+                        "UPO PWM nominal injection denominator changed after preflight"
+                    )
 
             def acquire_groups(
                 groups: Sequence[Any],
@@ -1751,6 +1876,8 @@ def characterize_comparator(
                 try:
                     if isinstance(shot_executor, KeysightBurstShotExecutor):
                         shot_executor.return_to_idle()
+                    elif isinstance(shot_executor, UpoPwmShotExecutor):
+                        shot_executor.return_to_idle(client)
                 except Exception as cleanup_error:
                     store.record_error({"scope": "generator_cleanup", "error": str(cleanup_error)})
                     if original_error is None:
@@ -1759,8 +1886,7 @@ def characterize_comparator(
                     if (
                         original_error is None
                         and backend.safe_for_pixel_cleanup
-                        and (not isinstance(shot_executor, KeysightBurstShotExecutor)
-                             or not shot_executor.upo_command_in_flight)
+                        and not bool(getattr(shot_executor, "upo_command_in_flight", False))
                     ):
                         backend.restore_pixel_configs(pixel_snapshot)
                         store.update_metadata(pixel_cleanup={

@@ -24,6 +24,8 @@ from .hardware import (
     ShotExecutionResult,
     ShotExecutor,
     ShotRequest,
+    UpoPwmSettings,
+    UpoPwmShotExecutor,
 )
 from .injection import (
     CROSSTALK_INJECTION_PATTERNS,
@@ -81,6 +83,8 @@ __all__ = [
     "ShotExecutionResult",
     "ShotExecutor",
     "ShotRequest",
+    "UpoPwmSettings",
+    "UpoPwmShotExecutor",
     "ThresholdDacCalibration",
     "WindowSpec",
     "analyze_saved_experiment",

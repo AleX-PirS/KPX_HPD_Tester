@@ -168,6 +168,9 @@ def characterize_parameter_sweep(
         "default_settings": _freeze(settings),
         "eo_defaults": _freeze(EO_cfg.DEFAULT_REGISTERS),
         "executor_type": type(kwargs.get("shot_executor")).__qualname__,
+        "executor_settings": _freeze(
+            getattr(kwargs.get("shot_executor"), "settings", None)
+        ),
     }
     digest = hashlib.sha256(json.dumps(contract, sort_keys=True, allow_nan=False).encode()).hexdigest()
     if resume_sweep is not None:

@@ -31,12 +31,11 @@ def main() -> None:
             injection_voltage_steps_v=config.injection_voltage_steps_v(),
             reference_calibration_voltage_unit=config.REFERENCE_LUT_VOLTAGE_UNIT,
             gain_map=config.gain_map(),
-            keysight_generator=generator,
-            keysight_burst_settings=config.build_burst_settings(),
             run_noise_scan=True,
             run_equalization=True,
             run_scurve=True,
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
+            **config.injection_hardware_arguments(generator),
         )
     print(f"Полная характеризация завершена: {result.experiment_path}")
     config.print_result_paths(result)
