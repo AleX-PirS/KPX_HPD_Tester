@@ -29,6 +29,17 @@ class AcquisitionOutcome:
     newly_saved: bool
     any_nonzero_count: bool
     all_pixels_valid_and_zero: bool
+    selected_counts: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScurveScanRun:
+    stage: str
+    scan_phase: str
+    planned_codes: tuple[int, ...]
+    acquired_codes: tuple[int, ...]
+    new_acquisitions: int
+    baseline_stop_event: dict[str, Any] | None = None
 
 
 def _inclusive_codes(start: int, stop: int, step: int) -> tuple[int, ...]:
@@ -42,6 +53,36 @@ def _valid_boolean(series: pd.Series) -> pd.Series:
     if pd.api.types.is_bool_dtype(series):
         return series.fillna(False)
     return series.astype(str).str.strip().str.lower().isin(("true", "1", "yes"))
+
+
+def _acquisition_outcome(
+    samples: Sequence[Mapping[str, Any]], *, newly_saved: bool
+) -> AcquisitionOutcome:
+    def is_valid(sample: Mapping[str, Any]) -> bool:
+        value = sample.get("measurement_valid", False)
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        return str(value).strip().lower() in {"true", "1", "yes"}
+
+    valid_samples = [
+        sample for sample in samples if is_valid(sample)
+    ]
+    selected_counts = tuple(
+        int(sample["selected_count"])
+        for sample in valid_samples
+        if sample.get("selected_count") not in (None, "")
+    )
+    return AcquisitionOutcome(
+        newly_saved=newly_saved,
+        any_nonzero_count=any(value > 0 for value in selected_counts),
+        all_pixels_valid_and_zero=(
+            bool(samples)
+            and len(valid_samples) == len(samples)
+            and bool(selected_counts)
+            and all(value == 0 for value in selected_counts)
+        ),
+        selected_counts=selected_counts,
+    )
 
 
 def _suggest_fine_codes(
@@ -252,6 +293,14 @@ def _acquire_point(
     pulse_amplitude_configuration: Mapping[str, Any] | None = None,
 ) -> AcquisitionOutcome:
     if store.is_complete(descriptor):
+        if (
+            descriptor.get("measurement_kind") == "scurve"
+            and descriptor.get("acquisition_type") == "background"
+        ):
+            saved = store.load_complete_acquisition(descriptor)
+            return _acquisition_outcome(
+                saved.to_dict(orient="records"), newly_saved=False
+            )
         return AcquisitionOutcome(
             newly_saved=False,
             any_nonzero_count=False,
@@ -295,23 +344,7 @@ def _acquire_point(
             "pixel_cleanup_safe": backend.safe_for_pixel_cleanup,
         })
         raise
-    valid_samples = [
-        sample for sample in samples if bool(sample.get("measurement_valid", False))
-    ]
-    any_nonzero = any(
-        int(sample["selected_count"]) > 0
-        for sample in valid_samples
-        if sample.get("selected_count") not in (None, "")
-    )
-    all_valid_and_zero = bool(samples) and len(valid_samples) == len(samples) and all(
-        int(sample["selected_count"]) == 0
-        for sample in valid_samples
-    )
-    return AcquisitionOutcome(
-        newly_saved=True,
-        any_nonzero_count=any_nonzero,
-        all_pixels_valid_and_zero=all_valid_and_zero,
-    )
+    return _acquisition_outcome(samples, newly_saved=True)
 
 
 def _saved_noise_outcomes(
@@ -691,6 +724,56 @@ def run_noise_scan(
     )
 
 
+def _scurve_baseline_noise_diagnostic(
+    selected_counts: Sequence[int],
+    *,
+    expected_observations: int,
+    settings: ScurveSettings,
+) -> dict[str, Any]:
+    counts = np.asarray(tuple(selected_counts), dtype=float)
+    finite = counts[np.isfinite(counts)]
+    threshold = float(
+        settings.n_injections * settings.baseline_noise_count_multiplier
+    )
+    coverage = (
+        float(len(finite) / expected_observations)
+        if expected_observations > 0
+        else 0.0
+    )
+    above_fraction = float(np.mean(finite > threshold)) if len(finite) else 0.0
+    enough_valid_pixels = coverage >= 0.80
+    detected = bool(
+        settings.baseline_noise_stop_enabled
+        and enough_valid_pixels
+        and above_fraction >= settings.baseline_noise_pixel_fraction
+    )
+    return {
+        "criterion": "background_pixel_fraction_strictly_above_scaled_N",
+        "detected": detected,
+        "n_injections": int(settings.n_injections),
+        "count_multiplier": float(settings.baseline_noise_count_multiplier),
+        "count_threshold_strictly_greater_than": threshold,
+        "required_pixel_fraction": float(settings.baseline_noise_pixel_fraction),
+        "observed_pixel_fraction": above_fraction,
+        "valid_observation_count": int(len(finite)),
+        "expected_observation_count": int(expected_observations),
+        "valid_observation_coverage": coverage,
+        "minimum_valid_observation_coverage": 0.80,
+        "background_count_median": (
+            float(np.median(finite)) if len(finite) else None
+        ),
+        "background_count_q90": (
+            float(np.quantile(finite, 0.90)) if len(finite) else None
+        ),
+        "background_count_q95": (
+            float(np.quantile(finite, 0.95)) if len(finite) else None
+        ),
+        "background_count_maximum": (
+            float(np.max(finite)) if len(finite) else None
+        ),
+    }
+
+
 def run_scurve_points(
     *,
     backend: MGPDMeasurementBackend,
@@ -709,8 +792,8 @@ def run_scurve_points(
     upper_non_limiting_code: int,
     noise_settings: NoiseScanSettings,
     scurve_settings: ScurveSettings,
-) -> int:
-    """Acquire paired no-pulse and exact-N-pulse shots at supplied DAC codes."""
+) -> ScurveScanRun:
+    """Acquire paired S-curve points and retain a measured baseline boundary."""
 
     pixels = backend.active_pixels(pixels)
     active_pixels = tuple(pixel for pixel in injection_group.active_pixels if pixel not in backend.bad_pixels)
@@ -742,6 +825,9 @@ def run_scurve_points(
     store.write_table(pixel_config_path, pd.DataFrame(pixel_config_rows))
     completed = 0
     planned_codes = tuple(dict.fromkeys(int(value) for value in codes))
+    acquired_codes: list[int] = []
+    noisy_streak: list[dict[str, Any]] = []
+    baseline_stop_event: dict[str, Any] | None = None
     last_logged_bucket = -1
     store.log_status(
         f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
@@ -749,6 +835,7 @@ def run_scurve_points(
         stage_percent=0.0,
     )
     for code_index, code in enumerate(planned_codes):
+        background_counts: list[int] = []
         calibration.lookup(code)
         backend.set_threshold(spec, code)
         if noise_settings.settling_time_s:
@@ -809,6 +896,7 @@ def run_scurve_points(
             )
             if background_outcome.newly_saved:
                 completed += 1
+            background_counts.extend(background_outcome.selected_counts)
 
             signal_descriptor = {**common, "acquisition_type": "signal"}
             signal_request = ShotRequest(
@@ -856,6 +944,84 @@ def run_scurve_points(
                     "timestamp_utc": utc_now_text(),
                 }
             )
+        acquired_codes.append(code)
+        diagnostic = _scurve_baseline_noise_diagnostic(
+            background_counts,
+            expected_observations=len(pixels) * scurve_settings.repeats,
+            settings=scurve_settings,
+        )
+        diagnostic.update({
+            "threshold_dac_code": int(code),
+            "scan_phase": scan_phase,
+        })
+        if diagnostic["detected"]:
+            noisy_streak.append(diagnostic)
+            store.log_status(
+                f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
+                f"сохранена шумовая точка {len(noisy_streak)}/"
+                f"{scurve_settings.baseline_noise_consecutive_codes}, DAC={code}, "
+                f"пикселей выше N*коэффициент: "
+                f"{100.0 * diagnostic['observed_pixel_fraction']:.1f}%",
+                stage_percent=(
+                    100.0 * (code_index + 1) / max(len(planned_codes), 1)
+                ),
+            )
+        else:
+            noisy_streak.clear()
+
+        if (
+            scurve_settings.baseline_noise_stop_enabled
+            and len(noisy_streak)
+            >= scurve_settings.baseline_noise_consecutive_codes
+        ):
+            baseline_stop_event = {
+                "timestamp_utc": utc_now_text(),
+                "stage": stage,
+                "scan_phase": scan_phase,
+                "injection_pattern": injection_group.pattern,
+                "injection_group_id": injection_group.group_id,
+                "scan_direction": (
+                    "descending" if scurve_settings.scan_descending else "ascending"
+                ),
+                "first_noise_code": int(noisy_streak[0]["threshold_dac_code"]),
+                "stop_code": int(code),
+                "retained_consecutive_noise_points": [dict(item) for item in noisy_streak],
+                "retained_noise_point_count": len(noisy_streak),
+                "background_and_signal_saved_before_decision": True,
+                "skipped_unmeasured_codes": list(planned_codes[code_index + 1 :]),
+            }
+            previous_events = list(
+                store.metadata.get("scurve_baseline_stop_events", [])
+            )
+            signature = (
+                stage,
+                scan_phase,
+                injection_group.group_id,
+                int(code),
+            )
+            if not any(
+                (
+                    item.get("stage"),
+                    item.get("scan_phase"),
+                    item.get("injection_group_id"),
+                    int(item.get("stop_code", -1)),
+                )
+                == signature
+                for item in previous_events
+            ):
+                previous_events.append(baseline_stop_event)
+                store.update_metadata(
+                    scurve_baseline_stop_events=previous_events
+                )
+            store.log_status(
+                f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
+                f"после {len(noisy_streak)} последовательных шумовых точек "
+                f"движение к "
+                f"{'меньшим' if scurve_settings.scan_descending else 'большим'} "
+                f"кодам остановлено на DAC={code}",
+                stage_percent=100.0,
+            )
+            break
         stage_percent = 100.0 * (code_index + 1) / max(len(planned_codes), 1)
         bucket = int(stage_percent // 5)
         if bucket > last_logged_bucket or code_index + 1 == len(planned_codes):
@@ -874,6 +1040,16 @@ def run_scurve_points(
             "injection_group_id": injection_group.group_id,
             "active_injection_pixel_count": len(injection_group.active_pixels),
             "new_acquisitions": completed,
+            "planned_codes": list(planned_codes),
+            "acquired_codes": list(acquired_codes),
+            "baseline_stop_event": baseline_stop_event,
         }
     )
-    return completed
+    return ScurveScanRun(
+        stage=stage,
+        scan_phase=scan_phase,
+        planned_codes=planned_codes,
+        acquired_codes=tuple(acquired_codes),
+        new_acquisitions=completed,
+        baseline_stop_event=baseline_stop_event,
+    )

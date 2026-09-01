@@ -47,10 +47,15 @@ from .pixel_masks import (
 )
 from .recommendations import save_noise_recommendations
 from .parameters import validate_eo_overrides
-from .measurement import run_noise_scan as acquire_noise_scan, run_scurve_points
+from .measurement import (
+    ScurveScanRun,
+    run_noise_scan as acquire_noise_scan,
+    run_scurve_points,
+)
 from .models import (
     CharacterizationSettings,
     FRAMEWORK_VERSION,
+    ScurveSettings,
     get_window_spec,
     resolve_pixels,
 )
@@ -530,28 +535,54 @@ def _safe_background_codes(
     return tuple(safe_codes)
 
 
-def _subsample_codes(codes: Sequence[int], step: int) -> tuple[int, ...]:
-    if not codes:
-        return ()
-    available = set(int(code) for code in codes)
-    lower, upper = min(available), max(available)
-    selected = [code for code in range(lower, upper + 1, step) if code in available]
-    if upper in available and upper not in selected:
-        selected.append(upper)
-    return tuple(selected)
+def _ordered_scurve_codes(
+    calibration: ThresholdDacCalibration,
+    settings: ScurveSettings,
+    *,
+    high_code: int | None = None,
+    low_code: int | None = None,
+    step: int | None = None,
+) -> tuple[int, ...]:
+    high = int(
+        calibration.max_code
+        if high_code is None and settings.coarse_high_code is None
+        else settings.coarse_high_code
+        if high_code is None
+        else high_code
+    )
+    low = int(
+        calibration.min_code
+        if low_code is None and settings.coarse_low_code is None
+        else settings.coarse_low_code
+        if low_code is None
+        else low_code
+    )
+    if high < low:
+        raise ValueError("S-curve high DAC code must be >= low DAC code")
+    calibration.lookup(high)
+    calibration.lookup(low)
+    increment = int(step or settings.coarse_step)
+    if settings.scan_descending:
+        values = list(range(high, low - 1, -increment))
+        if not values or values[-1] != low:
+            values.append(low)
+    else:
+        values = list(range(low, high + 1, increment))
+        if not values or values[-1] != high:
+            values.append(high)
+    return tuple(dict.fromkeys(values))
 
 
-def _scurve_transition_codes(
+def _scurve_transition_brackets(
     store: ExperimentStore,
     noise_statistics: pd.DataFrame,
     maximum_background_fraction: float,
     *,
     stage: str,
-) -> tuple[int, ...]:
-    raw = store.load_raw("scurve")
-    if raw.empty:
-        return ()
-    raw = raw[raw["stage"] == stage].copy()
+) -> tuple[tuple[int, int], ...]:
+    """Locate per-pixel 50% crossings, including 0-to-1 coarse jumps."""
+
+    raw = store.load_raw("scurve", stages=(stage,))
     if raw.empty:
         return ()
     efficiency = _paired_scurve_efficiency(
@@ -559,12 +590,82 @@ def _scurve_transition_codes(
         noise_statistics=noise_statistics,
         max_background_fraction=maximum_background_fraction,
     )
-    valid = efficiency[efficiency["fit_valid"].astype(str).str.lower().isin(("true", "1"))]
+    valid = efficiency[
+        efficiency["fit_valid"].astype(str).str.lower().isin(("true", "1"))
+    ].copy()
     if valid.empty:
         return ()
-    envelope = valid.groupby("threshold_dac_code")["efficiency"].median()
-    transition = envelope[(envelope >= 0.05) & (envelope <= 0.95)]
-    return tuple(int(code) for code in transition.index)
+    acquired_codes = sorted(
+        int(code) for code in efficiency["threshold_dac_code"].dropna().unique()
+    )
+    code_rank = {code: index for index, code in enumerate(acquired_codes)}
+    points = (
+        valid.groupby(["column", "row", "threshold_dac_code"], as_index=False)
+        ["efficiency"]
+        .mean()
+    )
+    brackets: set[tuple[int, int]] = set()
+    for _, pixel in points.groupby(["column", "row"], sort=False):
+        pixel = pixel.sort_values("threshold_dac_code")
+        codes = pixel["threshold_dac_code"].to_numpy(dtype=int)
+        values = pixel["efficiency"].to_numpy(dtype=float)
+        for code, value in zip(codes, values):
+            if np.isfinite(value) and 0.05 <= value <= 0.95:
+                brackets.add((int(code), int(code)))
+        for index in range(len(codes) - 1):
+            left_code = int(codes[index])
+            right_code = int(codes[index + 1])
+            # Do not bridge a DAC code whose paired background was rejected.
+            if code_rank.get(right_code, -2) - code_rank.get(left_code, -1) != 1:
+                continue
+            left_value = float(values[index])
+            right_value = float(values[index + 1])
+            if not np.isfinite(left_value) or not np.isfinite(right_value):
+                continue
+            if left_value == right_value:
+                continue
+            if (left_value - 0.5) * (right_value - 0.5) <= 0:
+                brackets.add((left_code, right_code))
+    return tuple(sorted(brackets))
+
+
+def _fine_codes_from_brackets(
+    brackets: Sequence[tuple[int, int]],
+    calibration: ThresholdDacCalibration,
+    settings: ScurveSettings,
+) -> tuple[tuple[int, ...], dict[str, Any]]:
+    fine_set: set[int] = set()
+    for first, second in brackets:
+        lower = max(
+            calibration.min_code,
+            min(int(first), int(second)) - settings.fine_margin_codes,
+        )
+        upper = min(
+            calibration.max_code,
+            max(int(first), int(second)) + settings.fine_margin_codes,
+        )
+        fine_set.update(range(lower, upper + 1, settings.fine_step))
+        fine_set.add(upper)
+    ordered = tuple(sorted(fine_set, reverse=settings.scan_descending))
+    ascending = sorted(fine_set)
+    bands: list[dict[str, int]] = []
+    if ascending:
+        band_start = previous = ascending[0]
+        for code in ascending[1:]:
+            if code - previous > settings.fine_step:
+                bands.append({"start": band_start, "stop": previous})
+                band_start = code
+            previous = code
+        bands.append({"start": band_start, "stop": previous})
+    return ordered, {
+        "method": "per_pixel_adjacent_50_percent_brackets_plus_midlevel_points",
+        "transition_bracket_count": len(brackets),
+        "fine_step": settings.fine_step,
+        "fine_margin_codes": settings.fine_margin_codes,
+        "fine_code_count": len(ordered),
+        "fine_bands": bands,
+        "scan_direction": "descending" if settings.scan_descending else "ascending",
+    }
 
 
 def _preflight_scan_coverage(
@@ -1643,7 +1744,7 @@ def characterize_comparator(
                 )
             assert normalized_gain_map is not None
             assert selected_settings.scurve.shutter_duration_s is not None
-            safe_codes = _safe_background_codes(
+            predicted_safe_codes = _safe_background_codes(
                 noise_statistics,
                 n_injections=selected_settings.scurve.n_injections,
                 maximum_fraction=selected_settings.scurve.max_background_fraction,
@@ -1651,11 +1752,63 @@ def characterize_comparator(
                     selected_settings.scurve.shutter_duration_s
                 ),
             )
-            coarse_codes = _subsample_codes(
-                safe_codes, selected_settings.scurve.coarse_step
+            coarse_codes = _ordered_scurve_codes(
+                threshold_calibration, selected_settings.scurve
             )
             if not coarse_codes:
                 raise RuntimeError("automatic S-curve coarse range is empty")
+            store.update_metadata(
+                scurve_scan_strategy={
+                    "physical_target": (
+                        "positive pulse from the falling CTRL edge above baseline"
+                    ),
+                    "opposite_polarity_rising_edge_branch_excluded": bool(
+                        selected_settings.scurve.scan_descending
+                    ),
+                    "scan_direction": (
+                        "descending"
+                        if selected_settings.scurve.scan_descending
+                        else "ascending"
+                    ),
+                    "coarse_high_code": max(coarse_codes),
+                    "coarse_low_safety_limit_code": min(coarse_codes),
+                    "coarse_step": selected_settings.scurve.coarse_step,
+                    "fine_step": selected_settings.scurve.fine_step,
+                    "runtime_baseline_stop_enabled": (
+                        selected_settings.scurve.baseline_noise_stop_enabled
+                    ),
+                    "baseline_stop_count_threshold": (
+                        "background_count > n_injections * count_multiplier"
+                    ),
+                    "baseline_noise_count_multiplier": (
+                        selected_settings.scurve.baseline_noise_count_multiplier
+                    ),
+                    "baseline_noise_pixel_fraction": (
+                        selected_settings.scurve.baseline_noise_pixel_fraction
+                    ),
+                    "retained_consecutive_noise_codes": (
+                        selected_settings.scurve.baseline_noise_consecutive_codes
+                    ),
+                    "predicted_safe_code_minimum_from_noise_reference": min(
+                        predicted_safe_codes
+                    ),
+                    "predicted_safe_code_maximum_from_noise_reference": max(
+                        predicted_safe_codes
+                    ),
+                    "note": (
+                        "noise reference is used for prediction and fit filtering; "
+                        "it does not sparsify the programmable S-curve DAC grid"
+                    ),
+                }
+            )
+            store.log_status(
+                "S-curve threshold scan: "
+                f"DAC {coarse_codes[0]} -> {coarse_codes[-1]}, "
+                f"coarse шаг {selected_settings.scurve.coarse_step}; "
+                f"после {selected_settings.scurve.baseline_noise_consecutive_codes} "
+                "последовательных полностью сохраненных шумовых точек scan "
+                "остановится"
+            )
 
             if run_noise_scan or run_equalization:
                 change = ManualExposureChange(
@@ -1737,9 +1890,10 @@ def characterize_comparator(
                 codes: Sequence[int],
                 amplitude: Any,
                 amplitude_configuration: Mapping[str, Any],
-            ) -> None:
+            ) -> tuple[ScurveScanRun, ...]:
+                runs: list[ScurveScanRun] = []
                 for group in groups:
-                    run_scurve_points(
+                    runs.append(run_scurve_points(
                         backend=backend,
                         store=store,
                         calibration=threshold_calibration,
@@ -1756,7 +1910,8 @@ def characterize_comparator(
                         upper_non_limiting_code=upper_non_limiting_code,
                         noise_settings=selected_settings.noise,
                         scurve_settings=selected_settings.scurve,
-                    )
+                    ))
+                return tuple(runs)
 
             try:
                 for amplitude_index, amplitude in enumerate(
@@ -1771,7 +1926,7 @@ def characterize_comparator(
                             f"pulse_amplitude_{amplitude_index:03d}_"
                             f"pattern_{pattern}"
                         )
-                        acquire_groups(
+                        coarse_runs = acquire_groups(
                             groups,
                             stage=stage,
                             phase="coarse",
@@ -1779,36 +1934,30 @@ def characterize_comparator(
                             amplitude=amplitude,
                             amplitude_configuration=amplitude_configuration,
                         )
-                        transition_codes = _scurve_transition_codes(
+                        transition_brackets = _scurve_transition_brackets(
                             store,
                             noise_statistics,
                             selected_settings.scurve.max_background_fraction,
                             stage=stage,
                         )
-                        if not transition_codes:
-                            current_lower = min(coarse_codes)
-                            current_upper = max(coarse_codes)
+                        current_upper = max(coarse_codes)
+                        if not transition_brackets:
                             for round_index in range(
                                 1, selected_settings.scurve.max_expand_rounds + 1
                             ):
-                                next_lower = max(
-                                    threshold_calibration.min_code,
-                                    current_lower
-                                    - selected_settings.scurve.expand_codes,
-                                )
                                 next_upper = min(
                                     threshold_calibration.max_code,
                                     current_upper
                                     + selected_settings.scurve.expand_codes,
                                 )
-                                expansion = tuple(
-                                    code
-                                    for code in range(
-                                        next_lower,
-                                        next_upper + 1,
-                                        selected_settings.scurve.coarse_step,
-                                    )
-                                    if code < current_lower or code > current_upper
+                                if next_upper <= current_upper:
+                                    break
+                                expansion = _ordered_scurve_codes(
+                                    threshold_calibration,
+                                    selected_settings.scurve,
+                                    high_code=next_upper,
+                                    low_code=current_upper + 1,
+                                    step=selected_settings.scurve.coarse_step,
                                 )
                                 if not expansion:
                                     break
@@ -1820,33 +1969,51 @@ def characterize_comparator(
                                     amplitude=amplitude,
                                     amplitude_configuration=amplitude_configuration,
                                 )
-                                current_lower, current_upper = next_lower, next_upper
-                                transition_codes = _scurve_transition_codes(
+                                current_upper = next_upper
+                                transition_brackets = _scurve_transition_brackets(
                                     store,
                                     noise_statistics,
                                     selected_settings.scurve.max_background_fraction,
                                     stage=stage,
                                 )
-                                if transition_codes:
+                                if transition_brackets:
                                     break
 
-                        if transition_codes:
-                            lower = max(
-                                threshold_calibration.min_code,
-                                min(transition_codes)
-                                - selected_settings.scurve.fine_margin_codes,
+                        fine_codes, fine_diagnostics = _fine_codes_from_brackets(
+                            transition_brackets,
+                            threshold_calibration,
+                            selected_settings.scurve,
+                        )
+                        fine_diagnostics.update({
+                            "stage": stage,
+                            "injection_pattern": pattern,
+                            "coarse_baseline_stop_codes": [
+                                run.baseline_stop_event.get("stop_code")
+                                for run in coarse_runs
+                                if run.baseline_stop_event is not None
+                            ],
+                        })
+                        previous_fine_diagnostics = list(
+                            store.metadata.get("scurve_fine_range_diagnostics", [])
+                        )
+                        previous_fine_diagnostics = [
+                            item
+                            for item in previous_fine_diagnostics
+                            if not (
+                                item.get("stage") == stage
+                                and item.get("injection_pattern") == pattern
                             )
-                            upper = min(
-                                threshold_calibration.max_code,
-                                max(transition_codes)
-                                + selected_settings.scurve.fine_margin_codes,
-                            )
-                            fine_codes = tuple(
-                                range(
-                                    lower,
-                                    upper + 1,
-                                    selected_settings.scurve.fine_step,
-                                )
+                        ]
+                        previous_fine_diagnostics.append(fine_diagnostics)
+                        store.update_metadata(
+                            scurve_fine_range_diagnostics=previous_fine_diagnostics
+                        )
+                        if fine_codes:
+                            store.log_status(
+                                f"S-curve {stage}/{pattern}: fine scan, "
+                                f"{len(fine_codes)} кодов с шагом "
+                                f"{selected_settings.scurve.fine_step}, "
+                                f"диапазонов {len(fine_diagnostics['fine_bands'])}"
                             )
                             acquire_groups(
                                 groups,
@@ -1855,6 +2022,12 @@ def characterize_comparator(
                                 codes=fine_codes,
                                 amplitude=amplitude,
                                 amplitude_configuration=amplitude_configuration,
+                            )
+                        else:
+                            store.log_status(
+                                f"S-curve {stage}/{pattern}: положительный переход "
+                                "не ограничен соседними coarse-точками; fine scan "
+                                "не выполняется"
                             )
                         completed_scurve_groups += len(groups)
                         scurve_fraction = completed_scurve_groups / max(

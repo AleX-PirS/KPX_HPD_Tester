@@ -271,6 +271,34 @@ class ExperimentStore:
     def is_complete(self, descriptor: Mapping[str, Any]) -> bool:
         return self._status_by_key.get(self.acquisition_key(descriptor)) == "complete"
 
+    def load_complete_acquisition(
+        self, descriptor: Mapping[str, Any]
+    ) -> pd.DataFrame:
+        """Read one deterministic raw acquisition, primarily for safe resume.
+
+        Long adaptive scans must reproduce their stopping decision after a
+        process restart. Reading only the already completed point avoids a
+        costly reload of the complete experiment directory.
+        """
+
+        key = self.acquisition_key(descriptor)
+        if self._status_by_key.get(key) != "complete":
+            return pd.DataFrame()
+        acquisition_id = self.acquisition_id(key)
+        relative = self._relative_acquisition_path(descriptor, acquisition_id)
+        path = (self.raw_root / relative).resolve()
+        try:
+            path.relative_to(self.raw_root.resolve())
+        except ValueError as error:
+            raise ValueError(
+                f"raw acquisition path escapes the experiment directory: {relative}"
+            ) from error
+        if not path.exists():
+            raise FileNotFoundError(
+                f"completed raw acquisition is missing during resume: {path}"
+            )
+        return pd.read_csv(path, keep_default_na=False)
+
     def _relative_acquisition_path(self, descriptor: Mapping[str, Any], acquisition_id: str) -> Path:
         kind = _safe_path_component(descriptor["measurement_kind"])
         stage = _safe_path_component(descriptor["stage"])

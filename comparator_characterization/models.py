@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.8.0"
+FRAMEWORK_VERSION = "0.9.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -267,11 +267,24 @@ class ScurveSettings:
     minimum_reference_voltage_v: float | None = None
     preferred_reference_common_mode_v: float | None = None
     maximum_reference_step_error_v: float | None = None
+    # Positive injected pulses go upward from the baseline. Scan the threshold
+    # from the high-code side towards the baseline so the opposite-polarity
+    # pulse from the rising CTRL edge is never followed below the noise peak.
+    scan_descending: bool = True
+    coarse_high_code: int | None = None
+    coarse_low_code: int | None = None
     coarse_step: int = 8
     fine_step: int = 1
     fine_margin_codes: int = 8
     expand_codes: int = 32
     max_expand_rounds: int = 4
+    # A full paired point is retained while approaching the baseline. The
+    # scan stops only after this many consecutive DAC codes have a substantial
+    # fraction of pixels with background counts above N_injections * multiplier.
+    baseline_noise_stop_enabled: bool = True
+    baseline_noise_count_multiplier: float = 1.0
+    baseline_noise_pixel_fraction: float = 0.10
+    baseline_noise_consecutive_codes: int = 2
     paired_background: bool = True
 
     def validate(self) -> None:
@@ -330,12 +343,45 @@ class ScurveSettings:
             raise ValueError(
                 "maximum_reference_step_error_v must be finite and >= 0 when supplied"
             )
+        if not isinstance(self.scan_descending, bool):
+            raise TypeError("scan_descending must be bool")
+        for name, code in (
+            ("coarse_high_code", self.coarse_high_code),
+            ("coarse_low_code", self.coarse_low_code),
+        ):
+            if code is not None and (
+                not isinstance(code, int)
+                or isinstance(code, bool)
+                or not 0 <= code <= 1023
+            ):
+                raise ValueError(f"{name} must be an integer in 0..1023 or None")
+        if (
+            self.coarse_high_code is not None
+            and self.coarse_low_code is not None
+            and self.coarse_high_code < self.coarse_low_code
+        ):
+            raise ValueError("coarse_high_code must be >= coarse_low_code")
         if self.coarse_step <= 0 or self.fine_step <= 0:
             raise ValueError("S-curve DAC steps must be positive")
         if self.fine_margin_codes < 0 or self.expand_codes < 1:
             raise ValueError("S-curve margins must be non-negative")
         if self.max_expand_rounds < 0:
             raise ValueError("max_expand_rounds must be >= 0")
+        if not isinstance(self.baseline_noise_stop_enabled, bool):
+            raise TypeError("baseline_noise_stop_enabled must be bool")
+        if (
+            not math.isfinite(float(self.baseline_noise_count_multiplier))
+            or float(self.baseline_noise_count_multiplier) <= 0
+        ):
+            raise ValueError("baseline_noise_count_multiplier must be finite and > 0")
+        if not 0 < float(self.baseline_noise_pixel_fraction) <= 1:
+            raise ValueError("baseline_noise_pixel_fraction must be in (0, 1]")
+        if (
+            not isinstance(self.baseline_noise_consecutive_codes, int)
+            or isinstance(self.baseline_noise_consecutive_codes, bool)
+            or self.baseline_noise_consecutive_codes < 1
+        ):
+            raise ValueError("baseline_noise_consecutive_codes must be a positive integer")
 
 
 @dataclass

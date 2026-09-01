@@ -192,6 +192,32 @@ NOISE_SHUTTER_DURATION_S = 0.001
 # При 100 кГц и 0.010 с получается номинально 1000 отрицательных фронтов.
 SCURVE_SHUTTER_DURATION_S = 0.010
 NOISE_REPEATS = 10
+# Пороговый ЦАП S-curve идет от большого кода к меньшему. Это оставляет в
+# измерении полезную инжекцию на отрицательном фронте CTRL и не продолжает
+# скан далеко ниже базовой линии к ветви противоположной полярности.
+SCURVE_SCAN_DESCENDING = True
+# None означает крайний код, реально присутствующий в LUT. Для полной
+# характеристики 0..1023 явные значения ниже эквивалентны None.
+SCURVE_COARSE_HIGH_CODE: int | None = 1023
+SCURVE_COARSE_LOW_CODE: int | None = 0
+SCURVE_COARSE_STEP = 8
+# После coarse-прохода соседние точки, между которыми расположен уровень 50%,
+# переснимаются с этим шагом. Значение 1 дает максимальную кодовую точность V50.
+SCURVE_FINE_STEP = 1
+SCURVE_FINE_MARGIN_CODES = 8
+
+# Мягкая остановка около шумовой базовой линии. Сначала полностью сохраняются
+# background и signal для текущего кода. Точка считается шумовой, если не менее
+# заданной доли исправных пикселей имеют background строго больше Nnom *
+# MULTIPLIER. Остановка выполняется только после двух таких кодов подряд, то
+# есть характерные 1-2 точки с количеством отсчетов намного выше N остаются в
+# raw-данных и на диагностических графиках. Одиночный выброс не останавливает
+# проход. При PWM Nnom автоматически равно round(Freal * экспозиция УПО).
+SCURVE_BASELINE_NOISE_STOP_ENABLED = True
+SCURVE_BASELINE_NOISE_COUNT_MULTIPLIER = 1.0
+SCURVE_BASELINE_NOISE_PIXEL_FRACTION = 0.10
+SCURVE_BASELINE_NOISE_CONSECUTIVE_CODES = 2
+
 # Ограничения coarse и автоматического fine сканирования включительно.
 # Например, 400..900 сокращает поиск, но исключенные области не измеряются.
 # Универсальный узкий диапазон неизвестен: задайте его по своему пилотному скану.
@@ -353,6 +379,24 @@ def build_settings(
     )
     settings.scurve.maximum_reference_step_error_v = (
         MAXIMUM_REFERENCE_STEP_ERROR_V
+    )
+    settings.scurve.scan_descending = SCURVE_SCAN_DESCENDING
+    settings.scurve.coarse_high_code = SCURVE_COARSE_HIGH_CODE
+    settings.scurve.coarse_low_code = SCURVE_COARSE_LOW_CODE
+    settings.scurve.coarse_step = SCURVE_COARSE_STEP
+    settings.scurve.fine_step = SCURVE_FINE_STEP
+    settings.scurve.fine_margin_codes = SCURVE_FINE_MARGIN_CODES
+    settings.scurve.baseline_noise_stop_enabled = (
+        SCURVE_BASELINE_NOISE_STOP_ENABLED
+    )
+    settings.scurve.baseline_noise_count_multiplier = (
+        SCURVE_BASELINE_NOISE_COUNT_MULTIPLIER
+    )
+    settings.scurve.baseline_noise_pixel_fraction = (
+        SCURVE_BASELINE_NOISE_PIXEL_FRACTION
+    )
+    settings.scurve.baseline_noise_consecutive_codes = (
+        SCURVE_BASELINE_NOISE_CONSECUTIVE_CODES
     )
     settings.analysis = AnalysisSettings(
         workers=ANALYSIS_WORKERS,

@@ -315,6 +315,60 @@ def _amplitude_label(frame: pd.DataFrame) -> str:
     return "unknown amplitude"
 
 
+def _truthy_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame:
+        return pd.Series(False, index=frame.index, dtype=bool)
+    values = frame[column]
+    if pd.api.types.is_bool_dtype(values):
+        return values.fillna(False).astype(bool)
+    return values.astype(str).str.strip().str.lower().isin(("true", "1", "yes"))
+
+
+def _scurve_raw_count_envelope(
+    frame: pd.DataFrame,
+    *,
+    count_column: str,
+    valid_column: str,
+    active_pixels_only: bool,
+) -> pd.DataFrame:
+    """Aggregate raw paired counts without applying S-curve fit rejection."""
+
+    required = {"threshold_dac_code", count_column, valid_column}
+    if frame.empty or not required.issubset(frame.columns):
+        return pd.DataFrame()
+    use = _truthy_series(frame, valid_column)
+    if active_pixels_only:
+        use &= _truthy_series(frame, "active_injection_pixel_bool")
+    data = frame.loc[use].copy()
+    data["threshold_dac_code"] = pd.to_numeric(
+        data["threshold_dac_code"], errors="coerce"
+    )
+    data[count_column] = pd.to_numeric(data[count_column], errors="coerce")
+    data["injections_for_analysis"] = pd.to_numeric(
+        data.get("injections_for_analysis"), errors="coerce"
+    )
+    data = data.dropna(subset=["threshold_dac_code", count_column])
+    if data.empty:
+        return pd.DataFrame()
+    envelope = data.groupby("threshold_dac_code", as_index=False).agg(
+        count_median=(count_column, "median"),
+        count_q10=(count_column, lambda values: values.quantile(0.10)),
+        count_q90=(count_column, lambda values: values.quantile(0.90)),
+        count_q95=(count_column, lambda values: values.quantile(0.95)),
+        count_maximum=(count_column, "max"),
+        nominal_injections=("injections_for_analysis", "median"),
+    )
+    return envelope.sort_values("threshold_dac_code")
+
+
+def _style_descending_raw_count_axis(axis: plt.Axes) -> None:
+    axis.invert_xaxis()
+    axis.set_yscale("symlog", linthresh=1.0)
+    axis.set_ylim(bottom=0)
+    axis.set_xlabel("Threshold DAC code, high to low")
+    axis.set_ylabel("Raw decoded count")
+
+
 def _noise_prediction(fit: pd.Series, voltage: np.ndarray) -> np.ndarray | None:
     if fit.get("fit_status") != "ok":
         return None
@@ -1214,6 +1268,266 @@ def generate_diagnostic_plots(
         )
 
     if not scurve_efficiency.empty:
+        raw_patterns = sorted(
+            scurve_efficiency["injection_pattern"].dropna().astype(str).unique(),
+            key=lambda value: (value != "all", value),
+        )
+        raw_color_map = plt.get_cmap("viridis")
+        for pattern in raw_patterns:
+            pattern_raw = scurve_efficiency[
+                scurve_efficiency["injection_pattern"].astype(str) == pattern
+            ].copy()
+            amplitude_frames = list(
+                pattern_raw.groupby(
+                    "pulse_amplitude_native", dropna=False, sort=False
+                )
+            )
+            for amplitude_index, (_, amplitude_raw) in enumerate(amplitude_frames):
+                signal_envelope = _scurve_raw_count_envelope(
+                    amplitude_raw,
+                    count_column="signal_count",
+                    valid_column="signal_valid",
+                    active_pixels_only=True,
+                )
+                background_envelope = _scurve_raw_count_envelope(
+                    amplitude_raw,
+                    count_column="background_count",
+                    valid_column="background_valid",
+                    active_pixels_only=False,
+                )
+                if signal_envelope.empty and background_envelope.empty:
+                    continue
+                figure, axes = plt.subplots(
+                    1, 2, figsize=(12.2, 4.8), layout="constrained"
+                )
+                nominal_values: list[float] = []
+                if not signal_envelope.empty:
+                    x = signal_envelope["threshold_dac_code"].to_numpy(dtype=float)
+                    axes[0].plot(
+                        x,
+                        signal_envelope["count_median"],
+                        marker="o",
+                        markersize=3.0,
+                        linewidth=1.1,
+                        color="#1f77b4",
+                        label="Signal median",
+                    )
+                    axes[0].fill_between(
+                        x,
+                        signal_envelope["count_q10"].to_numpy(dtype=float),
+                        signal_envelope["count_q90"].to_numpy(dtype=float),
+                        color="#1f77b4",
+                        alpha=0.20,
+                        label="Signal 10-90% pixels",
+                    )
+                    axes[0].plot(
+                        x,
+                        signal_envelope["count_q95"],
+                        color="#1f77b4",
+                        linestyle=":",
+                        linewidth=1.0,
+                        label="Signal q95",
+                    )
+                    nominal_values.extend(
+                        pd.to_numeric(
+                            signal_envelope["nominal_injections"], errors="coerce"
+                        ).dropna().tolist()
+                    )
+                if not background_envelope.empty:
+                    x = background_envelope["threshold_dac_code"].to_numpy(dtype=float)
+                    axes[1].plot(
+                        x,
+                        background_envelope["count_median"],
+                        marker="o",
+                        markersize=3.0,
+                        linewidth=1.1,
+                        color="#4daf4a",
+                        label="Background median",
+                    )
+                    axes[1].plot(
+                        x,
+                        background_envelope["count_q90"],
+                        color="#ff7f00",
+                        linewidth=1.2,
+                        label="Background q90",
+                    )
+                    axes[1].plot(
+                        x,
+                        background_envelope["count_q95"],
+                        color="#e41a1c",
+                        linewidth=1.2,
+                        label="Background q95",
+                    )
+                    axes[1].plot(
+                        x,
+                        background_envelope["count_maximum"],
+                        color="#984ea3",
+                        linestyle=":",
+                        linewidth=0.9,
+                        label="Background maximum",
+                    )
+                    nominal_values.extend(
+                        pd.to_numeric(
+                            background_envelope["nominal_injections"], errors="coerce"
+                        ).dropna().tolist()
+                    )
+                nominal = (
+                    float(np.median(nominal_values)) if nominal_values else float("nan")
+                )
+                for axis in axes:
+                    _style_descending_raw_count_axis(axis)
+                    if math.isfinite(nominal):
+                        axis.axhline(
+                            nominal,
+                            color="black",
+                            linestyle="--",
+                            linewidth=1.0,
+                            label=f"Nominal N = {nominal:g}",
+                        )
+                    axis.legend()
+                axes[0].set_title("Injected pixels: signal counts")
+                axes[1].set_title(
+                    "Paired background: retained baseline-noise points"
+                )
+                figure.suptitle(
+                    f"Raw S-curve counts, {_amplitude_label(amplitude_raw)}, "
+                    f"pattern {pattern}; no fit filtering"
+                )
+                stem = (
+                    f"matrix_scurve_raw_counts_{_safe_stem(pattern)}_"
+                    f"amplitude_{amplitude_index:03d}"
+                )
+                outputs[stem] = _save_figure(
+                    figure, plot_directory, stem, settings
+                )
+
+            pattern_results = (
+                scurve_results[
+                    scurve_results["injection_pattern"].astype(str) == pattern
+                ].copy()
+                if not scurve_results.empty
+                else pd.DataFrame()
+            )
+            if not pattern_results.empty:
+                coordinate_source = pattern_results
+                coordinate_value = "v50_v"
+            else:
+                coordinate_source = pattern_raw[
+                    _truthy_series(pattern_raw, "active_injection_pixel_bool")
+                ].copy()
+                coordinate_source = coordinate_source.groupby(
+                    ["column", "row"], as_index=False
+                ).agg(threshold_voltage_v=("threshold_voltage_v", "median"))
+                coordinate_value = "threshold_voltage_v"
+            raw_coordinates = _plot_coordinates(
+                settings, coordinate_source, coordinate_value
+            )
+            for column, row in raw_coordinates:
+                figure, axes = plt.subplots(
+                    1, 2, figsize=(12.2, 4.8), layout="constrained"
+                )
+                plotted = False
+                nominal_values = []
+                for amplitude_index, (_, amplitude_raw) in enumerate(amplitude_frames):
+                    pixel_raw = amplitude_raw[
+                        (pd.to_numeric(amplitude_raw["column"], errors="coerce") == column)
+                        & (pd.to_numeric(amplitude_raw["row"], errors="coerce") == row)
+                    ]
+                    signal_envelope = _scurve_raw_count_envelope(
+                        pixel_raw,
+                        count_column="signal_count",
+                        valid_column="signal_valid",
+                        active_pixels_only=True,
+                    )
+                    background_envelope = _scurve_raw_count_envelope(
+                        pixel_raw,
+                        count_column="background_count",
+                        valid_column="background_valid",
+                        active_pixels_only=False,
+                    )
+                    color = raw_color_map(
+                        amplitude_index / max(len(amplitude_frames) - 1, 1)
+                    )
+                    label = _amplitude_label(amplitude_raw)
+                    if not signal_envelope.empty:
+                        x = signal_envelope["threshold_dac_code"].to_numpy(dtype=float)
+                        axes[0].plot(
+                            x,
+                            signal_envelope["count_median"],
+                            marker="o",
+                            markersize=2.8,
+                            linewidth=1.0,
+                            color=color,
+                            label=label,
+                        )
+                        axes[0].fill_between(
+                            x,
+                            signal_envelope["count_q10"].to_numpy(dtype=float),
+                            signal_envelope["count_q90"].to_numpy(dtype=float),
+                            color=color,
+                            alpha=0.08,
+                        )
+                        nominal_values.extend(
+                            pd.to_numeric(
+                                signal_envelope["nominal_injections"], errors="coerce"
+                            ).dropna().tolist()
+                        )
+                        plotted = True
+                    if not background_envelope.empty:
+                        x = background_envelope["threshold_dac_code"].to_numpy(dtype=float)
+                        axes[1].plot(
+                            x,
+                            background_envelope["count_q95"],
+                            marker="o",
+                            markersize=2.8,
+                            linewidth=1.0,
+                            color=color,
+                            label=label,
+                        )
+                        axes[1].plot(
+                            x,
+                            background_envelope["count_median"],
+                            linestyle=":",
+                            linewidth=0.8,
+                            color=color,
+                        )
+                        nominal_values.extend(
+                            pd.to_numeric(
+                                background_envelope["nominal_injections"], errors="coerce"
+                            ).dropna().tolist()
+                        )
+                        plotted = True
+                if not plotted:
+                    plt.close(figure)
+                    continue
+                nominal = (
+                    float(np.median(nominal_values)) if nominal_values else float("nan")
+                )
+                for axis in axes:
+                    _style_descending_raw_count_axis(axis)
+                    if math.isfinite(nominal):
+                        axis.axhline(
+                            nominal,
+                            color="black",
+                            linestyle="--",
+                            linewidth=1.0,
+                            label=f"Nominal N = {nominal:g}",
+                        )
+                    axis.legend(ncol=2)
+                axes[0].set_title("Signal median and 10-90% repeats")
+                axes[1].set_title("Background q95; dotted lines are medians")
+                figure.suptitle(
+                    f"Pixel C{column:02d} R{row:02d}: raw S-curve counts, "
+                    f"pattern {pattern}"
+                )
+                stem = (
+                    f"pixel_C{column:02d}_R{row:02d}_"
+                    f"scurve_raw_counts_{_safe_stem(pattern)}"
+                )
+                outputs[stem] = _save_figure(
+                    figure, plot_directory, stem, settings
+                )
+
         valid = scurve_efficiency[
             scurve_efficiency["fit_valid"].astype(str).str.lower().isin(("true", "1"))
         ].copy()
@@ -1281,11 +1595,15 @@ def generate_diagnostic_plots(
                             color=color,
                             label=label,
                         )
-                        fit = pattern_results[
-                            (pattern_results["pulse_amplitude_native"] == amplitude)
-                            & (pattern_results["column"] == column)
-                            & (pattern_results["row"] == row)
-                        ]
+                        fit = (
+                            pattern_results[
+                                (pattern_results["pulse_amplitude_native"] == amplitude)
+                                & (pattern_results["column"] == column)
+                                & (pattern_results["row"] == row)
+                            ]
+                            if not pattern_results.empty
+                            else pd.DataFrame()
+                        )
                         if not fit.empty and fit.iloc[0]["fit_status"] in (
                             "ok",
                             "poor_quality",
