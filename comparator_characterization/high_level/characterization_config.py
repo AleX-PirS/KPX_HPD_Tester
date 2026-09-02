@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Защита от случайного запуска реального стенда.
-ENABLE_HARDWARE_RUN = False
+ENABLE_HARDWARE_RUN = True
 
 # None/{}: один обычный тест. Иначе декартово произведение значений EO_cfg.
 # Например: {"DAC_CMP_BIAS_LSB": [200, 500], "DAC_CMP_VB5": [500, 1000]}.
@@ -109,12 +109,12 @@ REFERENCE_LUT_VOLTAGE_UNIT = "auto"
 # Пользователь задает только требуемые положительные ступеньки REF1-REF2.
 # Единица здесь mV. Скрипт выбирает измеренные LUT-точки и всегда требует
 # физическое условие V_REF1 > V_REF2.
-INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 40.0, 50.0)
+INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 50.0, 100.0, 250.0)
 
 # По умолчанию оба выбранных кода строго больше 400.
 MINIMUM_REFERENCE_CODE = 401
 # Верхняя граница включительно, также применяется к обоим REF.
-MAXIMUM_REFERENCE_CODE = 800
+MAXIMUM_REFERENCE_CODE = 900
 # Это отдельное ограничение по измеренному напряжению, обычно оставляется None.
 MINIMUM_REFERENCE_VOLTAGE_V: float | None = None
 # Необязательная цель общего уровня (V_REF1 + V_REF2)/2.
@@ -207,7 +207,7 @@ SCURVE_COARSE_STEP = 8
 # После coarse-прохода соседние точки, между которыми расположен уровень 50%,
 # переснимаются с этим шагом. Значение 1 дает максимальную кодовую точность V50.
 SCURVE_FINE_STEP = 1
-SCURVE_FINE_MARGIN_CODES = 8
+SCURVE_FINE_MARGIN_CODES = 16
 
 # Мягкая остановка около шумовой базовой линии. Сначала полностью сохраняются
 # background и signal для текущего кода. Точка считается шумовой, если не менее

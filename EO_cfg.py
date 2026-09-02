@@ -323,7 +323,7 @@ DEFAULT_FIELD_VALUES = {
     "DAC_SH_VC4_TR": 3,
 
     # Comparators
-    "DAC_CMP_BIAS_LSB": 400,
+    "DAC_CMP_BIAS_LSB": 800,
     "DAC_CMP_BIAS_LSB_TR": 3,
     "DAC_CMP_VB5": 800,
     "DAC_CMP_VB5_TR": 3,
@@ -343,9 +343,9 @@ DEFAULT_FIELD_VALUES = {
     "DAC_BUF_HB_TR": 3,
     "DAC_BUF_LB": 512,
     "DAC_BUF_LB_TR": 3,
-    "DAC_BUF50_TST": 410,
+    "DAC_BUF50_TST": 1000,
     "DAC_BUF50_TST_TR": 3,
-    "DAC_BUF50_MUX": 1023,
+    "DAC_BUF50_MUX": 1000,
     "DAC_BUF50_MUX_TR": 15,
 
     # Injection system
