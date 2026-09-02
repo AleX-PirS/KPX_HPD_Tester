@@ -17,7 +17,11 @@ def main() -> None:
     config.configure_runtime_logging()
     config.require_hardware_run_enabled()
     settings = config.build_settings()
-    with config.build_generator() as generator, config.build_upo_client() as client:
+    with (
+        config.build_generator() as generator,
+        config.build_oscilloscope() as oscilloscope,
+        config.build_upo_client() as client,
+    ):
         result = config.run_characterization(
             client,
             config.threshold_calibration_files(),
@@ -27,14 +31,14 @@ def main() -> None:
             base_pixel_config=config.base_pixel_config(),
             results_root=config.RESULTS_ROOT,
             settings=settings,
-            reference_calibration_files=config.reference_calibration_files(),
-            injection_voltage_steps_v=config.injection_voltage_steps_v(),
-            reference_calibration_voltage_unit=config.REFERENCE_LUT_VOLTAGE_UNIT,
             gain_map=config.gain_map(),
             run_noise_scan=True,
             run_equalization=True,
             run_scurve=True,
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
+            **config.reference_hardware_arguments(
+                oscilloscope, required_for_scurve=True
+            ),
             **config.injection_hardware_arguments(generator),
         )
     print(f"Полная характеризация завершена: {result.experiment_path}")

@@ -46,6 +46,12 @@ from .models import (
 )
 from .pixel_masks import BadPixelMapInput, normalize_bad_pixel_map
 from .recommendations import load_recommended_trim_map, propose_noise_trim_maps
+from .reference_verification import (
+    ReferenceStepVerificationError,
+    ReferenceStepVerificationResult,
+    ReferenceStepVerificationSettings,
+    verify_reference_steps,
+)
 from .workflow import (
     CharacterizationResult,
     ManualExposureChange,
@@ -79,6 +85,9 @@ __all__ = [
     "NoiseScanSettings",
     "ReferenceDacCalibration",
     "ReferencePairSelection",
+    "ReferenceStepVerificationError",
+    "ReferenceStepVerificationResult",
+    "ReferenceStepVerificationSettings",
     "ScurveSettings",
     "ShotExecutionResult",
     "ShotExecutor",
@@ -103,4 +112,5 @@ __all__ = [
     "resolve_gain_map",
     "normalize_bad_pixel_map",
     "select_reference_dac_pairs",
+    "verify_reference_steps",
 ]

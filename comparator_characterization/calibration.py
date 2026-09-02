@@ -337,6 +337,8 @@ class ReferencePairSelection:
     selected_common_mode_target_v: float | None = None
     common_mode_step_error_slack_v: float = 0.0
     minimum_achievable_step_error_v: float = 0.0
+    fixed_ref1_voltage_v: float | None = None
+    ref1_shared_across_amplitudes: bool = False
 
     def to_pulse_amplitude(self) -> dict[str, Any]:
         return {
@@ -352,6 +354,8 @@ class ReferencePairSelection:
             "selected_common_mode_target_v": self.selected_common_mode_target_v,
             "common_mode_step_error_slack_v": self.common_mode_step_error_slack_v,
             "minimum_achievable_step_error_v": self.minimum_achievable_step_error_v,
+            "fixed_ref1_voltage_v": self.fixed_ref1_voltage_v,
+            "ref1_shared_across_amplitudes": self.ref1_shared_across_amplitudes,
             "ref1_voltage_above_ref2": True,
             "reference_pair_selection_method": self.selection_method,
             "minimum_reference_code": self.minimum_reference_code,
@@ -414,15 +418,19 @@ def select_reference_dac_pairs(
     minimum_reference_voltage_v: float | None = None,
     preferred_reference_common_mode_v: float | None = None,
     common_mode_step_error_slack_v: float = 0.0,
-    maximum_reference_step_error_v: float | None = None,
+    maximum_reference_step_error_v: float | None = 1e-3,
 ) -> tuple[ReferencePairSelection, ...]:
-    """Select measured REF1/REF2 codes for positive physical voltage steps.
+    """Select one fixed low REF1 and a separate REF2 for every positive step.
 
-    Candidate pairs stay within ``common_mode_step_error_slack_v`` of the
-    minimum achievable step error. Inside that narrow accuracy band, either a
-    configured common-mode target or one automatically shared by all requested
-    steps is preferred. The physical ordering ``V_REF1 > V_REF2`` is mandatory
-    for every returned pair.
+    The selector uses measured LUT rows only and enforces ``V_REF1 > V_REF2``.
+    With a finite ``maximum_reference_step_error_v`` it first finds every REF1
+    level for which all requested steps can be represented within that error,
+    then chooses the lowest *measured voltage* REF1. REF2 alone changes between
+    amplitudes. Distinct requested steps receive distinct REF2 codes.
+
+    ``preferred_reference_common_mode_v`` and
+    ``common_mode_step_error_slack_v`` remain accepted for source compatibility,
+    but common-mode optimization is deliberately not used by this policy.
     """
 
     if not isinstance(minimum_reference_code, int) or isinstance(
@@ -485,140 +493,135 @@ def select_reference_dac_pairs(
             "no measured REF pair satisfies the required physical order V_REF1 > V_REF2"
         )
 
-    candidate_sets: list[tuple[float, float, np.ndarray]] = []
-    for target in requested:
-        errors = np.where(valid_order, np.abs(delta - target), np.inf)
-        minimum_error = float(np.min(errors))
-        if (
-            maximum_reference_step_error_v is not None
-            and minimum_error > maximum_reference_step_error_v
-        ):
-            raise ValueError(
-                f"nearest REF pair for requested step {target:g} V has error "
-                f"{minimum_error:g} V, above maximum_reference_step_error_v="
-                f"{maximum_reference_step_error_v:g} V"
-            )
-        allowed_error = minimum_error + common_mode_step_error_slack_v
-        if maximum_reference_step_error_v is not None:
-            allowed_error = min(allowed_error, maximum_reference_step_error_v)
-        candidate_indices = np.argwhere(
-            valid_order & (errors <= allowed_error + 1e-15)
-        )
-        if not len(candidate_indices):
-            raise RuntimeError("internal REF pair candidate selection failure")
-        candidate_sets.append((target, minimum_error, candidate_indices))
-
-    selected_common_mode_target = preferred_reference_common_mode_v
-    automatic_shared_common_mode = False
-    if (
-        selected_common_mode_target is None
-        and common_mode_step_error_slack_v > 0
-        and len(candidate_sets) > 1
-    ):
-        common_mode_candidates: list[np.ndarray] = []
-        for _, _, indices in candidate_sets:
-            common_mode_candidates.append(
-                np.sort(
-                    0.5
-                    * (
-                        ref1_voltages[indices[:, 0]]
-                        + ref2_voltages[indices[:, 1]]
-                    )
+    global_minimum_errors = tuple(
+        float(np.min(np.where(valid_order, np.abs(delta - target), np.inf)))
+        for target in requested
+    )
+    if maximum_reference_step_error_v is not None:
+        for target, minimum_error in zip(requested, global_minimum_errors):
+            if minimum_error > maximum_reference_step_error_v:
+                raise ValueError(
+                    f"nearest REF pair for requested step {target:g} V has error "
+                    f"{minimum_error:g} V, above maximum_reference_step_error_v="
+                    f"{maximum_reference_step_error_v:g} V"
                 )
-            )
-        evaluation_grid = np.unique(np.concatenate(common_mode_candidates))
-        if len(evaluation_grid) > 20_001:
-            evaluation_grid = np.linspace(
-                float(evaluation_grid.min()),
-                float(evaluation_grid.max()),
-                20_001,
-            )
-        nearest_distances: list[np.ndarray] = []
-        for values in common_mode_candidates:
-            positions = np.searchsorted(values, evaluation_grid)
-            lower_positions = np.clip(positions - 1, 0, len(values) - 1)
-            upper_positions = np.clip(positions, 0, len(values) - 1)
-            nearest_distances.append(
-                np.minimum(
-                    np.abs(evaluation_grid - values[lower_positions]),
-                    np.abs(evaluation_grid - values[upper_positions]),
-                )
-            )
-        distance_matrix = np.vstack(nearest_distances)
-        maximum_distance = np.max(distance_matrix, axis=0)
-        total_distance = np.sum(distance_matrix, axis=0)
-        order = np.lexsort((-evaluation_grid, total_distance, maximum_distance))
-        selected_common_mode_target = float(evaluation_grid[int(order[0])])
-        automatic_shared_common_mode = True
 
-    if preferred_reference_common_mode_v is not None:
-        method = (
-            "unique_pairs_step_error_band_then_configured_common_mode_"
-            "then_highest_low_code"
+    def distinct_ref2_assignment(
+        ref1_index: int,
+        error_limit: float,
+    ) -> tuple[dict[int, int], tuple[float, ...]] | None:
+        options: dict[int, list[int]] = {}
+        error_rows: dict[int, np.ndarray] = {}
+        for target_index, target in enumerate(requested):
+            errors = np.abs(delta[ref1_index] - target)
+            permitted = np.flatnonzero(
+                valid_order[ref1_index] & (errors <= error_limit + 1e-15)
+            )
+            if not len(permitted):
+                return None
+            options[target_index] = sorted(
+                (int(index) for index in permitted),
+                key=lambda index: (
+                    float(errors[index]),
+                    int(ref2_codes[index]),
+                ),
+            )
+            error_rows[target_index] = errors
+
+        ref2_to_target: dict[int, int] = {}
+
+        def assign(target_index: int, visited: set[int]) -> bool:
+            for ref2_index in options[target_index]:
+                if ref2_index in visited:
+                    continue
+                visited.add(ref2_index)
+                previous_target = ref2_to_target.get(ref2_index)
+                if previous_target is None or assign(previous_target, visited):
+                    ref2_to_target[ref2_index] = target_index
+                    return True
+            return False
+
+        for target_index in sorted(options, key=lambda index: (len(options[index]), index)):
+            if not assign(target_index, set()):
+                return None
+        target_to_ref2 = {
+            target_index: ref2_index
+            for ref2_index, target_index in ref2_to_target.items()
+        }
+        selected_errors = tuple(
+            float(error_rows[index][target_to_ref2[index]])
+            for index in range(len(requested))
         )
-    elif automatic_shared_common_mode:
-        method = (
-            "unique_pairs_step_error_band_then_automatic_shared_common_mode_"
-            "then_highest_low_code"
-        )
+        return target_to_ref2, selected_errors
+
+    ref1_order = sorted(
+        range(len(ref1_codes)),
+        key=lambda index: (float(ref1_voltages[index]), int(ref1_codes[index])),
+    )
+    selected_ref1_index: int | None = None
+    selected_assignment: dict[int, int] | None = None
+    selected_errors: tuple[float, ...] | None = None
+    if maximum_reference_step_error_v is not None:
+        for ref1_index in ref1_order:
+            result = distinct_ref2_assignment(
+                ref1_index, maximum_reference_step_error_v
+            )
+            if result is not None:
+                selected_ref1_index = ref1_index
+                selected_assignment, selected_errors = result
+                break
     else:
-        method = "unique_pairs_minimum_abs_step_error_then_highest_low_code_and_voltage"
-
-    selections: list[ReferencePairSelection] = []
-    used_pairs: set[tuple[int, int]] = set()
-    for target, minimum_error, candidate_indices in candidate_sets:
-        unused_candidates = np.asarray(
-            [
-                item
-                for item in candidate_indices
-                if (int(item[0]), int(item[1])) not in used_pairs
-            ],
-            dtype=int,
-        )
-        if not len(unused_candidates):
-            raise ValueError("not enough distinct physical REF pairs for all requested steps")
-
-        def candidate_key(index_pair: np.ndarray) -> tuple[float, ...]:
-            index1, index2 = (int(index_pair[0]), int(index_pair[1]))
-            code1 = int(ref1_codes[index1])
-            code2 = int(ref2_codes[index2])
-            voltage1 = float(ref1_voltages[index1])
-            voltage2 = float(ref2_voltages[index2])
-            common_mode = 0.5 * (voltage1 + voltage2)
-            step_error = abs(float(delta[index1, index2]) - target)
-            if selected_common_mode_target is not None:
-                return (
-                    abs(common_mode - selected_common_mode_target),
-                    step_error,
-                    -float(min(code1, code2)),
-                    -min(voltage1, voltage2),
-                    float(code1),
-                    float(code2),
+        candidates: list[
+            tuple[tuple[float, float, float, int], int, dict[int, int], tuple[float, ...]]
+        ] = []
+        for ref1_index in ref1_order:
+            result = distinct_ref2_assignment(ref1_index, float("inf"))
+            if result is None:
+                continue
+            assignment, errors = result
+            candidates.append(
+                (
+                    (
+                        max(errors),
+                        sum(errors),
+                        float(ref1_voltages[ref1_index]),
+                        int(ref1_codes[ref1_index]),
+                    ),
+                    ref1_index,
+                    assignment,
+                    errors,
                 )
-            return (
-                step_error,
-                -float(min(code1, code2)),
-                -min(voltage1, voltage2),
-                float(code1),
-                float(code2),
+            )
+        if candidates:
+            _, selected_ref1_index, selected_assignment, selected_errors = min(
+                candidates, key=lambda item: item[0]
             )
 
-        selected_index = min(unused_candidates, key=candidate_key)
-        index1, index2 = int(selected_index[0]), int(selected_index[1])
-        used_pairs.add((index1, index2))
-        code1 = int(ref1_codes[index1])
+    if selected_ref1_index is None or selected_assignment is None or selected_errors is None:
+        limit_text = (
+            f" within {maximum_reference_step_error_v:g} V"
+            if maximum_reference_step_error_v is not None
+            else ""
+        )
+        raise ValueError(
+            "no single measured REF1 level can represent every requested step"
+            f"{limit_text} with distinct REF2 codes and V_REF1 > V_REF2"
+        )
+
+    code1 = int(ref1_codes[selected_ref1_index])
+    voltage1 = float(ref1_voltages[selected_ref1_index])
+    method = (
+        "fixed_lowest_measured_REF1_voltage_then_distinct_nearest_REF2_"
+        "within_step_tolerance"
+    )
+    selections: list[ReferencePairSelection] = []
+    for target_index, target in enumerate(requested):
+        index2 = selected_assignment[target_index]
         code2 = int(ref2_codes[index2])
-        voltage1 = float(ref1_voltages[index1])
         voltage2 = float(ref2_voltages[index2])
         actual = voltage1 - voltage2
         signed_error = actual - target
         absolute_error = abs(signed_error)
-        if maximum_reference_step_error_v is not None and absolute_error > maximum_reference_step_error_v:
-            raise ValueError(
-                f"selected REF pair for requested step {target:g} V has error "
-                f"{absolute_error:g} V, above maximum_reference_step_error_v="
-                f"{maximum_reference_step_error_v:g} V"
-            )
         selections.append(
             ReferencePairSelection(
                 requested_voltage_step_v=target,
@@ -634,9 +637,11 @@ def select_reference_dac_pairs(
                 minimum_reference_code=minimum_reference_code,
                 maximum_reference_code=maximum_reference_code,
                 minimum_reference_voltage_v=minimum_reference_voltage_v,
-                selected_common_mode_target_v=selected_common_mode_target,
-                common_mode_step_error_slack_v=common_mode_step_error_slack_v,
-                minimum_achievable_step_error_v=minimum_error,
+                selected_common_mode_target_v=None,
+                common_mode_step_error_slack_v=0.0,
+                minimum_achievable_step_error_v=global_minimum_errors[target_index],
+                fixed_ref1_voltage_v=voltage1,
+                ref1_shared_across_amplitudes=True,
             )
         )
     return tuple(selections)

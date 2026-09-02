@@ -16,6 +16,7 @@ from comparator_characterization import (
     AnalysisSettings,
     CharacterizationSettings,
     KeysightBurstSettings,
+    ReferenceStepVerificationSettings,
     UpoPwmSettings,
     UpoPwmShotExecutor,
     load_gain_map_csv,
@@ -24,6 +25,7 @@ from comparator_characterization import (
 if TYPE_CHECKING:
     from generator_cfg import TwoChannelGenerator
     from mgpd import MGPDClient
+    from oscilloscope_cfg import Oscilloscope
 
 
 # Файл находится в comparator_characterization/high_level, поэтому корень
@@ -48,6 +50,35 @@ UPO_PORT = 0xBEEB
 UPO_TIMEOUT_S = 8.0
 UPO_RECONNECT_ATTEMPTS = 3
 UPO_RECONNECT_BACKOFF_S = 0.5
+
+# Перед каждым аппаратным тестом все выбранные REF-ступеньки проверяются на
+# осциллографе. CH1 = TST_SIG с AMUX, CH4 = CTRL. Оба входа DC, 1 МОм;
+# trigger CH4, NEG, 0.5 V; развертка 500 нс/дел. Для каждой ступеньки
+# сохраняются отдельные raw CSV при CLK OFF и CLK ON.
+VERIFY_REFERENCE_STEPS_BEFORE_TEST = True
+OSCILLOSCOPE_VISA_ADDRESS: str | None = None
+OSCILLOSCOPE_IDN_SUBSTRING = "DSO9104H"
+OSCILLOSCOPE_TIMEOUT_MS = 5_000
+REFERENCE_SIGNAL_CHANNEL = 1
+REFERENCE_TRIGGER_CHANNEL = 4
+REFERENCE_TRIGGER_LEVEL_V = 0.5
+REFERENCE_TIME_SCALE_S = 5e-7
+REFERENCE_TIME_OFFSET_S = 0.0
+REFERENCE_SIGNAL_SCALE_V = 0.2
+REFERENCE_SIGNAL_OFFSET_V = 0.4
+REFERENCE_TRIGGER_SCALE_V = 0.5
+REFERENCE_TRIGGER_OFFSET_V = 1.5
+REFERENCE_WAVEFORM_POINTS = 12_500
+REFERENCE_SCOPE_ARM_DELAY_S = 0.10
+REFERENCE_SCOPE_ACQUISITION_TIME_S = 0.25
+REFERENCE_PLATEAU_GUARD_S = 1.5e-7
+REFERENCE_PLATEAU_WINDOW_S = 1.0e-6
+REFERENCE_MAXIMUM_SCOPE_STEP_ERROR_V = 1e-3
+REFERENCE_VERIFICATION_CLK_ON_MHZ = 50
+REFERENCE_VERIFICATION_RETRIES = 2
+REFERENCE_VERIFICATION_RETRY_BACKOFF_S = 0.25
+REFERENCE_VERIFICATION_ABORT_ON_FAILURE = True
+REFERENCE_VERIFICATION_SAVE_SCREENSHOTS = False
 
 # Перед каждым аппаратным тестом FCLK явно устанавливается в 50 МГц, затем
 # загружаются EO_cfg.DEFAULT_REGISTERS и конфигурация всех 1024 PX:
@@ -117,13 +148,12 @@ MINIMUM_REFERENCE_CODE = 401
 MAXIMUM_REFERENCE_CODE = 900
 # Это отдельное ограничение по измеренному напряжению, обычно оставляется None.
 MINIMUM_REFERENCE_VOLTAGE_V: float | None = None
-# Необязательная цель общего уровня (V_REF1 + V_REF2)/2.
+# Устаревшие параметры сохранены для совместимости старых конфигов. Новый
+# алгоритм фиксирует один самый низкий допустимый REF1 и меняет только REF2.
 PREFERRED_REFERENCE_COMMON_MODE_V: float | None = None
-# Допустимое ухудшение относительно минимальной ошибки ступеньки. Внутри этой
-# узкой полосы селектор автоматически выравнивает common-mode всего набора.
-REFERENCE_COMMON_MODE_STEP_ERROR_SLACK_V = 50e-6
-# Максимально допустимая ошибка выбранной ступеньки, None отключает предел.
-MAXIMUM_REFERENCE_STEP_ERROR_V: float | None = None
+REFERENCE_COMMON_MODE_STEP_ERROR_SLACK_V = 0.0
+# Максимально допустимая ошибка выбранной по LUT ступеньки: 1 мВ.
+MAXIMUM_REFERENCE_STEP_ERROR_V: float | None = 1e-3
 
 # Выберите ровно один источник GAIN для S-curve: код ИЛИ CSV.
 # Значения GAIN: целые числа 0..31 для каждого выбранного исправного пикселя.
@@ -207,7 +237,7 @@ SCURVE_COARSE_STEP = 8
 # После coarse-прохода соседние точки, между которыми расположен уровень 50%,
 # переснимаются с этим шагом. Значение 1 дает максимальную кодовую точность V50.
 SCURVE_FINE_STEP = 1
-SCURVE_FINE_MARGIN_CODES = 16
+SCURVE_FINE_MARGIN_CODES = 8
 
 # Мягкая остановка около шумовой базовой линии. Сначала полностью сохраняются
 # background и signal для текущего кода. Точка считается шумовой, если не менее
@@ -248,6 +278,12 @@ PLOT_SCURVE_PATTERNS: tuple[str, ...] = ()
 REPRESENTATIVE_PIXEL_COUNT = 6
 SAVE_PDF_PLOTS = True
 PLOT_DPI = 300
+
+# Источник для локальной HTML-страницы. Допустим каталог эксперимента или
+# конкретный analysis/vNNN. None означает, что путь задается в командной строке.
+PLOT_DASHBOARD_EXPERIMENT: Path | None = None
+PLOT_DASHBOARD_PORT = 0
+PLOT_DASHBOARD_OPEN_BROWSER = True
 
 # S-curve fit: робастная оценка индивидуальных плато, монотонное упорядочивание
 # точек и probit-fit только центральных 5-95% перехода. Это не сглаживает raw и
@@ -456,6 +492,78 @@ def build_upo_client() -> "MGPDClient":
         reconnect_attempts=UPO_RECONNECT_ATTEMPTS,
         reconnect_backoff_s=UPO_RECONNECT_BACKOFF_S,
     )
+
+
+def build_oscilloscope():
+    """Контекст осциллографа или пустой контекст при отключенной проверке."""
+
+    if not VERIFY_REFERENCE_STEPS_BEFORE_TEST:
+        return nullcontext(None)
+    from oscilloscope_cfg import Oscilloscope
+
+    return Oscilloscope(
+        osc_address=OSCILLOSCOPE_VISA_ADDRESS,
+        idn_substring=OSCILLOSCOPE_IDN_SUBSTRING,
+        timeout_ms=OSCILLOSCOPE_TIMEOUT_MS,
+    )
+
+
+def build_reference_verification_settings() -> ReferenceStepVerificationSettings:
+    """Собрать настройки проверки REF через CH1/CH4."""
+
+    return ReferenceStepVerificationSettings(
+        enabled=VERIFY_REFERENCE_STEPS_BEFORE_TEST,
+        signal_channel=REFERENCE_SIGNAL_CHANNEL,
+        trigger_channel=REFERENCE_TRIGGER_CHANNEL,
+        trigger_level_v=REFERENCE_TRIGGER_LEVEL_V,
+        trigger_slope="NEG",
+        time_scale_s=REFERENCE_TIME_SCALE_S,
+        time_offset_s=REFERENCE_TIME_OFFSET_S,
+        waveform_points=REFERENCE_WAVEFORM_POINTS,
+        averaging_enabled=False,
+        average_count=1,
+        signal_scale_v=REFERENCE_SIGNAL_SCALE_V,
+        signal_offset_v=REFERENCE_SIGNAL_OFFSET_V,
+        trigger_scale_v=REFERENCE_TRIGGER_SCALE_V,
+        trigger_offset_v=REFERENCE_TRIGGER_OFFSET_V,
+        scope_arm_delay_s=REFERENCE_SCOPE_ARM_DELAY_S,
+        acquisition_time_s=REFERENCE_SCOPE_ACQUISITION_TIME_S,
+        plateau_guard_s=REFERENCE_PLATEAU_GUARD_S,
+        plateau_window_s=REFERENCE_PLATEAU_WINDOW_S,
+        maximum_scope_step_error_v=REFERENCE_MAXIMUM_SCOPE_STEP_ERROR_V,
+        clock_on_frequency_mhz=REFERENCE_VERIFICATION_CLK_ON_MHZ,
+        acquisition_retries=REFERENCE_VERIFICATION_RETRIES,
+        retry_backoff_s=REFERENCE_VERIFICATION_RETRY_BACKOFF_S,
+        abort_on_failure=REFERENCE_VERIFICATION_ABORT_ON_FAILURE,
+        save_screenshots=REFERENCE_VERIFICATION_SAVE_SCREENSHOTS,
+    )
+
+
+def reference_hardware_arguments(
+    oscilloscope: Any,
+    *,
+    required_for_scurve: bool,
+) -> dict[str, Any]:
+    """Передать REF LUT и при включении добавить проверку до измерений."""
+
+    verify = bool(VERIFY_REFERENCE_STEPS_BEFORE_TEST)
+    if not (required_for_scurve or verify):
+        return {}
+    arguments: dict[str, Any] = {
+        "reference_calibration_files": reference_calibration_files(),
+        "injection_voltage_steps_v": injection_voltage_steps_v(),
+        "reference_calibration_voltage_unit": REFERENCE_LUT_VOLTAGE_UNIT,
+    }
+    if verify:
+        if oscilloscope is None:
+            raise RuntimeError("Проверка REF включена, но осциллограф не был открыт")
+        arguments.update(
+            reference_step_oscilloscope=oscilloscope,
+            reference_step_verification_settings=build_reference_verification_settings(),
+            reference_verification_pwm_frequency_khz=UPO_CTRL_FREQUENCY_KHZ,
+            reference_verification_pwm_high_time_ns=UPO_CTRL_HIGH_TIME_NS,
+        )
+    return arguments
 
 
 def _normalized_ctrl_source() -> str:

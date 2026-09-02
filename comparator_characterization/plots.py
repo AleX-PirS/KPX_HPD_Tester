@@ -2035,30 +2035,31 @@ def generate_diagnostic_plots(
                 axes[1].axhline(0, color="black", linewidth=0.8)
                 axes[1].set_xlabel("Amplitude index")
                 axes[1].set_ylabel("Selection error, uV")
-                common_mode = _numeric_series(
-                    pair_table, "reference_common_mode_v"
-                )
+                ref1_level = _numeric_series(pair_table, "ref1_voltage_v")
+                ref2_level = _numeric_series(pair_table, "ref2_voltage_v")
                 axes[2].plot(
                     x,
-                    common_mode,
+                    ref1_level,
                     marker="o",
                     linewidth=1.0,
                     color="#e45756",
+                    label="REF1 (fixed)",
                 )
-                if common_mode.notna().any():
-                    axes[2].axhline(
-                        float(common_mode.median()),
-                        color="black",
-                        linestyle="--",
-                        linewidth=0.9,
-                    )
-                    span_mv = 1000.0 * float(
-                        common_mode.max() - common_mode.min()
-                    )
-                    axes[2].set_title(f"Common-mode span = {span_mv:.3f} mV")
+                axes[2].plot(
+                    x,
+                    ref2_level,
+                    marker="s",
+                    linewidth=1.0,
+                    color="#72b7b2",
+                    label="REF2 (varied)",
+                )
+                if ref1_level.notna().any():
+                    span_mv = 1000.0 * float(ref1_level.max() - ref1_level.min())
+                    axes[2].set_title(f"REF1 span = {span_mv:.3f} mV")
                 axes[2].set_xlabel("Requested REF1-REF2 step, mV")
-                axes[2].set_ylabel("(VREF1 + VREF2) / 2, V")
-                figure.suptitle("REF LUT pair-selection accuracy and common mode")
+                axes[2].set_ylabel("Measured LUT voltage, V")
+                axes[2].legend()
+                figure.suptitle("REF LUT selection: one fixed REF1, varied REF2")
                 outputs["reference_pair_selection"] = _save_figure(
                     figure, plot_directory, "reference_pair_selection", settings
                 )

@@ -2,13 +2,15 @@
 
 Все параметры пользователя собраны в `characterization_config.py`. Файлы
 `run_*.py` запускают конкретные измерения, `preview_ref_selection.py` проверяет
-выбор REF1/REF2 без стенда, а `plot_characterization.py` повторно анализирует
-сохраненный эксперимент.
+выбор REF1/REF2 без стенда, `run_reference_verification.py` отдельно проверяет
+ступеньки осциллографом, `plot_characterization.py` повторно анализирует
+эксперимент, а `run_plot_dashboard.py` открывает локальную страницу графиков.
 
 Запускайте команды из корня проекта. Рекомендуемый вариант:
 
 ```bash
 python -m comparator_characterization.high_level.preview_ref_selection
+python -m comparator_characterization.high_level.run_reference_verification
 python -m comparator_characterization.high_level.run_noise_scan
 python -m comparator_characterization.high_level.run_noise_equalization
 python -m comparator_characterization.high_level.run_full_trim_sweep
@@ -17,6 +19,7 @@ python -m comparator_characterization.high_level.run_full_characterization
 python -m comparator_characterization.high_level.run_eo_parameter_sweep
 python -m comparator_characterization.high_level.run_crosstalk
 python -m comparator_characterization.high_level.plot_characterization results/EXPERIMENT
+python -m comparator_characterization.high_level.run_plot_dashboard results/EXPERIMENT
 ```
 
 Допустим и прямой запуск файла, например:
@@ -74,20 +77,44 @@ SCURVE_COARSE_BASELINE_NOISE_CONSECUTIVE_CODES = 1
 SCURVE_BASELINE_NOISE_CONSECUTIVE_CODES = 2
 
 MINIMUM_REFERENCE_CODE = 401
-MAXIMUM_REFERENCE_CODE = 800  # сохранено из вашей конфигурации
-REFERENCE_COMMON_MODE_STEP_ERROR_SLACK_V = 50e-6
+MAXIMUM_REFERENCE_CODE = 900
+MAXIMUM_REFERENCE_STEP_ERROR_V = 1e-3
 NOISE_COARSE_START = 400     # пример, подберите по своему пилотному скану
 NOISE_COARSE_STOP = 900
 NOISE_COARSE_STEP = 4
 BAD_PIXEL_MAP = [(16, 0), (20, 5)]  # либо путь CSV/JSON, либо None
 ```
 
-Для полного набора амплитуд REF-пары выбираются совместно. Сначала для каждой
-ступеньки находится минимальная ошибка, затем в пределах дополнительных 50 uV
-автоматически выравнивается `(VREF1+VREF2)/2`. Это уменьшает зависимость
-результата от абсолютного уровня REF. Значение 0 возвращает прежний независимый
-выбор ближайшей пары. `PREFERRED_REFERENCE_COMMON_MODE_V` задает явную цель, а
-`MAXIMUM_REFERENCE_STEP_ERROR_V` остается жестким пределом.
+Для полного набора амплитуд REF-пары выбираются совместно. Алгоритм находит один
+самый низкий по измеренному напряжению уровень REF1, на котором все требуемые
+ступеньки достижимы с ошибкой не более 1 мВ. Этот REF1 остается одинаковым во
+всех точках, меняется только REF2. Для каждой пары обязательно проверяется
+`V_REF1 > V_REF2`; сравнение выполняется по напряжению LUT, а не по коду.
+Устаревшие common-mode параметры принимаются API только для совместимости и не
+участвуют в новом выборе.
+
+## Проверка REF осциллографом до теста
+
+По умолчанию `VERIFY_REFERENCE_STEPS_BEFORE_TEST = True`, поэтому каждый
+аппаратный запуск, включая noise-only и resume, после стандартной инициализации
+ASIC, но до настройки окна и первого `GET_SHOT`, выполняет одинаковую проверку:
+
+1. `TST_SIG` выводится на AMUX, REF1/REF2 программируются из выбранной таблицы.
+2. Осциллограф: CH1 = TST_SIG, CH4 = CTRL, оба входа DC 1 МОм.
+3. Trigger: CH4, отрицательный фронт, 0.5 В; развертка 500 нс/дел.
+4. Для каждой ступеньки снимается raw-кадр при `FCLK=0`, затем при рабочей FCLK.
+5. Ступенька CH1 считается по медианам плато до и после фронта CH4.
+6. Проверяется ошибка относительно LUT, по умолчанию не более 1 мВ.
+7. Восстанавливаются `TEST_MUX`, REF1, REF2, CTRL=0 и рабочая FCLK.
+
+Raw CH1/CH4 сохраняются в
+`reference_verification/run_TIMESTAMP/waveforms/*.csv`; рядом находятся
+`capture_metrics.csv`, `clk_comparison.csv`, JSON результата и сводный PNG.
+В `clk_comparison.csv` отдельно записано изменение ступеньки и шума плато при
+включении CLK. При ошибке данные сохраняются, затем тест безопасно прерывается.
+Вертикальные масштабы, окна плато, число повторных попыток и допуск находятся в
+`characterization_config.py`. Если нужно только проверить ступеньки, запустите
+`run_reference_verification.py`.
 
 Серия по параметрам EO_CFG задается декартовым произведением:
 
@@ -162,6 +189,24 @@ coarse-точками с эффективностью около 0 и 1. Эти 
 конфигурация, фактически измеренные coarse/fine диапазоны, timing и effective
 PWM normalization, V50/sigma, проверка шага 1 около D50, trim/mask рекомендации,
 ограничения GAIN и до двух основных графиков.
+
+## Локальная страница дополнительных графиков
+
+Автоматические графики в `analysis/vNNN/plots` остаются без изменений. Для
+дополнительного оформления запустите:
+
+```bash
+python -m comparator_characterization.high_level.run_plot_dashboard results/EXPERIMENT
+```
+
+Откроется локальный адрес `127.0.0.1`; данные во внешнюю сеть не отправляются.
+На странице можно выбрать отдельный график или набор, конкретный пиксель,
+noise-stage, `all/tile_2x2/tile_4x4/tile_8x8`, амплитуду, русский или английский
+язык, размеры заголовка/осей/делений/легенды, квадратные или растянутые ячейки
+матрицы, PNG/PDF/SVG и явные границы DAC. Для S-кривой стандартно показывается
+только положительная физическая ветвь; вариант `Полная / bipolar` оставляет обе
+полярности. Новые файлы и точный JSON запроса сохраняются в
+`analysis/vNNN/custom_plots/render_TIMESTAMP`.
 
 Резервный `keysight_burst` сохраняет задержку 0.8 s, `*TRG` и конечное число
 периодов `N_INJECTIONS`. В основном режиме `upo_pwm` внешний генератор и VISA не

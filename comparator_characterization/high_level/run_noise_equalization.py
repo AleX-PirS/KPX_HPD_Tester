@@ -17,7 +17,10 @@ def main() -> None:
     config.configure_runtime_logging()
     config.require_hardware_run_enabled()
     settings = config.build_settings(scan_all_trim_codes=False)
-    with config.build_upo_client() as client:
+    with (
+        config.build_oscilloscope() as oscilloscope,
+        config.build_upo_client() as client,
+    ):
         result = config.run_characterization(
             client,
             config.threshold_calibration_files(),
@@ -31,6 +34,9 @@ def main() -> None:
             run_equalization=True,
             run_scurve=False,
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
+            **config.reference_hardware_arguments(
+                oscilloscope, required_for_scurve=False
+            ),
         )
     print(f"Эксперимент завершен: {result.experiment_path}")
     config.print_result_paths(result)

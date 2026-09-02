@@ -113,7 +113,7 @@ def _key_figures(analysis_directory: Path) -> list[tuple[str, Path]]:
         ("Распределения порогов", plot_directory / "threshold_distributions_individual_scale.png"),
         ("Матрица до и после эквализации", plot_directory / "baseline_equalization_overview.png"),
         ("S-кривые матрицы", plot_directory / "matrix_scurves_all.png"),
-        ("Выбор REF и common-mode", plot_directory / "reference_pair_selection.png"),
+        ("Выбор фиксированного REF1 и REF2", plot_directory / "reference_pair_selection.png"),
         ("Качество S-curve fit", plot_directory / "scurve_fit_quality.png"),
     ]
     return [(label, path) for label, path in candidates if path.exists()]
@@ -152,6 +152,17 @@ def generate_analysis_report(
         if experiment_root is not None
         else pd.DataFrame()
     )
+    verification_history = metadata.get("reference_step_verification_history", [])
+    verification_record = (
+        verification_history[-1]
+        if isinstance(verification_history, list) and verification_history
+        else {}
+    )
+    verification_comparison = pd.DataFrame()
+    if experiment_root is not None and verification_record.get("clk_comparison_csv"):
+        candidate = (experiment_root / str(verification_record["clk_comparison_csv"])).resolve()
+        if candidate.is_relative_to(experiment_root.resolve()):
+            verification_comparison = _read_csv(candidate)
     if reference_pairs.empty and not scurve_efficiency.empty:
         source_columns = {
             "requested_injection_voltage_step_v": "requested_voltage_step_v",
@@ -245,26 +256,42 @@ def generate_analysis_report(
         conclusions.append(
             "Crosstalk между режимами разбиения не оценен, поскольку измерен только один pattern."
         )
-    if not reference_pairs.empty and "reference_common_mode_v" in reference_pairs:
-        common_modes = pd.to_numeric(
-            reference_pairs["reference_common_mode_v"], errors="coerce"
+    if not reference_pairs.empty and "ref1_voltage_v" in reference_pairs:
+        ref1_values = pd.to_numeric(
+            reference_pairs["ref1_voltage_v"], errors="coerce"
         ).dropna()
-        if len(common_modes):
-            common_mode_span_mv = 1000.0 * float(
-                common_modes.max() - common_modes.min()
-            )
-            if common_mode_span_mv > 10.0:
+        ref1_codes = pd.to_numeric(
+            reference_pairs.get("ref1_code"), errors="coerce"
+        ).dropna()
+        if len(ref1_values):
+            ref1_span_uv = 1e6 * float(ref1_values.max() - ref1_values.min())
+            if ref1_codes.nunique() == 1 and ref1_span_uv <= 1e-3:
                 conclusions.append(
-                    "REF common-mode меняется между ступеньками на "
-                    f"{_fmt(common_mode_span_mv, digits=3, suffix=' mV')}. "
-                    "Амплитудную характеристику нельзя интерпретировать как "
-                    "зависимость только от DeltaV без дополнительной проверки."
+                    "Все амплитуды используют один REF1: код "
+                    f"{_fmt(ref1_codes.iloc[0], digits=0)}, уровень "
+                    f"{_fmt(ref1_values.iloc[0], digits=6, suffix=' V')}; "
+                    "между точками меняется только REF2."
                 )
             else:
                 conclusions.append(
-                    "REF common-mode согласован для набора ступенек: span "
-                    f"{_fmt(common_mode_span_mv, digits=3, suffix=' mV')}."
+                    "Нарушена политика фиксированного REF1: обнаружено "
+                    f"{ref1_codes.nunique()} кодов, span уровня "
+                    f"{_fmt(ref1_span_uv, digits=3, suffix=' uV')}."
                 )
+    if verification_record:
+        conclusions.append(
+            "Осциллографическая проверка REF перед тестом: "
+            + ("пройдена." if verification_record.get("passed") else "НЕ пройдена.")
+        )
+        if not verification_comparison.empty:
+            maximum_clock_shift = 1000.0 * pd.to_numeric(
+                verification_comparison.get("clock_induced_absolute_step_shift_v"),
+                errors="coerce",
+            ).max()
+            conclusions.append(
+                "Максимальное изменение измеренной ступеньки при включении CLK: "
+                f"{_fmt(maximum_clock_shift, digits=3, suffix=' mV')}."
+            )
     for item in conclusions:
         lines.append(f"- {item}")
 
@@ -335,7 +362,6 @@ def generate_analysis_report(
                     _fmt(row.get("ref1_voltage_v"), digits=6),
                     _fmt(row.get("ref2_code"), digits=0),
                     _fmt(row.get("ref2_voltage_v"), digits=6),
-                    _fmt(row.get("reference_common_mode_v"), digits=6),
                 ]
             )
         lines.extend(
@@ -348,11 +374,53 @@ def generate_analysis_report(
                     "REF1, V",
                     "REF2 code",
                     "REF2, V",
-                    "Common-mode, V",
                 ],
                 reference_rows,
             )
         )
+
+    if verification_record:
+        lines.extend(["", "### Осциллографическая проверка REF", ""])
+        lines.append(
+            "Проверка выполнена до измерительной части через `AMUX=TST_SIG`: "
+            "CH1 - сигнал, CH4 - CTRL, входы 1 МОм, trigger NEG 0.5 V. "
+            "Для каждой ступеньки сохранены raw-кадры при CLK OFF и CLK ON."
+        )
+        if not verification_comparison.empty:
+            rows = []
+            for _, row in verification_comparison.sort_values(
+                "requested_voltage_step_v"
+            ).iterrows():
+                rows.append(
+                    [
+                        _fmt(1000 * _number(row.get("requested_voltage_step_v")), digits=3),
+                        _fmt(1000 * _number(row.get("measured_step_clk_off_v")), digits=3),
+                        _fmt(1000 * _number(row.get("measured_step_clk_on_v")), digits=3),
+                        _fmt(1000 * _number(row.get("clock_induced_step_shift_v")), digits=3),
+                        "да" if bool(row.get("pair_pass")) else "нет",
+                    ]
+                )
+            lines.extend(
+                [
+                    "",
+                    *_markdown_table(
+                        ["Requested, mV", "CLK OFF, mV", "CLK ON, mV", "ON-OFF, mV", "Pass"],
+                        rows,
+                    ),
+                ]
+            )
+        if experiment_root is not None and verification_record.get("output_directory"):
+            directory = experiment_root / str(verification_record["output_directory"])
+            lines.extend(
+                [
+                    "",
+                    _relative_link(
+                        analysis_directory,
+                        directory,
+                        "Каталог raw CSV и метрик проверки REF",
+                    ),
+                ]
+            )
 
     if not noise_fits.empty:
         lines.extend(["", "## Noise scan и эквализация", ""])
@@ -602,6 +670,14 @@ def generate_analysis_report(
         )
 
     figures = _key_figures(analysis_directory)
+    if experiment_root is not None and verification_record.get("output_directory"):
+        verification_plot = (
+            experiment_root
+            / str(verification_record["output_directory"])
+            / "reference_step_verification.png"
+        )
+        if verification_plot.exists():
+            figures.insert(0, ("Проверка REF при CLK OFF и CLK ON", verification_plot))
     if figures:
         lines.extend(["", "## Основные графики", ""])
         for label, path in figures[:2]:

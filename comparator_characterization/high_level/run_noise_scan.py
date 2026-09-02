@@ -15,7 +15,10 @@ from comparator_characterization.high_level import characterization_config as co
 def main() -> None:
     config.configure_runtime_logging()
     config.require_hardware_run_enabled()
-    with config.build_upo_client() as client:
+    with (
+        config.build_oscilloscope() as oscilloscope,
+        config.build_upo_client() as client,
+    ):
         result = config.run_characterization(
             client, config.threshold_calibration_files(),
             window=config.WINDOW, pixels=config.PIXELS,
@@ -24,6 +27,9 @@ def main() -> None:
             results_root=config.RESULTS_ROOT, settings=config.build_settings(),
             run_noise_scan=True, run_equalization=False, run_scurve=False,
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
+            **config.reference_hardware_arguments(
+                oscilloscope, required_for_scurve=False
+            ),
         )
     print(f"Пилотный noise scan завершен: {result.experiment_path}")
     config.print_result_paths(result)

@@ -266,6 +266,20 @@ class Oscilloscope:
 
     # ---------------- public API ----------------
 
+    def run_acquisition(self) -> None:
+        """Перевести осциллограф в режим ожидания/непрерывного захвата."""
+
+        self._write(":RUN")
+
+    def stop_acquisition(self) -> None:
+        """Остановить захват, чтобы waveform обоих каналов был одним кадром."""
+
+        self._write(":STOP")
+
+    # Короткие совместимые имена для измерительных адаптеров.
+    run = run_acquisition
+    stop = stop_acquisition
+
     def configure_frame(
         self,
         channels: list[int] | tuple[int, ...] = (1,),

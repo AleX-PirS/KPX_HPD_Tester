@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.11.0"
+FRAMEWORK_VERSION = "0.12.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -265,11 +265,12 @@ class ScurveSettings:
     # Inclusive upper bound for BOTH REF DACs, independent of voltage polarity.
     maximum_reference_code: int = 1023
     minimum_reference_voltage_v: float | None = None
+    # Deprecated compatibility inputs. The current selector deliberately uses
+    # one fixed, lowest feasible REF1 and changes only REF2.
     preferred_reference_common_mode_v: float | None = None
-    # A tiny step-error allowance lets the complete amplitude set share a
-    # nearly constant REF common mode instead of optimizing every pair alone.
-    reference_common_mode_step_error_slack_v: float = 50e-6
-    maximum_reference_step_error_v: float | None = None
+    reference_common_mode_step_error_slack_v: float = 0.0
+    # The selected measured LUT step must normally be within 1 mV of request.
+    maximum_reference_step_error_v: float | None = 1e-3
     # Positive injected pulses go upward from the baseline. Scan the threshold
     # from the high-code side towards the baseline so the opposite-polarity
     # pulse from the rising CTRL edge is never followed below the noise peak.

@@ -159,7 +159,12 @@ def characterize_parameter_sweep(
     # Reusing one noise reference across different bias points is not valid.
     if len(combos) > 1 and kwargs.get("noise_reference_experiment") is not None:
         raise ValueError("a parameter sweep needs a separate noise scan per combination")
-    omitted = {"keysight_generator", "shot_executor", "before_scurve"}
+    omitted = {
+        "keysight_generator",
+        "shot_executor",
+        "before_scurve",
+        "reference_step_oscilloscope",
+    }
     contract = {
         "framework_version": FRAMEWORK_VERSION,
         "window": window, "combinations": combos,

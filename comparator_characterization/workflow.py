@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import subprocess
@@ -36,6 +36,7 @@ from .hardware import (
     MGPDMeasurementBackend,
     STANDARD_CHARACTERIZATION_FCLK_MHZ,
     ShotExecutor,
+    UpoPwmSettings,
     UpoPwmShotExecutor,
     build_standard_characterization_pixel_configs,
     load_base_pixel_configs,
@@ -46,6 +47,12 @@ from .pixel_masks import (
     normalize_bad_pixel_map,
 )
 from .recommendations import save_noise_recommendations
+from .reference_verification import (
+    ReferenceStepVerificationError,
+    ReferenceStepVerificationResult,
+    ReferenceStepVerificationSettings,
+    verify_reference_steps,
+)
 from .parameters import validate_eo_overrides
 from .measurement import (
     ScurveScanRun,
@@ -760,6 +767,12 @@ def characterize_comparator(
     ] | None = None,
     injection_voltage_steps_v: Sequence[float] | None = None,
     reference_calibration_voltage_unit: str = "auto",
+    reference_step_oscilloscope: Any | None = None,
+    reference_step_verification_settings: (
+        ReferenceStepVerificationSettings | None
+    ) = None,
+    reference_verification_pwm_frequency_khz: int = 100,
+    reference_verification_pwm_high_time_ns: int = 5_000,
     gain_map: Mapping[tuple[int, int], int] | Sequence[Any] | None = None,
     counter_key: str | None = None,
     confirm_inferred_counter_mapping: bool = False,
@@ -787,13 +800,40 @@ def characterize_comparator(
     ``injection_voltage_steps_v`` are supplied, native codes are selected
     automatically with the mandatory physical order ``V_REF1 > V_REF2``.
     S-curve-only runs may freeze and reuse a previous noise experiment through
-    ``noise_reference_experiment``.
+    ``noise_reference_experiment``. Supplying enabled REF verification settings
+    makes the same selected steps run through AMUX ``TST_SIG`` and an
+    oscilloscope before any noise or S-curve acquisition.
     """
 
     eo_overrides = validate_eo_overrides(eo_overrides, run_scurve=run_scurve)
     selected_settings = (
         copy.deepcopy(settings) if settings is not None else CharacterizationSettings()
     )
+    reference_verification = reference_step_verification_settings
+    if reference_step_oscilloscope is not None and reference_verification is None:
+        reference_verification = ReferenceStepVerificationSettings()
+    reference_verification_enabled = bool(
+        reference_verification is not None and reference_verification.enabled
+    )
+    if reference_verification_enabled:
+        assert reference_verification is not None
+        reference_verification.validate()
+        if (
+            reference_verification.clock_on_frequency_mhz
+            != initialization_fclk_mhz
+        ):
+            raise ValueError(
+                "reference verification CLK ON frequency must match "
+                "initialization_fclk_mhz so the standard ASIC state is restored"
+            )
+        if reference_step_oscilloscope is None:
+            raise ValueError(
+                "enabled REF-step verification requires reference_step_oscilloscope"
+            )
+        UpoPwmSettings(
+            frequency_khz=reference_verification_pwm_frequency_khz,
+            high_time_ns=reference_verification_pwm_high_time_ns,
+        ).validate()
     upo_pwm_mode = run_scurve and isinstance(shot_executor, UpoPwmShotExecutor)
     if upo_pwm_mode:
         # A continuous UPO PWM has no user-programmed burst count. Put a benign
@@ -821,9 +861,10 @@ def characterize_comparator(
     reference_calibrations: dict[str, ReferenceDacCalibration] = {}
     reference_pair_selections: tuple[Any, ...] = ()
     if injection_voltage_steps_v is not None:
-        if not run_scurve:
+        if not (run_scurve or reference_verification_enabled):
             raise ValueError(
-                "injection_voltage_steps_v is only valid when run_scurve=True"
+                "injection_voltage_steps_v requires run_scurve=True or enabled "
+                "REF-step oscilloscope verification"
             )
         if selected_settings.scurve.pulse_amplitudes:
             raise ValueError(
@@ -869,6 +910,11 @@ def characterize_comparator(
         raise ValueError(
             "reference_calibration_files requires injection_voltage_steps_v; "
             "manual native-code amplitudes do not use a LUT implicitly"
+        )
+    if reference_verification_enabled and not reference_pair_selections:
+        raise ValueError(
+            "enabled REF-step verification requires REF1/REF2 LUTs and "
+            "injection_voltage_steps_v"
         )
     bounded_amplitudes = []
     for amplitude in selected_settings.scurve.pulse_amplitudes:
@@ -1105,6 +1151,9 @@ def characterize_comparator(
                 ),
                 "use_reference_trim_map": use_reference_trim_map,
                 "initialization_fclk_mhz": int(initialization_fclk_mhz),
+                "verify_reference_steps_before_measurement": (
+                    reference_verification_enabled
+                ),
             },
             "hardware_capability_notes": {
                 "noise_acquisition": "MGPDLab GET_SHOT then GET_PIXEL",
@@ -1121,6 +1170,23 @@ def characterize_comparator(
                 "counter_mapping": "AB=High, BC=Mid, CD=Low, confirmed by user",
                 "lfsr_direction": "existing project direction retained",
                 "asic_polarity": "recorded from OMR and never modified by this pipeline",
+                "reference_step_verification": (
+                    "AMUX TST_SIG, oscilloscope CH1 signal and CH4 CTRL, CLK OFF and ON"
+                    if reference_verification_enabled
+                    else "disabled"
+                ),
+            },
+            "reference_step_verification_configuration": {
+                "enabled": reference_verification_enabled,
+                "settings": (
+                    asdict(reference_verification)
+                    if reference_verification is not None
+                    else None
+                ),
+                "pwm_frequency_khz": reference_verification_pwm_frequency_khz,
+                "pwm_high_time_ns": reference_verification_pwm_high_time_ns,
+                "amux_signal": "TST_SIG",
+                "physical_ref_order": "V_REF1 > V_REF2",
             },
             "test_injection_configuration": {
                 "ctrl_source": (
@@ -1195,6 +1261,10 @@ def characterize_comparator(
                     ),
                     "physical_order": "V_REF1 > V_REF2",
                     "candidate_codes": "measured_LUT_rows_only",
+                    "ref1_policy": (
+                        "one_fixed_lowest_feasible_measured_voltage_for_all_amplitudes"
+                    ),
+                    "varying_reference": "REF2_only",
                 },
             },
             **dict(additional_metadata or {}),
@@ -1221,6 +1291,37 @@ def characterize_comparator(
     analysis_path: Path | None = None
     target_voltage: float | None = None
     final_trim_map = backend.current_trim_map(spec, selected_pixels)
+
+    def record_reference_verification(
+        result: ReferenceStepVerificationResult,
+    ) -> None:
+        history = list(
+            store.metadata.get("reference_step_verification_history", [])
+        )
+        history.append(
+            {
+                "timestamp_utc": utc_now_text(),
+                "resume_run": resume_experiment is not None,
+                "passed": result.passed,
+                "capture_count": result.capture_count,
+                "failed_capture_count": result.failed_capture_count,
+                "output_directory": result.output_directory.relative_to(
+                    store.root
+                ).as_posix(),
+                "capture_metrics_csv": result.capture_table.relative_to(
+                    store.root
+                ).as_posix(),
+                "clk_comparison_csv": result.comparison_table.relative_to(
+                    store.root
+                ).as_posix(),
+                "result_json": result.result_json.relative_to(store.root).as_posix(),
+                "settings": asdict(reference_verification),
+                "pwm_frequency_khz": reference_verification_pwm_frequency_khz,
+                "pwm_high_time_ns": reference_verification_pwm_high_time_ns,
+            }
+        )
+        store.update_metadata(reference_step_verification_history=history)
+
     try:
         store.log_status(
             f"Запуск теста окна {spec.name}, пикселей: {len(selected_pixels)}",
@@ -1342,6 +1443,10 @@ def characterize_comparator(
                                 "minimum_achievable_step_error_v": (
                                     item.minimum_achievable_step_error_v
                                 ),
+                                "fixed_ref1_voltage_v": item.fixed_ref1_voltage_v,
+                                "ref1_shared_across_amplitudes": (
+                                    item.ref1_shared_across_amplitudes
+                                ),
                                 "selection_method": item.selection_method,
                                 "minimum_reference_code": item.minimum_reference_code,
                                 "maximum_reference_code": item.maximum_reference_code,
@@ -1398,11 +1503,50 @@ def characterize_comparator(
                     injection_groups=groups_path.relative_to(store.root).as_posix(),
                 )
 
-        backend.configure_window(spec, upper_non_limiting_code)
-        store.log_status(
-            f"Окно {spec.name} настроено, начинается измерительная часть",
-            overall_percent_estimate=7.0,
-        )
+        if reference_verification_enabled:
+            assert reference_verification is not None
+            assert reference_step_oscilloscope is not None
+            store.log_status(
+                "Перед измерениями проверяются все REF-ступеньки: "
+                "AMUX=TST_SIG, CH1=сигнал, CH4=CTRL, CLK OFF/ON",
+                overall_percent_estimate=4.0,
+            )
+            try:
+                verification_result = verify_reference_steps(
+                    client=client,
+                    configuration=backend.cfg,
+                    oscilloscope=reference_step_oscilloscope,
+                    selections=reference_pair_selections,
+                    output_parent=store.root / "reference_verification",
+                    settings=reference_verification,
+                    pwm_frequency_khz=reference_verification_pwm_frequency_khz,
+                    pwm_high_time_ns=reference_verification_pwm_high_time_ns,
+                    status_callback=lambda message: store.log_status(
+                        message, overall_percent_estimate=5.0
+                    ),
+                )
+            except ReferenceStepVerificationError as error:
+                if error.result is not None:
+                    record_reference_verification(error.result)
+                raise
+            else:
+                record_reference_verification(verification_result)
+                store.log_status(
+                    "Все REF-ступеньки подтверждены осциллографом с CLK OFF и CLK ON",
+                    overall_percent_estimate=6.0,
+                )
+
+        if run_noise_scan or run_equalization or run_scurve:
+            backend.configure_window(spec, upper_non_limiting_code)
+            store.log_status(
+                f"Окно {spec.name} настроено, начинается измерительная часть",
+                overall_percent_estimate=7.0,
+            )
+        else:
+            store.log_status(
+                "Измерительные этапы отключены: завершена только проверка REF",
+                overall_percent_estimate=96.0,
+            )
 
         reference_noise_statistics = pd.DataFrame()
         reference_trim_map: dict[tuple[int, int], int] | None = None

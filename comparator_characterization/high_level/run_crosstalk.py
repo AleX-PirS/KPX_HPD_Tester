@@ -24,7 +24,11 @@ def main() -> None:
     settings = config.build_settings(
         injection_patterns=("all", "tile_2x2", "tile_4x4", "tile_8x8")
     )
-    with config.build_generator() as generator, config.build_upo_client() as client:
+    with (
+        config.build_generator() as generator,
+        config.build_oscilloscope() as oscilloscope,
+        config.build_upo_client() as client,
+    ):
         result = characterize_injection_crosstalk(
             client,
             config.threshold_calibration_files(),
@@ -35,13 +39,13 @@ def main() -> None:
             base_pixel_config=config.base_pixel_config(),
             results_root=config.RESULTS_ROOT,
             settings=settings,
-            reference_calibration_files=config.reference_calibration_files(),
-            injection_voltage_steps_v=config.injection_voltage_steps_v(),
-            reference_calibration_voltage_unit=config.REFERENCE_LUT_VOLTAGE_UNIT,
             gain_map=config.gain_map(),
             initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
             eo_overrides=config.EO_OVERRIDES,
             resume_experiment=config.RESUME_EXPERIMENT,
+            **config.reference_hardware_arguments(
+                oscilloscope, required_for_scurve=True
+            ),
             **config.injection_hardware_arguments(generator),
         )
     print(f"Тест наводок завершен: {result.experiment_path}")

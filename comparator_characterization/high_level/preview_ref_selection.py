@@ -45,8 +45,7 @@ def main() -> None:
             "REF1_voltage_V": item.ref1_voltage_v,
             "REF2_code": item.ref2_code,
             "REF2_voltage_V": item.ref2_voltage_v,
-            "common_mode_V": item.reference_common_mode_v,
-            "common_mode_target_V": item.selected_common_mode_target_v,
+            "REF1_fixed_for_all_steps": item.ref1_shared_across_amplitudes,
         }
         for item in selections
     )
