@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.9.0"
+FRAMEWORK_VERSION = "0.11.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -266,6 +266,9 @@ class ScurveSettings:
     maximum_reference_code: int = 1023
     minimum_reference_voltage_v: float | None = None
     preferred_reference_common_mode_v: float | None = None
+    # A tiny step-error allowance lets the complete amplitude set share a
+    # nearly constant REF common mode instead of optimizing every pair alone.
+    reference_common_mode_step_error_slack_v: float = 50e-6
     maximum_reference_step_error_v: float | None = None
     # Positive injected pulses go upward from the baseline. Scan the threshold
     # from the high-code side towards the baseline so the opposite-polarity
@@ -284,6 +287,10 @@ class ScurveSettings:
     baseline_noise_stop_enabled: bool = True
     baseline_noise_count_multiplier: float = 1.0
     baseline_noise_pixel_fraction: float = 0.10
+    # A coarse grid can jump over a narrow noise peak. Retain the first coarse
+    # noise point and hand the boundary to the step-1 fine scan instead of
+    # continuing into the opposite-polarity branch.
+    coarse_baseline_noise_consecutive_codes: int = 1
     baseline_noise_consecutive_codes: int = 2
     paired_background: bool = True
 
@@ -336,6 +343,13 @@ class ScurveSettings:
         ):
             if value is not None and not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite when supplied")
+        if (
+            not math.isfinite(float(self.reference_common_mode_step_error_slack_v))
+            or float(self.reference_common_mode_step_error_slack_v) < 0
+        ):
+            raise ValueError(
+                "reference_common_mode_step_error_slack_v must be finite and >= 0"
+            )
         if self.maximum_reference_step_error_v is not None and (
             not math.isfinite(float(self.maximum_reference_step_error_v))
             or float(self.maximum_reference_step_error_v) < 0
@@ -377,6 +391,14 @@ class ScurveSettings:
         if not 0 < float(self.baseline_noise_pixel_fraction) <= 1:
             raise ValueError("baseline_noise_pixel_fraction must be in (0, 1]")
         if (
+            not isinstance(self.coarse_baseline_noise_consecutive_codes, int)
+            or isinstance(self.coarse_baseline_noise_consecutive_codes, bool)
+            or self.coarse_baseline_noise_consecutive_codes < 1
+        ):
+            raise ValueError(
+                "coarse_baseline_noise_consecutive_codes must be a positive integer"
+            )
+        if (
             not isinstance(self.baseline_noise_consecutive_codes, int)
             or isinstance(self.baseline_noise_consecutive_codes, bool)
             or self.baseline_noise_consecutive_codes < 1
@@ -407,6 +429,27 @@ class AnalysisSettings:
     # Separate limits for memory-heavy PNG/PDF rendering and CSV reading.
     plot_workers: int = 0
     read_workers: int = 0
+    # UPO PWM has no hardware edge counter. When a clean, flat response is
+    # present, use its robust stage-level plateau as the effective S-curve
+    # denominator. The timing-derived value remains preserved in its own CSV
+    # column and is used when the plateau cannot be established.
+    infer_upo_pwm_plateau_denominator: bool = True
+    scurve_plateau_min_codes: int = 3
+    # Fit only the local probit transition core after weighted isotonic
+    # ordering and per-pixel plateau estimation. The 5-95% interval prevents
+    # an uneven PWM plateau from artificially broadening the fitted edge.
+    scurve_fit_core_low_fraction: float = 0.05
+    scurve_fit_core_high_fraction: float = 0.95
+    # Plot the physical branch from the measured baseline boundary through a
+    # short, confirmed zero-count tail, never the full 0..1023 range by default.
+    scurve_plot_zero_tail_points: int = 3
+    scurve_plot_code_margin: int = 2
+    # Raw-count plots may move their left edge from the matrix fit boundary to
+    # the nearest supported local pixel/noise maximum on either side.
+    # This affects visualization only: below-boundary points remain excluded
+    # from V50/sigma fitting.
+    scurve_plot_noise_peak_search_codes: int = 32
+    scurve_plot_noise_peak_support_fraction: float = 0.05
 
     def validate(self) -> None:
         for name in ("workers", "plot_workers", "read_workers"):
@@ -417,6 +460,40 @@ class AnalysisSettings:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"analysis.{name} must be a positive integer")
+        if not isinstance(self.infer_upo_pwm_plateau_denominator, bool):
+            raise TypeError("analysis.infer_upo_pwm_plateau_denominator must be bool")
+        for name in ("scurve_plateau_min_codes", "scurve_plot_zero_tail_points"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"analysis.{name} must be a positive integer")
+        if (
+            not isinstance(self.scurve_plot_code_margin, int)
+            or isinstance(self.scurve_plot_code_margin, bool)
+            or self.scurve_plot_code_margin < 0
+        ):
+            raise ValueError("analysis.scurve_plot_code_margin must be an integer >= 0")
+        if (
+            not isinstance(self.scurve_plot_noise_peak_search_codes, int)
+            or isinstance(self.scurve_plot_noise_peak_search_codes, bool)
+            or self.scurve_plot_noise_peak_search_codes < 0
+        ):
+            raise ValueError(
+                "analysis.scurve_plot_noise_peak_search_codes must be an integer >= 0"
+            )
+        if not (
+            0 < float(self.scurve_plot_noise_peak_support_fraction) < 1
+        ):
+            raise ValueError(
+                "analysis.scurve_plot_noise_peak_support_fraction must be in (0, 1)"
+            )
+        if not (
+            0 <= float(self.scurve_fit_core_low_fraction)
+            < float(self.scurve_fit_core_high_fraction)
+            <= 1
+        ):
+            raise ValueError(
+                "analysis S-curve fit-core fractions must satisfy 0 <= low < high <= 1"
+            )
         if self.noise_min_points < 4:
             raise ValueError("noise_min_points must be at least 4")
         if not -1 <= self.gaussian_min_r2 <= 1:

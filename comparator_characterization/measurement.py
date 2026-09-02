@@ -828,6 +828,12 @@ def run_scurve_points(
     acquired_codes: list[int] = []
     noisy_streak: list[dict[str, Any]] = []
     baseline_stop_event: dict[str, Any] | None = None
+    coarse_like_phase = scan_phase == "coarse" or scan_phase.startswith("expand_")
+    required_noise_points = (
+        scurve_settings.coarse_baseline_noise_consecutive_codes
+        if coarse_like_phase
+        else scurve_settings.baseline_noise_consecutive_codes
+    )
     last_logged_bucket = -1
     store.log_status(
         f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
@@ -959,7 +965,7 @@ def run_scurve_points(
             store.log_status(
                 f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
                 f"сохранена шумовая точка {len(noisy_streak)}/"
-                f"{scurve_settings.baseline_noise_consecutive_codes}, DAC={code}, "
+                f"{required_noise_points}, DAC={code}, "
                 f"пикселей выше N*коэффициент: "
                 f"{100.0 * diagnostic['observed_pixel_fraction']:.1f}%",
                 stage_percent=(
@@ -972,7 +978,7 @@ def run_scurve_points(
         if (
             scurve_settings.baseline_noise_stop_enabled
             and len(noisy_streak)
-            >= scurve_settings.baseline_noise_consecutive_codes
+            >= required_noise_points
         ):
             baseline_stop_event = {
                 "timestamp_utc": utc_now_text(),
@@ -987,6 +993,8 @@ def run_scurve_points(
                 "stop_code": int(code),
                 "retained_consecutive_noise_points": [dict(item) for item in noisy_streak],
                 "retained_noise_point_count": len(noisy_streak),
+                "required_noise_point_count_for_phase": required_noise_points,
+                "coarse_like_phase": coarse_like_phase,
                 "background_and_signal_saved_before_decision": True,
                 "skipped_unmeasured_codes": list(planned_codes[code_index + 1 :]),
             }

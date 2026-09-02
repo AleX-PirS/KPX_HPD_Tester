@@ -18,7 +18,13 @@ from .pixel_masks import (
     BadPixelMapInput, bad_pixel_document, exclude_bad_pixel_rows, normalize_bad_pixel_map,
 )
 from .recommendations import save_noise_recommendations
-from .storage import ExperimentStore, atomic_write_json, atomic_write_table, file_sha256, utc_now_text
+from .storage import (
+    ExperimentStore,
+    atomic_write_json,
+    atomic_write_table,
+    file_sha256,
+    utc_now_text,
+)
 
 
 _NORMAL = NormalDist()
@@ -160,6 +166,59 @@ def _weighted_linear_fit(
     weighted_variance = float(np.sum(weights * residuals**2) / degrees)
     covariance = np.linalg.pinv(design.T @ (weights[:, None] * design)) * weighted_variance
     return parameters, covariance, residuals
+
+
+def _weighted_isotonic_regression(
+    values: np.ndarray,
+    weights: np.ndarray,
+    *,
+    increasing: bool,
+) -> np.ndarray:
+    """Return a weighted monotonic projection using the pool-adjacent violators algorithm.
+
+    The projection is used only to make an S-curve fit insensitive to local
+    PWM/repeat scatter. Raw and processed measured efficiencies are never
+    replaced by the projected values.
+    """
+
+    observed = np.asarray(values, dtype=float)
+    selected_weights = np.asarray(weights, dtype=float)
+    if observed.ndim != 1 or selected_weights.shape != observed.shape:
+        raise ValueError("isotonic values and weights must be one-dimensional and aligned")
+    if not len(observed):
+        return observed.copy()
+    if not np.all(np.isfinite(observed)) or not np.all(
+        np.isfinite(selected_weights) & (selected_weights > 0)
+    ):
+        raise ValueError("isotonic inputs must be finite with positive weights")
+
+    transformed = observed if increasing else -observed
+    blocks: list[list[float | int]] = []
+    for index, (value, weight) in enumerate(zip(transformed, selected_weights)):
+        blocks.append([index, index, float(value * weight), float(weight)])
+        while len(blocks) >= 2:
+            previous = blocks[-2]
+            current = blocks[-1]
+            previous_mean = float(previous[2]) / float(previous[3])
+            current_mean = float(current[2]) / float(current[3])
+            if previous_mean <= current_mean:
+                break
+            blocks.pop()
+            blocks.pop()
+            blocks.append(
+                [
+                    int(previous[0]),
+                    int(current[1]),
+                    float(previous[2]) + float(current[2]),
+                    float(previous[3]) + float(current[3]),
+                ]
+            )
+
+    projected = np.empty_like(observed)
+    for start, stop, weighted_sum, weight_sum in blocks:
+        mean = float(weighted_sum) / float(weight_sum)
+        projected[int(start) : int(stop) + 1] = mean
+    return projected if increasing else -projected
 
 
 def _gaussian_log_fit(
@@ -689,14 +748,251 @@ def choose_measured_trim_map(
     return best
 
 
+_SCURVE_STAGE_COLUMNS = (
+    "stage",
+    "pulse_amplitude_native",
+    "injection_pattern",
+)
+
+
+def _scurve_noise_boundaries(
+    paired: pd.DataFrame,
+    *,
+    denominator_column: str,
+    count_multiplier: float,
+    pixel_fraction: float,
+) -> pd.DataFrame:
+    """Find the highest-code baseline-noise point for each S-curve stage.
+
+    Positive signals are measured above the baseline and the physical branch is
+    therefore the code interval at and above this boundary. The direct paired
+    background is preferred over an extrapolated noise reference.
+    """
+
+    columns = [
+        *_SCURVE_STAGE_COLUMNS,
+        "baseline_noise_boundary_code",
+        "baseline_noise_detected_code_count",
+        "baseline_noise_boundary_method",
+        "baseline_noise_max_observed_pixel_fraction",
+    ]
+    if paired.empty:
+        return pd.DataFrame(columns=columns)
+    data = paired.copy()
+    data["threshold_dac_code"] = pd.to_numeric(
+        data["threshold_dac_code"], errors="coerce"
+    )
+    data["background_count"] = pd.to_numeric(
+        data["background_count"], errors="coerce"
+    )
+    data[denominator_column] = pd.to_numeric(
+        data[denominator_column], errors="coerce"
+    )
+    valid = (
+        _as_bool(data["background_valid"])
+        & ~_as_bool(data["background_counter_saturated"])
+        & data["threshold_dac_code"].notna()
+        & data["background_count"].notna()
+        & (data[denominator_column] > 0)
+    )
+    data = data[valid].copy()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    data["background_above_noise_stop"] = (
+        data["background_count"]
+        > data[denominator_column] * float(count_multiplier)
+    )
+    by_code = (
+        data.groupby(
+            [*_SCURVE_STAGE_COLUMNS, "threshold_dac_code"],
+            dropna=False,
+            sort=True,
+        )["background_above_noise_stop"]
+        .mean()
+        .rename("observed_pixel_fraction")
+        .reset_index()
+    )
+    rows: list[dict[str, Any]] = []
+    for keys, group in by_code.groupby(
+        list(_SCURVE_STAGE_COLUMNS), dropna=False, sort=True
+    ):
+        detected = group[group["observed_pixel_fraction"] >= float(pixel_fraction)]
+        row = dict(zip(_SCURVE_STAGE_COLUMNS, keys))
+        if detected.empty:
+            row.update(
+                {
+                    "baseline_noise_boundary_code": float("nan"),
+                    "baseline_noise_detected_code_count": 0,
+                    "baseline_noise_boundary_method": (
+                        "not_detected_physical_branch_not_fitted"
+                    ),
+                    "baseline_noise_max_observed_pixel_fraction": float(
+                        group["observed_pixel_fraction"].max()
+                    ),
+                }
+            )
+        else:
+            row.update(
+                {
+                    "baseline_noise_boundary_code": int(
+                        detected["threshold_dac_code"].max()
+                    ),
+                    "baseline_noise_detected_code_count": int(len(detected)),
+                    "baseline_noise_boundary_method": (
+                        "highest_DAC_with_paired_background_fraction_above_limit"
+                    ),
+                    "baseline_noise_max_observed_pixel_fraction": float(
+                        detected["observed_pixel_fraction"].max()
+                    ),
+                }
+            )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _upo_pwm_plateau_denominators(
+    paired: pd.DataFrame,
+    preliminary_boundaries: pd.DataFrame,
+    *,
+    max_background_fraction: float,
+    settings: AnalysisSettings,
+) -> pd.DataFrame:
+    """Estimate one effective PWM denominator without claiming an edge count.
+
+    UPO PWM has no finite-cycle counter. A clean stage-level plateau can reveal
+    that the real exposure differs from the timing-derived nominal value. The
+    same robust global estimate is used for all amplitudes acquired with the
+    same experiment because the PWM frequency and shutter exposure are common.
+    """
+
+    columns = [
+        *_SCURVE_STAGE_COLUMNS,
+        "timing_nominal_injections",
+        "stage_plateau_estimate_injections",
+        "plateau_candidate_code_count",
+        "effective_injections_for_analysis",
+        "injection_denominator_method",
+        "effective_to_timing_nominal_ratio",
+    ]
+    if paired.empty:
+        return pd.DataFrame(columns=columns)
+    data = paired.merge(
+        preliminary_boundaries[
+            [*_SCURVE_STAGE_COLUMNS, "baseline_noise_boundary_code"]
+        ],
+        on=list(_SCURVE_STAGE_COLUMNS),
+        how="left",
+        validate="many_to_one",
+    )
+    stage_rows: list[dict[str, Any]] = []
+    inferred_values: list[float] = []
+    for keys, group in data.groupby(
+        list(_SCURVE_STAGE_COLUMNS), dropna=False, sort=True
+    ):
+        nominal_values = pd.to_numeric(
+            group["injections_for_analysis"], errors="coerce"
+        )
+        nominal_values = nominal_values[np.isfinite(nominal_values) & (nominal_values > 0)]
+        nominal = float(nominal_values.median()) if len(nominal_values) else float("nan")
+        sources = group.get(
+            "injection_count_source", pd.Series("", index=group.index)
+        ).astype(str)
+        pwm = bool(sources.str.contains("upo_pwm", case=False, na=False).any())
+        boundary_values = pd.to_numeric(
+            group["baseline_noise_boundary_code"], errors="coerce"
+        ).dropna()
+        boundary = float(boundary_values.median()) if len(boundary_values) else float("nan")
+        estimate = float("nan")
+        candidate_count = 0
+        if (
+            pwm
+            and settings.infer_upo_pwm_plateau_denominator
+            and math.isfinite(nominal)
+            and math.isfinite(boundary)
+        ):
+            active = group[
+                _as_bool(group["active_injection_pixel_bool"])
+                & _as_bool(group["signal_valid"])
+                & _as_bool(group["background_valid"])
+                & ~_as_bool(group["signal_counter_saturated"])
+                & ~_as_bool(group["background_counter_saturated"])
+                & (pd.to_numeric(group["threshold_dac_code"], errors="coerce") >= boundary)
+            ].copy()
+            if not active.empty:
+                by_code = active.groupby("threshold_dac_code", as_index=False).agg(
+                    signal_median=("signal_count", "median"),
+                    background_median=("background_count", "median"),
+                )
+                candidates = by_code[
+                    (pd.to_numeric(by_code["background_median"], errors="coerce")
+                     < float(max_background_fraction) * nominal)
+                    & (pd.to_numeric(by_code["signal_median"], errors="coerce")
+                       >= 0.5 * nominal)
+                    & (pd.to_numeric(by_code["signal_median"], errors="coerce")
+                       <= 2.0 * nominal)
+                ]
+                candidate_count = int(len(candidates))
+                if candidate_count >= settings.scurve_plateau_min_codes:
+                    estimate = float(
+                        pd.to_numeric(
+                            candidates["signal_median"], errors="coerce"
+                        ).quantile(0.75)
+                    )
+                    if math.isfinite(estimate) and 0.5 * nominal <= estimate <= 2.0 * nominal:
+                        inferred_values.append(estimate)
+                    else:
+                        estimate = float("nan")
+        stage_rows.append(
+            {
+                **dict(zip(_SCURVE_STAGE_COLUMNS, keys)),
+                "timing_nominal_injections": nominal,
+                "stage_plateau_estimate_injections": estimate,
+                "plateau_candidate_code_count": candidate_count,
+                "pwm_source": pwm,
+            }
+        )
+
+    global_effective = (
+        float(round(float(np.median(inferred_values))))
+        if inferred_values
+        else float("nan")
+    )
+    rows: list[dict[str, Any]] = []
+    for row in stage_rows:
+        nominal = float(row["timing_nominal_injections"])
+        if row.pop("pwm_source") and math.isfinite(global_effective):
+            effective = global_effective
+            method = (
+                "upo_pwm_global_robust_plateau_q75_of_stage_estimates_"
+                "no_hardware_edge_counter"
+            )
+        else:
+            effective = nominal
+            method = "stored_timing_or_hardware_denominator"
+        row["effective_injections_for_analysis"] = effective
+        row["injection_denominator_method"] = method
+        row["effective_to_timing_nominal_ratio"] = (
+            effective / nominal
+            if math.isfinite(effective) and math.isfinite(nominal) and nominal > 0
+            else float("nan")
+        )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
+
+
 def _paired_scurve_efficiency(
     raw: pd.DataFrame,
     *,
     noise_statistics: pd.DataFrame,
     max_background_fraction: float,
+    settings: AnalysisSettings | None = None,
+    baseline_noise_count_multiplier: float = 1.0,
+    baseline_noise_pixel_fraction: float = 0.10,
 ) -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame()
+    selected_settings = settings or AnalysisSettings()
+    selected_settings.validate()
     frame = raw.copy()
     defaults: dict[str, Any] = {
         "injection_pattern": "all",
@@ -846,6 +1142,73 @@ def _paired_scurve_efficiency(
     )
     paired = signal.merge(background, on=keys, how="outer", validate="one_to_one")
 
+    # Prefer a step-1 fine acquisition over a duplicate coarse/expand point.
+    # Every raw row remains available; only the default fit selection changes.
+    phase_priority = paired["scan_phase"].map(
+        {"coarse": 1, "fine": 3, "manual": 4}
+    )
+    paired["analysis_phase_priority"] = phase_priority.where(
+        phase_priority.notna(),
+        pd.Series(
+            np.where(
+            paired["scan_phase"].astype(str).str.startswith("expand_"), 2, 0
+            ),
+            index=paired.index,
+        ),
+    )
+    phase_identity = [
+        "stage",
+        "threshold_dac_code",
+        "pulse_amplitude_native",
+        "repeat_index",
+        "column",
+        "row",
+        "local_trim_code",
+        "injection_pattern",
+        "injection_group_id",
+    ]
+    maximum_phase_priority = paired.groupby(
+        phase_identity, dropna=False
+    )["analysis_phase_priority"].transform("max")
+    paired["preferred_for_default_analysis"] = (
+        paired["analysis_phase_priority"] == maximum_phase_priority
+    )
+
+    preliminary_boundaries = _scurve_noise_boundaries(
+        paired,
+        denominator_column="injections_for_analysis",
+        count_multiplier=baseline_noise_count_multiplier,
+        pixel_fraction=baseline_noise_pixel_fraction,
+    )
+    denominators = _upo_pwm_plateau_denominators(
+        paired,
+        preliminary_boundaries,
+        max_background_fraction=max_background_fraction,
+        settings=selected_settings,
+    )
+    paired = paired.merge(
+        denominators,
+        on=list(_SCURVE_STAGE_COLUMNS),
+        how="left",
+        validate="many_to_one",
+    )
+    paired["stored_injections_for_analysis"] = paired["injections_for_analysis"]
+    paired["injections_for_analysis"] = pd.to_numeric(
+        paired["effective_injections_for_analysis"], errors="coerce"
+    ).fillna(pd.to_numeric(paired["stored_injections_for_analysis"], errors="coerce"))
+    final_boundaries = _scurve_noise_boundaries(
+        paired,
+        denominator_column="injections_for_analysis",
+        count_multiplier=baseline_noise_count_multiplier,
+        pixel_fraction=baseline_noise_pixel_fraction,
+    )
+    paired = paired.merge(
+        final_boundaries,
+        on=list(_SCURVE_STAGE_COLUMNS),
+        how="left",
+        validate="many_to_one",
+    )
+
     expected_columns = [
         "threshold_dac_code",
         "column",
@@ -945,7 +1308,7 @@ def _paired_scurve_efficiency(
         * (1 - clipped_efficiency)
         / paired["injections_for_analysis"]
     )
-    paired["fit_valid"] = (
+    paired["fit_valid_before_physical_branch"] = (
         paired["signal_valid"].fillna(False)
         & paired["background_valid"].fillna(False)
         & ~paired["signal_counter_saturated"].fillna(False)
@@ -958,6 +1321,20 @@ def _paired_scurve_efficiency(
             paired["background_corrected_detected"]
             <= paired["injections_for_analysis"]
         )
+        & paired["preferred_for_default_analysis"].fillna(False)
+    )
+    paired["physical_branch_valid"] = (
+        pd.to_numeric(paired["baseline_noise_boundary_code"], errors="coerce").notna()
+        & (
+            pd.to_numeric(paired["threshold_dac_code"], errors="coerce")
+            >= pd.to_numeric(
+                paired["baseline_noise_boundary_code"], errors="coerce"
+            )
+        )
+    )
+    paired["fit_valid"] = (
+        paired["fit_valid_before_physical_branch"]
+        & paired["physical_branch_valid"]
     )
     # Identical flag ordering without iterrows over millions of acquisitions.
     reasons = pd.Series("", index=paired.index, dtype=object)
@@ -968,6 +1345,11 @@ def _paired_scurve_efficiency(
         ("background_counter_saturated", False, "background_counter_saturated"),
         ("active_injection_pixel_bool", True, "inactive_pixel_not_used_for_scurve_fit"),
         ("background_low", True, "background_above_limit"),
+        (
+            "preferred_for_default_analysis",
+            True,
+            "duplicate_coarse_point_superseded_by_finer_phase",
+        ),
     ):
         flag = paired[field].astype(bool)
         if invert:
@@ -979,6 +1361,12 @@ def _paired_scurve_efficiency(
     excess = np.isfinite(corrected) & np.isfinite(injections) & (corrected > injections)
     reasons.loc[negative] += "negative_after_background_subtraction;"
     reasons.loc[excess] += "corrected_count_exceeds_injections;"
+    missing_boundary = pd.to_numeric(
+        paired["baseline_noise_boundary_code"], errors="coerce"
+    ).isna()
+    opposite_branch = ~missing_boundary & ~paired["physical_branch_valid"]
+    reasons.loc[missing_boundary] += "baseline_boundary_not_detected_no_physical_fit;"
+    reasons.loc[opposite_branch] += "opposite_polarity_or_below_baseline_branch_excluded;"
     paired["quality_flags"] = reasons.str.rstrip(";")
     return paired
 
@@ -986,11 +1374,14 @@ def _paired_scurve_efficiency(
 def _fit_scurve_group(
     group: pd.DataFrame,
     calibration: ThresholdDacCalibration,
+    settings: AnalysisSettings,
 ) -> dict[str, Any]:
     valid = group[_as_bool(group["fit_valid"])].copy()
     result = {
         "fit_status": "insufficient_data",
+        "fit_model": "weighted_isotonic_free_plateau_probit_core",
         "transition_direction": "unknown",
+        "code_transition_direction": "unknown",
         "v50_v": float("nan"),
         "v50_uncertainty_v": float("nan"),
         "d50_code": float("nan"),
@@ -1000,8 +1391,18 @@ def _fit_scurve_group(
         "fit_r2": float("nan"),
         "fit_rmse_efficiency": float("nan"),
         "fit_points": int(len(valid)),
+        "fit_points_available_on_physical_branch": int(len(valid)),
+        "fit_points_in_transition_core": 0,
+        "fit_core_low_fraction": float(settings.scurve_fit_core_low_fraction),
+        "fit_core_high_fraction": float(settings.scurve_fit_core_high_fraction),
+        "fit_code_min": float("nan"),
+        "fit_code_max": float("nan"),
         "minimum_efficiency": float("nan"),
         "maximum_efficiency": float("nan"),
+        "fit_lower_plateau_efficiency": float("nan"),
+        "fit_upper_plateau_efficiency": float("nan"),
+        "fit_plateau_dynamic_range": float("nan"),
+        "fit_isotonic_adjustment_rmse": float("nan"),
     }
     if valid.empty:
         return result
@@ -1012,7 +1413,8 @@ def _fit_scurve_group(
         injections=("injections_for_analysis", "sum"),
     )
     aggregated["efficiency"] = aggregated["detected"] / aggregated["injections"]
-    result["fit_points"] = int(len(aggregated))
+    aggregated = aggregated.sort_values("threshold_dac_code").reset_index(drop=True)
+    result["fit_points_available_on_physical_branch"] = int(len(aggregated))
     result["minimum_efficiency"] = float(aggregated["efficiency"].min())
     result["maximum_efficiency"] = float(aggregated["efficiency"].max())
     if (
@@ -1023,42 +1425,137 @@ def _fit_scurve_group(
         result["fit_status"] = "transition_not_bracketed"
         return result
 
-    voltage = aggregated["threshold_voltage_v"].to_numpy(dtype=float)
-    code = aggregated["threshold_dac_code"].to_numpy(dtype=float)
-    detected = aggregated["detected"].to_numpy(dtype=float)
-    injections = aggregated["injections"].to_numpy(dtype=float)
-    efficiency = detected / injections
-    correlation = float(np.corrcoef(voltage, efficiency)[0, 1])
-    direction = "ascending" if correlation >= 0 else "descending"
-    result["transition_direction"] = direction
+    all_code = aggregated["threshold_dac_code"].to_numpy(dtype=float)
+    all_voltage = aggregated["threshold_voltage_v"].to_numpy(dtype=float)
+    all_detected = aggregated["detected"].to_numpy(dtype=float)
+    all_injections = aggregated["injections"].to_numpy(dtype=float)
+    all_efficiency = all_detected / all_injections
+    code_correlation = float(np.corrcoef(all_code, all_efficiency)[0, 1])
+    if not math.isfinite(code_correlation):
+        code_correlation = float(all_efficiency[-1] - all_efficiency[0])
+    code_direction = "ascending" if code_correlation >= 0 else "descending"
+    result["code_transition_direction"] = code_direction
 
-    adjusted_probability = (detected + 0.5) / (injections + 1.0)
-    if direction == "descending":
-        adjusted_probability = 1 - adjusted_probability
-    z = np.array([_NORMAL.inv_cdf(float(value)) for value in adjusted_probability])
-    use = np.isfinite(z) & np.isfinite(voltage)
+    try:
+        monotonic_efficiency = _weighted_isotonic_regression(
+            all_efficiency,
+            all_injections,
+            increasing=code_direction == "ascending",
+        )
+    except ValueError:
+        result["fit_status"] = "invalid_isotonic_inputs"
+        return result
+
+    edge_points = min(int(settings.scurve_plateau_min_codes), len(aggregated))
+    if code_direction == "descending":
+        upper_slice = slice(0, edge_points)
+        lower_slice = slice(len(aggregated) - edge_points, len(aggregated))
+    else:
+        lower_slice = slice(0, edge_points)
+        upper_slice = slice(len(aggregated) - edge_points, len(aggregated))
+    upper_plateau = float(
+        np.average(
+            monotonic_efficiency[upper_slice], weights=all_injections[upper_slice]
+        )
+    )
+    lower_plateau = float(
+        np.average(
+            monotonic_efficiency[lower_slice], weights=all_injections[lower_slice]
+        )
+    )
+    dynamic_range = upper_plateau - lower_plateau
+    result.update(
+        {
+            "fit_lower_plateau_efficiency": lower_plateau,
+            "fit_upper_plateau_efficiency": upper_plateau,
+            "fit_plateau_dynamic_range": dynamic_range,
+            "fit_isotonic_adjustment_rmse": float(
+                np.sqrt(np.average(
+                    (all_efficiency - monotonic_efficiency) ** 2,
+                    weights=all_injections,
+                ))
+            ),
+        }
+    )
+    if not math.isfinite(dynamic_range) or dynamic_range < 0.5:
+        result["fit_status"] = "insufficient_plateau_dynamic_range"
+        return result
+
+    normalized_efficiency = np.clip(
+        (monotonic_efficiency - lower_plateau) / dynamic_range,
+        0.0,
+        1.0,
+    )
+    core_mask = (
+        normalized_efficiency > float(settings.scurve_fit_core_low_fraction)
+    ) & (
+        normalized_efficiency < float(settings.scurve_fit_core_high_fraction)
+    )
+    core_indices = np.flatnonzero(core_mask)
+    result["fit_points_in_transition_core"] = int(len(core_indices))
+    if len(core_indices) < 3:
+        result["fit_status"] = "transition_core_insufficient"
+        return result
+
+    # Keep the fit local but include the nearest bracketing point on each side.
+    # For an extremely sharp step, expand symmetrically until five measured
+    # codes are available. Edge probabilities receive very small weights.
+    first = max(int(core_indices[0]) - 1, 0)
+    last = min(int(core_indices[-1]) + 1, len(aggregated) - 1)
+    while last - first + 1 < 5 and (first > 0 or last < len(aggregated) - 1):
+        if first > 0:
+            first -= 1
+        if last - first + 1 < 5 and last < len(aggregated) - 1:
+            last += 1
+    use_indices = np.arange(first, last + 1, dtype=int)
+    result["fit_points"] = int(len(use_indices))
+    result["fit_code_min"] = float(all_code[use_indices].min())
+    result["fit_code_max"] = float(all_code[use_indices].max())
+
+    voltage = all_voltage[use_indices]
+    code = all_code[use_indices]
+    injections = all_injections[use_indices]
+    efficiency = all_efficiency[use_indices]
+    probability = normalized_efficiency[use_indices]
+    epsilon = np.clip(0.5 / (injections + 1.0), 1e-6, 0.1)
+    probability = np.minimum(np.maximum(probability, epsilon), 1.0 - epsilon)
+    fit_probability = 1.0 - probability if code_direction == "descending" else probability
+    z = np.array([_NORMAL.inv_cdf(float(value)) for value in fit_probability])
+    use = np.isfinite(z) & np.isfinite(voltage) & np.isfinite(code)
     design = np.column_stack((np.ones(int(np.sum(use))), z[use]))
-    weights = np.clip(injections[use] * efficiency[use] * (1 - efficiency[use]), 0.25, np.inf)
+    weights = np.clip(
+        injections[use] * probability[use] * (1.0 - probability[use]),
+        0.25,
+        np.inf,
+    )
     try:
         parameters, covariance, _ = _weighted_linear_fit(
             design, voltage[use], weights
         )
-        code_parameters, _, _ = _weighted_linear_fit(design, code[use], weights)
+        code_parameters, code_covariance, _ = _weighted_linear_fit(
+            design, code[use], weights
+        )
     except np.linalg.LinAlgError:
         result["fit_status"] = "singular_fit"
         return result
-    v50, slope = float(parameters[0]), float(parameters[1])
-    sigma_v = abs(slope)
+    v50, voltage_slope = float(parameters[0]), float(parameters[1])
+    sigma_v = abs(voltage_slope)
     d50 = float(code_parameters[0])
     sigma_code = abs(float(code_parameters[1]))
     if sigma_v <= 0:
         result["fit_status"] = "invalid_width"
         return result
 
+    if voltage_slope >= 0:
+        direction = code_direction
+    else:
+        direction = "descending" if code_direction == "ascending" else "ascending"
+    result["transition_direction"] = direction
     sign = 1 if direction == "ascending" else -1
-    predicted = np.array(
+    predicted_probability = np.array(
         [_NORMAL.cdf(sign * (value - v50) / sigma_v) for value in voltage]
     )
+    predicted = lower_plateau + dynamic_range * predicted_probability
     variance = float(np.sum((efficiency - np.mean(efficiency)) ** 2))
     r2 = 1 - float(np.sum((efficiency - predicted) ** 2)) / variance if variance else float("nan")
     result.update(
@@ -1068,6 +1565,9 @@ def _fit_scurve_group(
             "v50_uncertainty_v": math.sqrt(max(float(covariance[0, 0]), 0.0)),
             "d50_code": d50,
             "d50_nearest_programmable_code": calibration.voltage_to_nearest_dac_code(v50),
+            "d50_uncertainty_codes": math.sqrt(
+                max(float(code_covariance[0, 0]), 0.0)
+            ),
             "sigma_v": sigma_v,
             "sigma_millivolts": sigma_v * 1000.0,
             "threshold_domain_noise_sigma_v": sigma_v,
@@ -1082,8 +1582,8 @@ def _fit_scurve_group(
 
 
 def _fit_scurve_job(job: tuple) -> dict[str, Any]:
-    row, group, calibration = job
-    row.update(_fit_scurve_group(group, calibration))
+    row, group, calibration, settings = job
+    row.update(_fit_scurve_group(group, calibration, settings))
     return row
 
 
@@ -1131,11 +1631,192 @@ def fit_scurves(
         for keys, group in groups:
             row = dict(zip(group_columns, keys))
             row.update(group.iloc[0][metadata_columns].to_dict())
-            yield row, group[numeric_columns], calibration
+            yield row, group[numeric_columns], calibration, selected_settings
 
     rows = map_analysis_groups(_fit_scurve_job, jobs, total=groups.ngroups,
                                settings=selected_settings, label="S-curve fit")
     return pd.DataFrame(rows)
+
+
+def summarize_scurve_branch_and_precision(
+    efficiency: pd.DataFrame,
+    scurve_results: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Describe physical-branch selection and verify the acquired DAC step at V50."""
+
+    if efficiency.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    frame = efficiency.copy()
+    frame["threshold_dac_code"] = pd.to_numeric(
+        frame["threshold_dac_code"], errors="coerce"
+    )
+    branch_rows: list[dict[str, Any]] = []
+    for keys, group in frame.groupby(
+        list(_SCURVE_STAGE_COLUMNS), dropna=False, sort=True
+    ):
+        codes = sorted(
+            int(value)
+            for value in group["threshold_dac_code"].dropna().unique()
+        )
+        physical = group[_as_bool(group["physical_branch_valid"])]
+        physical_codes = sorted(
+            int(value)
+            for value in physical["threshold_dac_code"].dropna().unique()
+        )
+        fine = physical[
+            (physical["scan_phase"].astype(str) == "fine")
+            & _as_bool(physical["preferred_for_default_analysis"])
+        ]
+        fine_codes = sorted(
+            int(value) for value in fine["threshold_dac_code"].dropna().unique()
+        )
+        fine_differences = np.diff(fine_codes) if len(fine_codes) >= 2 else np.array([])
+        boundary_values = pd.to_numeric(
+            group.get("baseline_noise_boundary_code"), errors="coerce"
+        ).dropna()
+        row = {
+            **dict(zip(_SCURVE_STAGE_COLUMNS, keys)),
+            "acquired_code_min": min(codes) if codes else np.nan,
+            "acquired_code_max": max(codes) if codes else np.nan,
+            "acquired_unique_code_count": len(codes),
+            "baseline_noise_boundary_code": (
+                float(boundary_values.median()) if len(boundary_values) else np.nan
+            ),
+            "physical_branch_code_min": (
+                min(physical_codes) if physical_codes else np.nan
+            ),
+            "physical_branch_code_max": (
+                max(physical_codes) if physical_codes else np.nan
+            ),
+            "physical_branch_unique_code_count": len(physical_codes),
+            "opposite_branch_row_count_excluded": int(
+                (~_as_bool(group["physical_branch_valid"])).sum()
+            ),
+            "fine_code_min_on_physical_branch": (
+                min(fine_codes) if fine_codes else np.nan
+            ),
+            "fine_code_max_on_physical_branch": (
+                max(fine_codes) if fine_codes else np.nan
+            ),
+            "fine_unique_code_count_on_physical_branch": len(fine_codes),
+            "fine_grid_complete_step_one_between_min_max": bool(
+                len(fine_differences) and np.all(fine_differences == 1)
+            ),
+            "fine_unit_step_pair_fraction": (
+                float(np.mean(fine_differences == 1))
+                if len(fine_differences)
+                else np.nan
+            ),
+        }
+        for column in (
+            "timing_nominal_injections",
+            "stage_plateau_estimate_injections",
+            "plateau_candidate_code_count",
+            "effective_injections_for_analysis",
+            "injection_denominator_method",
+            "effective_to_timing_nominal_ratio",
+            "baseline_noise_boundary_method",
+            "baseline_noise_detected_code_count",
+            "baseline_noise_max_observed_pixel_fraction",
+            "requested_injection_voltage_step_v",
+            "injection_voltage_step_v",
+            "injection_charge_electrons",
+            "injection_charge_uncertainty_c",
+        ):
+            if column in group:
+                numeric = pd.to_numeric(group[column], errors="coerce")
+                if numeric.notna().any():
+                    row[column] = float(numeric.median())
+                else:
+                    values = group[column].dropna().astype(str)
+                    row[column] = values.iloc[0] if len(values) else ""
+        branch_rows.append(row)
+    branch_summary = pd.DataFrame(branch_rows)
+
+    precision_rows: list[dict[str, Any]] = []
+    result_group_columns = [
+        "stage",
+        "pulse_amplitude_native",
+        "injection_pattern",
+        "column",
+        "row",
+        "local_trim_code",
+    ]
+    if not scurve_results.empty:
+        grouped_efficiency = frame.groupby(
+            result_group_columns, dropna=False, sort=False
+        )
+        for _, result in scurve_results.iterrows():
+            key = tuple(result.get(column) for column in result_group_columns)
+            try:
+                pixel = grouped_efficiency.get_group(key)
+            except KeyError:
+                pixel = frame.iloc[0:0]
+            fine = pixel[
+                (pixel.get("scan_phase", pd.Series("", index=pixel.index)).astype(str)
+                 == "fine")
+                & _as_bool(pixel.get(
+                    "physical_branch_valid", pd.Series(False, index=pixel.index)
+                ))
+                & _as_bool(pixel.get(
+                    "preferred_for_default_analysis", pd.Series(False, index=pixel.index)
+                ))
+            ]
+            fine_codes = sorted(
+                int(value)
+                for value in pd.to_numeric(
+                    fine.get("threshold_dac_code"), errors="coerce"
+                ).dropna().unique()
+            )
+            d50 = _finite_or_nan(result.get("d50_code"))
+            lower = max((code for code in fine_codes if code <= d50), default=np.nan)
+            upper = min((code for code in fine_codes if code >= d50), default=np.nan)
+            gap = (
+                float(upper - lower)
+                if math.isfinite(float(lower)) and math.isfinite(float(upper))
+                else float("nan")
+            )
+            transition_points = fine[
+                _as_bool(fine.get("fit_valid", pd.Series(False, index=fine.index)))
+                & (pd.to_numeric(fine.get("efficiency"), errors="coerce") >= 0.10)
+                & (pd.to_numeric(fine.get("efficiency"), errors="coerce") <= 0.90)
+            ]
+            precision_rows.append(
+                {
+                    **{column: result.get(column) for column in result_group_columns},
+                    "fit_status": result.get("fit_status"),
+                    "d50_code": d50,
+                    "fine_lower_code_at_d50": lower,
+                    "fine_upper_code_at_d50": upper,
+                    "fine_bracket_gap_code": gap,
+                    "fine_step_one_at_d50": bool(math.isfinite(gap) and gap <= 1.0),
+                    "fine_transition_point_count_10_to_90_percent": int(
+                        transition_points["threshold_dac_code"].nunique()
+                    ),
+                }
+            )
+    precision = pd.DataFrame(precision_rows)
+    if not precision.empty and not branch_summary.empty:
+        precision_group = precision.groupby(
+            list(_SCURVE_STAGE_COLUMNS), dropna=False, as_index=False
+        ).agg(
+            fitted_pixel_count=(
+                "d50_code", lambda values: int(pd.to_numeric(values, errors="coerce").notna().sum())
+            ),
+            fine_step_one_pixel_count=("fine_step_one_at_d50", "sum"),
+            median_fine_bracket_gap_code=("fine_bracket_gap_code", "median"),
+        )
+        precision_group["fine_step_one_at_d50_fraction"] = (
+            precision_group["fine_step_one_pixel_count"]
+            / precision_group["fitted_pixel_count"].replace(0, np.nan)
+        )
+        branch_summary = branch_summary.merge(
+            precision_group,
+            on=list(_SCURVE_STAGE_COLUMNS),
+            how="left",
+            validate="one_to_one",
+        )
+    return branch_summary, precision
 
 
 def calculate_injection_crosstalk_metrics(
@@ -1739,12 +2420,15 @@ def analyze_saved_experiment(
         analysis_dir, noise_fits, noise_statistics,
         target_voltage=target_voltage, bad_pixel_map=bad_pixels,
     ))
-    atomic_write_json(analysis_dir / "measurement_coverage.json", {
+    coverage_document = {
         "source_kind": "raw_acquisitions", "source_status": store.metadata.get("status"),
         "available_noise_stages": sorted(stages),
         "equalized_final_measured": not final.empty,
         "warning_ru": "При отсутствии equalized_final карты подстроек являются предложениями, а не результатом проверенной эквализации.",
-    })
+    }
+    atomic_write_json(
+        analysis_dir / "measurement_coverage.json", coverage_document
+    )
     outputs["measurement_coverage"] = analysis_dir / "measurement_coverage.json"
 
     raw_scurve = exclude_bad_pixel_rows(store.load_raw("scurve", workers=selected_settings.read_workers), bad_pixels)
@@ -1752,6 +2436,8 @@ def analyze_saved_experiment(
     scurve_results = pd.DataFrame()
     scurve_amplitude_summary = pd.DataFrame()
     scurve_gain_results = pd.DataFrame()
+    scurve_branch_summary = pd.DataFrame()
+    scurve_transition_precision = pd.DataFrame()
     crosstalk_pixels = pd.DataFrame()
     crosstalk_summary = pd.DataFrame()
     if not raw_scurve.empty:
@@ -1786,6 +2472,9 @@ def analyze_saved_experiment(
             .get("scurve", {})
             .get("max_background_fraction", 0.01)
         )
+        saved_scurve_settings = (
+            store.metadata.get("settings", {}).get("scurve", {})
+        )
         scurve_noise_statistics = noise_statistics
         reference_record = store.metadata.get("noise_reference", {})
         reference_relative = reference_record.get("statistics_copy")
@@ -1803,12 +2492,32 @@ def analyze_saved_experiment(
             raw_scurve,
             noise_statistics=scurve_noise_statistics,
             max_background_fraction=max_background_fraction,
+            settings=selected_settings,
+            baseline_noise_count_multiplier=float(
+                saved_scurve_settings.get("baseline_noise_count_multiplier", 1.0)
+            ),
+            baseline_noise_pixel_fraction=float(
+                saved_scurve_settings.get("baseline_noise_pixel_fraction", 0.10)
+            ),
         )
         del raw_scurve
         store.write_table(analysis_dir / "scurve_efficiency.csv", scurve_efficiency)
         if calibration is not None:
             scurve_results = fit_scurves(scurve_efficiency, calibration, settings=selected_settings)
         store.write_table(analysis_dir / "scurve_results.csv", scurve_results)
+        scurve_branch_summary, scurve_transition_precision = (
+            summarize_scurve_branch_and_precision(
+                scurve_efficiency, scurve_results
+            )
+        )
+        store.write_table(
+            analysis_dir / "scurve_branch_summary.csv",
+            scurve_branch_summary,
+        )
+        store.write_table(
+            analysis_dir / "scurve_transition_precision.csv",
+            scurve_transition_precision,
+        )
         scurve_amplitude_summary = summarize_scurve_amplitudes(scurve_results)
         scurve_gain_results = fit_scurve_gain_results(scurve_results)
         store.write_table(
@@ -1832,6 +2541,12 @@ def analyze_saved_experiment(
         )
         outputs["scurve_efficiency"] = analysis_dir / "scurve_efficiency.csv"
         outputs["scurve_results"] = analysis_dir / "scurve_results.csv"
+        outputs["scurve_branch_summary"] = (
+            analysis_dir / "scurve_branch_summary.csv"
+        )
+        outputs["scurve_transition_precision"] = (
+            analysis_dir / "scurve_transition_precision.csv"
+        )
         outputs["scurve_amplitude_summary"] = (
             analysis_dir / "scurve_amplitude_summary.csv"
         )
@@ -1867,6 +2582,25 @@ def analyze_saved_experiment(
         from .plots import generate_recommendation_plots
 
         outputs["plots"].update(generate_recommendation_plots(analysis_dir, selected_settings))
+
+    from .report import generate_analysis_report
+
+    outputs["report"] = generate_analysis_report(
+        analysis_directory=analysis_dir,
+        experiment_root=store.root,
+        metadata=store.metadata,
+        coverage=coverage_document,
+        noise_statistics=noise_statistics,
+        noise_fits=noise_fits,
+        scurve_efficiency=scurve_efficiency,
+        scurve_results=scurve_results,
+        scurve_amplitude_summary=scurve_amplitude_summary,
+        scurve_gain_results=scurve_gain_results,
+        scurve_branch_summary=scurve_branch_summary,
+        scurve_transition_precision=scurve_transition_precision,
+        crosstalk_summary=crosstalk_summary,
+        target_voltage=selected_target,
+    )
 
     atomic_write_json(
         analysis_dir / "analysis_manifest.json",
@@ -1969,6 +2703,32 @@ def analyze_saved_noise_statistics(
             target_voltage=target_voltage, settings=selected_settings,
         )
         outputs["plots"].update(generate_recommendation_plots(directory, selected_settings))
+    from .report import generate_analysis_report
+
+    offline_metadata = {
+        "experiment_id": source.stem,
+        "window": str(statistics.iloc[0]["window"]) if not statistics.empty else "н/д",
+        "comparator_under_test": str(statistics.iloc[0]["comparator_under_test"])
+        if not statistics.empty
+        else "н/д",
+        "status": "processed_statistics_only",
+    }
+    outputs["report"] = generate_analysis_report(
+        analysis_directory=directory,
+        experiment_root=None,
+        metadata=offline_metadata,
+        coverage=coverage,
+        noise_statistics=statistics,
+        noise_fits=fits,
+        scurve_efficiency=pd.DataFrame(),
+        scurve_results=pd.DataFrame(),
+        scurve_amplitude_summary=pd.DataFrame(),
+        scurve_gain_results=pd.DataFrame(),
+        scurve_branch_summary=pd.DataFrame(),
+        scurve_transition_precision=pd.DataFrame(),
+        crosstalk_summary=pd.DataFrame(),
+        target_voltage=target_voltage,
+    )
     atomic_write_json(directory / "analysis_manifest.json", {
         "created_utc": utc_now_text(), **coverage,
         "files": {key: value.relative_to(directory).as_posix() for key, value in outputs.items() if isinstance(value, Path) and value.is_file()},

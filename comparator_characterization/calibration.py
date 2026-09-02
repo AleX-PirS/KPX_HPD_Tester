@@ -334,6 +334,9 @@ class ReferencePairSelection:
     minimum_reference_code: int
     minimum_reference_voltage_v: float | None
     maximum_reference_code: int = 1023
+    selected_common_mode_target_v: float | None = None
+    common_mode_step_error_slack_v: float = 0.0
+    minimum_achievable_step_error_v: float = 0.0
 
     def to_pulse_amplitude(self) -> dict[str, Any]:
         return {
@@ -346,6 +349,9 @@ class ReferencePairSelection:
             "ref1_voltage_v": self.ref1_voltage_v,
             "ref2_voltage_v": self.ref2_voltage_v,
             "reference_common_mode_v": self.reference_common_mode_v,
+            "selected_common_mode_target_v": self.selected_common_mode_target_v,
+            "common_mode_step_error_slack_v": self.common_mode_step_error_slack_v,
+            "minimum_achievable_step_error_v": self.minimum_achievable_step_error_v,
             "ref1_voltage_above_ref2": True,
             "reference_pair_selection_method": self.selection_method,
             "minimum_reference_code": self.minimum_reference_code,
@@ -407,14 +413,16 @@ def select_reference_dac_pairs(
     maximum_reference_code: int = 1023,
     minimum_reference_voltage_v: float | None = None,
     preferred_reference_common_mode_v: float | None = None,
+    common_mode_step_error_slack_v: float = 0.0,
     maximum_reference_step_error_v: float | None = None,
 ) -> tuple[ReferencePairSelection, ...]:
     """Select measured REF1/REF2 codes for positive physical voltage steps.
 
-    The primary objective is minimum ``abs((V_REF1 - V_REF2) - requested)``.
-    Equal-error candidates are resolved by an optional common-mode target, then
-    by the greatest distance from the low-code region. The physical ordering
-    ``V_REF1 > V_REF2`` is mandatory for every returned pair.
+    Candidate pairs stay within ``common_mode_step_error_slack_v`` of the
+    minimum achievable step error. Inside that narrow accuracy band, either a
+    configured common-mode target or one automatically shared by all requested
+    steps is preferred. The physical ordering ``V_REF1 > V_REF2`` is mandatory
+    for every returned pair.
     """
 
     if not isinstance(minimum_reference_code, int) or isinstance(
@@ -435,6 +443,14 @@ def select_reference_dac_pairs(
         preferred_reference_common_mode_v = float(preferred_reference_common_mode_v)
         if not math.isfinite(preferred_reference_common_mode_v):
             raise ValueError("preferred_reference_common_mode_v must be finite")
+    common_mode_step_error_slack_v = float(common_mode_step_error_slack_v)
+    if (
+        not math.isfinite(common_mode_step_error_slack_v)
+        or common_mode_step_error_slack_v < 0
+    ):
+        raise ValueError(
+            "common_mode_step_error_slack_v must be finite and >= 0"
+        )
     if maximum_reference_step_error_v is not None:
         maximum_reference_step_error_v = float(maximum_reference_step_error_v)
         if not math.isfinite(maximum_reference_step_error_v) or maximum_reference_step_error_v < 0:
@@ -469,47 +485,127 @@ def select_reference_dac_pairs(
             "no measured REF pair satisfies the required physical order V_REF1 > V_REF2"
         )
 
-    selections: list[ReferencePairSelection] = []
-    available_pairs = valid_order.copy()
-    method = (
-        "unique_pairs_minimum_abs_step_error_then_preferred_common_mode_then_highest_low_code"
-        if preferred_reference_common_mode_v is not None
-        else "unique_pairs_minimum_abs_step_error_then_highest_low_code_and_voltage"
-    )
+    candidate_sets: list[tuple[float, float, np.ndarray]] = []
     for target in requested:
-        if not bool(np.any(available_pairs)):
-            raise ValueError("not enough distinct physical REF pairs for all requested steps")
-        errors = np.where(available_pairs, np.abs(delta - target), np.inf)
+        errors = np.where(valid_order, np.abs(delta - target), np.inf)
         minimum_error = float(np.min(errors))
+        if (
+            maximum_reference_step_error_v is not None
+            and minimum_error > maximum_reference_step_error_v
+        ):
+            raise ValueError(
+                f"nearest REF pair for requested step {target:g} V has error "
+                f"{minimum_error:g} V, above maximum_reference_step_error_v="
+                f"{maximum_reference_step_error_v:g} V"
+            )
+        allowed_error = minimum_error + common_mode_step_error_slack_v
+        if maximum_reference_step_error_v is not None:
+            allowed_error = min(allowed_error, maximum_reference_step_error_v)
         candidate_indices = np.argwhere(
-            available_pairs
-            & np.isclose(errors, minimum_error, rtol=1e-12, atol=1e-15)
+            valid_order & (errors <= allowed_error + 1e-15)
         )
         if not len(candidate_indices):
-            raise RuntimeError("internal REF pair selection failure")
+            raise RuntimeError("internal REF pair candidate selection failure")
+        candidate_sets.append((target, minimum_error, candidate_indices))
 
-        def candidate_key(index_pair: np.ndarray) -> tuple[float, float, float, int, int]:
+    selected_common_mode_target = preferred_reference_common_mode_v
+    automatic_shared_common_mode = False
+    if (
+        selected_common_mode_target is None
+        and common_mode_step_error_slack_v > 0
+        and len(candidate_sets) > 1
+    ):
+        common_mode_candidates: list[np.ndarray] = []
+        for _, _, indices in candidate_sets:
+            common_mode_candidates.append(
+                np.sort(
+                    0.5
+                    * (
+                        ref1_voltages[indices[:, 0]]
+                        + ref2_voltages[indices[:, 1]]
+                    )
+                )
+            )
+        evaluation_grid = np.unique(np.concatenate(common_mode_candidates))
+        if len(evaluation_grid) > 20_001:
+            evaluation_grid = np.linspace(
+                float(evaluation_grid.min()),
+                float(evaluation_grid.max()),
+                20_001,
+            )
+        nearest_distances: list[np.ndarray] = []
+        for values in common_mode_candidates:
+            positions = np.searchsorted(values, evaluation_grid)
+            lower_positions = np.clip(positions - 1, 0, len(values) - 1)
+            upper_positions = np.clip(positions, 0, len(values) - 1)
+            nearest_distances.append(
+                np.minimum(
+                    np.abs(evaluation_grid - values[lower_positions]),
+                    np.abs(evaluation_grid - values[upper_positions]),
+                )
+            )
+        distance_matrix = np.vstack(nearest_distances)
+        maximum_distance = np.max(distance_matrix, axis=0)
+        total_distance = np.sum(distance_matrix, axis=0)
+        order = np.lexsort((-evaluation_grid, total_distance, maximum_distance))
+        selected_common_mode_target = float(evaluation_grid[int(order[0])])
+        automatic_shared_common_mode = True
+
+    if preferred_reference_common_mode_v is not None:
+        method = (
+            "unique_pairs_step_error_band_then_configured_common_mode_"
+            "then_highest_low_code"
+        )
+    elif automatic_shared_common_mode:
+        method = (
+            "unique_pairs_step_error_band_then_automatic_shared_common_mode_"
+            "then_highest_low_code"
+        )
+    else:
+        method = "unique_pairs_minimum_abs_step_error_then_highest_low_code_and_voltage"
+
+    selections: list[ReferencePairSelection] = []
+    used_pairs: set[tuple[int, int]] = set()
+    for target, minimum_error, candidate_indices in candidate_sets:
+        unused_candidates = np.asarray(
+            [
+                item
+                for item in candidate_indices
+                if (int(item[0]), int(item[1])) not in used_pairs
+            ],
+            dtype=int,
+        )
+        if not len(unused_candidates):
+            raise ValueError("not enough distinct physical REF pairs for all requested steps")
+
+        def candidate_key(index_pair: np.ndarray) -> tuple[float, ...]:
             index1, index2 = (int(index_pair[0]), int(index_pair[1]))
             code1 = int(ref1_codes[index1])
             code2 = int(ref2_codes[index2])
             voltage1 = float(ref1_voltages[index1])
             voltage2 = float(ref2_voltages[index2])
             common_mode = 0.5 * (voltage1 + voltage2)
-            common_mode_error = (
-                abs(common_mode - preferred_reference_common_mode_v)
-                if preferred_reference_common_mode_v is not None
-                else 0.0
-            )
+            step_error = abs(float(delta[index1, index2]) - target)
+            if selected_common_mode_target is not None:
+                return (
+                    abs(common_mode - selected_common_mode_target),
+                    step_error,
+                    -float(min(code1, code2)),
+                    -min(voltage1, voltage2),
+                    float(code1),
+                    float(code2),
+                )
             return (
-                common_mode_error,
+                step_error,
                 -float(min(code1, code2)),
                 -min(voltage1, voltage2),
-                code1,
-                code2,
+                float(code1),
+                float(code2),
             )
 
-        selected_index = min(candidate_indices, key=candidate_key)
+        selected_index = min(unused_candidates, key=candidate_key)
         index1, index2 = int(selected_index[0]), int(selected_index[1])
+        used_pairs.add((index1, index2))
         code1 = int(ref1_codes[index1])
         code2 = int(ref2_codes[index2])
         voltage1 = float(ref1_voltages[index1])
@@ -519,11 +615,10 @@ def select_reference_dac_pairs(
         absolute_error = abs(signed_error)
         if maximum_reference_step_error_v is not None and absolute_error > maximum_reference_step_error_v:
             raise ValueError(
-                f"nearest REF pair for requested step {target:g} V has error "
+                f"selected REF pair for requested step {target:g} V has error "
                 f"{absolute_error:g} V, above maximum_reference_step_error_v="
                 f"{maximum_reference_step_error_v:g} V"
             )
-        available_pairs[index1, index2] = False
         selections.append(
             ReferencePairSelection(
                 requested_voltage_step_v=target,
@@ -539,6 +634,9 @@ def select_reference_dac_pairs(
                 minimum_reference_code=minimum_reference_code,
                 maximum_reference_code=maximum_reference_code,
                 minimum_reference_voltage_v=minimum_reference_voltage_v,
+                selected_common_mode_target_v=selected_common_mode_target,
+                common_mode_step_error_slack_v=common_mode_step_error_slack_v,
+                minimum_achievable_step_error_v=minimum_error,
             )
         )
     return tuple(selections)

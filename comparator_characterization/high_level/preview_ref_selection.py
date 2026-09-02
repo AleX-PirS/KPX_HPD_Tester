@@ -31,6 +31,9 @@ def main() -> None:
         maximum_reference_code=config.MAXIMUM_REFERENCE_CODE,
         minimum_reference_voltage_v=config.MINIMUM_REFERENCE_VOLTAGE_V,
         preferred_reference_common_mode_v=config.PREFERRED_REFERENCE_COMMON_MODE_V,
+        common_mode_step_error_slack_v=(
+            config.REFERENCE_COMMON_MODE_STEP_ERROR_SLACK_V
+        ),
         maximum_reference_step_error_v=config.MAXIMUM_REFERENCE_STEP_ERROR_V,
     )
     table = pd.DataFrame(
@@ -43,6 +46,7 @@ def main() -> None:
             "REF2_code": item.ref2_code,
             "REF2_voltage_V": item.ref2_voltage_v,
             "common_mode_V": item.reference_common_mode_v,
+            "common_mode_target_V": item.selected_common_mode_target_v,
         }
         for item in selections
     )

@@ -153,6 +153,35 @@ def atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
         raise
 
 
+def atomic_write_text(path: Path, text: str) -> Path:
+    """Atomically save UTF-8 text with the same Windows-lock retries as JSON."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = str(text)
+    if payload and not payload.endswith("\n"):
+        payload += "\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary = Path(stream.name)
+        _atomic_replace_with_retry(temporary, path)
+    except Exception:
+        _discard_temporary(temporary)
+        raise
+    return path
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:

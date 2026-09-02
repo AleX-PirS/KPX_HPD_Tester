@@ -356,16 +356,195 @@ def _scurve_raw_count_envelope(
         count_q90=(count_column, lambda values: values.quantile(0.90)),
         count_q95=(count_column, lambda values: values.quantile(0.95)),
         count_maximum=(count_column, "max"),
-        nominal_injections=("injections_for_analysis", "median"),
+        effective_injections=("injections_for_analysis", "median"),
     )
     return envelope.sort_values("threshold_dac_code")
 
 
-def _style_descending_raw_count_axis(axis: plt.Axes) -> None:
-    axis.invert_xaxis()
+def _scurve_noise_peak_lower_code(
+    frame: pd.DataFrame,
+    *,
+    boundary_code: float,
+    settings: AnalysisSettings,
+) -> float:
+    """Extend a raw-count view to a supported local baseline-noise maximum.
+
+    The matrix-level fit boundary remains unchanged. A pixel baseline may be
+    displaced to either side of that boundary, so the display searches a local
+    neighborhood in both directions. A point on the higher-code falling
+    shoulder must support the maximum, so a single isolated counter excursion
+    does not move the left plot edge.
+    """
+
+    if settings.scurve_plot_noise_peak_search_codes <= 0:
+        return boundary_code
+    required = {"threshold_dac_code", "background_count", "background_valid"}
+    if frame.empty or not required.issubset(frame.columns):
+        return boundary_code
+    data = frame[_truthy_series(frame, "background_valid")].copy()
+    if "background_counter_saturated" in data:
+        data = data[~_truthy_series(data, "background_counter_saturated")]
+    data["threshold_dac_code"] = pd.to_numeric(
+        data["threshold_dac_code"], errors="coerce"
+    )
+    data["background_count"] = pd.to_numeric(
+        data["background_count"], errors="coerce"
+    )
+    search_span = float(settings.scurve_plot_noise_peak_search_codes)
+    lower_limit = boundary_code - search_span
+    upper_limit = boundary_code + search_span
+    data = data[
+        data["threshold_dac_code"].between(lower_limit, upper_limit)
+    ].dropna(subset=["threshold_dac_code", "background_count"])
+    if data.empty:
+        return boundary_code
+    trace = (
+        data.groupby("threshold_dac_code", as_index=False)
+        .agg(background_q90=("background_count", lambda values: values.quantile(0.90)))
+        .sort_values("threshold_dac_code")
+        .reset_index(drop=True)
+    )
+    if len(trace) < 2:
+        return boundary_code
+
+    values = trace["background_q90"].to_numpy(dtype=float)
+    codes = trace["threshold_dac_code"].to_numpy(dtype=float)
+    peak_index = int(np.nanargmax(values))
+    peak_value = max(float(values[peak_index]), 0.0)
+    tolerance = float(settings.scurve_plot_noise_peak_support_fraction)
+    nominal = (
+        pd.to_numeric(data["injections_for_analysis"], errors="coerce").dropna()
+        if "injections_for_analysis" in data
+        else pd.Series(dtype=float)
+    )
+    substantial_limit = float(nominal.median()) if len(nominal) else 0.0
+    if peak_value <= substantial_limit:
+        return boundary_code
+    # At increasing DAC code the baseline-noise peak must have a measured
+    # falling shoulder. It may be sparse because the first point came from the
+    # coarse grid, hence support is relative rather than requiring code + 1.
+    shoulder = values[peak_index + 1 :]
+    supported = bool(np.any(shoulder >= tolerance * peak_value))
+    if not supported:
+        return boundary_code
+    return float(codes[peak_index])
+
+
+def _scurve_plot_code_window(
+    frame: pd.DataFrame,
+    settings: AnalysisSettings,
+) -> tuple[float, float] | None:
+    """Return a tight ascending-code view of the measured positive branch."""
+
+    if frame.empty or "threshold_dac_code" not in frame:
+        return None
+    data = frame.copy()
+    data["threshold_dac_code"] = pd.to_numeric(
+        data["threshold_dac_code"], errors="coerce"
+    )
+    data = data[data["threshold_dac_code"].notna()]
+    if data.empty:
+        return None
+    all_data = data.copy()
+    physical = (
+        data[_truthy_series(data, "physical_branch_valid")].copy()
+        if "physical_branch_valid" in data
+        else data.copy()
+    )
+    if physical.empty:
+        return None
+    boundary = _numeric_series(
+        physical, "baseline_noise_boundary_code"
+    ).dropna()
+    fit_lower = (
+        float(boundary.median())
+        if len(boundary)
+        else float(physical["threshold_dac_code"].min())
+    )
+    lower = _scurve_noise_peak_lower_code(
+        all_data,
+        boundary_code=fit_lower,
+        settings=settings,
+    )
+    lower = max(
+        float(all_data["threshold_dac_code"].min()),
+        lower - float(settings.scurve_plot_code_margin),
+    )
+    signal = physical.copy()
+    if "active_injection_pixel_bool" in signal:
+        signal = signal[_truthy_series(signal, "active_injection_pixel_bool")]
+    if "signal_valid" in signal:
+        signal = signal[_truthy_series(signal, "signal_valid")]
+    signal["signal_count"] = pd.to_numeric(
+        signal.get("signal_count"), errors="coerce"
+    )
+    signal = signal.dropna(subset=["signal_count"])
+    if signal.empty:
+        upper = min(
+            float(physical["threshold_dac_code"].max()), fit_lower + 32.0
+        )
+        return lower, max(upper, lower + 1.0)
+    envelope = (
+        signal.groupby("threshold_dac_code", as_index=False)
+        .agg(
+            signal_q90=("signal_count", lambda values: values.quantile(0.90)),
+            effective_n=("injections_for_analysis", "median"),
+        )
+        .sort_values("threshold_dac_code")
+    )
+    envelope = envelope[envelope["threshold_dac_code"] >= fit_lower]
+    nominal = pd.to_numeric(envelope["effective_n"], errors="coerce").dropna()
+    zero_limit = max(
+        1.0,
+        0.001 * float(nominal.median()) if len(nominal) else 1.0,
+    )
+    active = envelope[
+        pd.to_numeric(envelope["signal_q90"], errors="coerce") > zero_limit
+    ]
+    if active.empty:
+        upper = min(
+            float(envelope["threshold_dac_code"].max()), fit_lower + 32.0
+        )
+    else:
+        active_max = float(active["threshold_dac_code"].max())
+        upper = float(envelope["threshold_dac_code"].max())
+        zero_streak = 0
+        for _, row in envelope[
+            envelope["threshold_dac_code"] > active_max
+        ].iterrows():
+            if float(row["signal_q90"]) <= zero_limit:
+                zero_streak += 1
+            else:
+                zero_streak = 0
+            if zero_streak >= settings.scurve_plot_zero_tail_points:
+                upper = float(row["threshold_dac_code"])
+                break
+    upper = min(
+        float(physical["threshold_dac_code"].max()),
+        upper + float(settings.scurve_plot_code_margin),
+    )
+    return lower, max(upper, lower + 1.0)
+
+
+def _scurve_plot_window_rows(
+    frame: pd.DataFrame,
+    window: tuple[float, float] | None,
+) -> pd.DataFrame:
+    if window is None or frame.empty:
+        return frame
+    code = pd.to_numeric(frame["threshold_dac_code"], errors="coerce")
+    return frame[(code >= window[0]) & (code <= window[1])].copy()
+
+
+def _style_scurve_code_axis(
+    axis: plt.Axes,
+    window: tuple[float, float] | None,
+) -> None:
+    if window is not None:
+        axis.set_xlim(window[0], window[1])
     axis.set_yscale("symlog", linthresh=1.0)
     axis.set_ylim(bottom=0)
-    axis.set_xlabel("Threshold DAC code, high to low")
+    axis.set_xlabel("Threshold DAC code")
     axis.set_ylabel("Raw decoded count")
 
 
@@ -447,7 +626,33 @@ def _scurve_prediction(fit: pd.Series, voltage: np.ndarray) -> np.ndarray | None
     if not math.isfinite(v50) or not math.isfinite(sigma) or sigma <= 0:
         return None
     sign = 1 if fit.get("transition_direction") == "ascending" else -1
-    return np.array([_NORMAL.cdf(sign * (value - v50) / sigma) for value in voltage])
+    lower = _number(fit.get("fit_lower_plateau_efficiency"))
+    upper = _number(fit.get("fit_upper_plateau_efficiency"))
+    if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
+        lower, upper = 0.0, 1.0
+    probability = np.array(
+        [_NORMAL.cdf(sign * (value - v50) / sigma) for value in voltage]
+    )
+    return lower + (upper - lower) * probability
+
+
+def _scurve_code_prediction(fit: pd.Series, code: np.ndarray) -> np.ndarray | None:
+    d50 = _number(fit.get("d50_code"))
+    sigma = _number(fit.get("sigma_dac_codes"))
+    if not math.isfinite(d50) or not math.isfinite(sigma) or sigma <= 0:
+        return None
+    code_direction = fit.get(
+        "code_transition_direction", fit.get("transition_direction")
+    )
+    sign = 1 if code_direction == "ascending" else -1
+    lower = _number(fit.get("fit_lower_plateau_efficiency"))
+    upper = _number(fit.get("fit_upper_plateau_efficiency"))
+    if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
+        lower, upper = 0.0, 1.0
+    probability = np.array(
+        [_NORMAL.cdf(sign * (value - d50) / sigma) for value in code]
+    )
+    return lower + (upper - lower) * probability
 
 
 @_parallel_figures
@@ -1283,14 +1488,18 @@ def generate_diagnostic_plots(
                 )
             )
             for amplitude_index, (_, amplitude_raw) in enumerate(amplitude_frames):
+                plot_window = _scurve_plot_code_window(amplitude_raw, settings)
+                amplitude_plot = _scurve_plot_window_rows(
+                    amplitude_raw, plot_window
+                )
                 signal_envelope = _scurve_raw_count_envelope(
-                    amplitude_raw,
+                    amplitude_plot,
                     count_column="signal_count",
                     valid_column="signal_valid",
                     active_pixels_only=True,
                 )
                 background_envelope = _scurve_raw_count_envelope(
-                    amplitude_raw,
+                    amplitude_plot,
                     count_column="background_count",
                     valid_column="background_valid",
                     active_pixels_only=False,
@@ -1330,7 +1539,7 @@ def generate_diagnostic_plots(
                     )
                     nominal_values.extend(
                         pd.to_numeric(
-                            signal_envelope["nominal_injections"], errors="coerce"
+                            signal_envelope["effective_injections"], errors="coerce"
                         ).dropna().tolist()
                     )
                 if not background_envelope.empty:
@@ -1368,21 +1577,21 @@ def generate_diagnostic_plots(
                     )
                     nominal_values.extend(
                         pd.to_numeric(
-                            background_envelope["nominal_injections"], errors="coerce"
+                            background_envelope["effective_injections"], errors="coerce"
                         ).dropna().tolist()
                     )
                 nominal = (
                     float(np.median(nominal_values)) if nominal_values else float("nan")
                 )
                 for axis in axes:
-                    _style_descending_raw_count_axis(axis)
+                    _style_scurve_code_axis(axis, plot_window)
                     if math.isfinite(nominal):
                         axis.axhline(
                             nominal,
                             color="black",
                             linestyle="--",
                             linewidth=1.0,
-                            label=f"Nominal N = {nominal:g}",
+                            label=f"Effective analysis N = {nominal:g}",
                         )
                     axis.legend()
                 axes[0].set_title("Injected pixels: signal counts")
@@ -1391,7 +1600,7 @@ def generate_diagnostic_plots(
                 )
                 figure.suptitle(
                     f"Raw S-curve counts, {_amplitude_label(amplitude_raw)}, "
-                    f"pattern {pattern}; no fit filtering"
+                    f"pattern {pattern}; measured positive branch"
                 )
                 stem = (
                     f"matrix_scurve_raw_counts_{_safe_stem(pattern)}_"
@@ -1423,6 +1632,13 @@ def generate_diagnostic_plots(
                 settings, coordinate_source, coordinate_value
             )
             for column, row in raw_coordinates:
+                pixel_pattern_raw = pattern_raw[
+                    (pd.to_numeric(pattern_raw["column"], errors="coerce") == column)
+                    & (pd.to_numeric(pattern_raw["row"], errors="coerce") == row)
+                ]
+                plot_window = _scurve_plot_code_window(
+                    pixel_pattern_raw, settings
+                )
                 figure, axes = plt.subplots(
                     1, 2, figsize=(12.2, 4.8), layout="constrained"
                 )
@@ -1433,6 +1649,9 @@ def generate_diagnostic_plots(
                         (pd.to_numeric(amplitude_raw["column"], errors="coerce") == column)
                         & (pd.to_numeric(amplitude_raw["row"], errors="coerce") == row)
                     ]
+                    pixel_raw = _scurve_plot_window_rows(
+                        pixel_raw, plot_window
+                    )
                     signal_envelope = _scurve_raw_count_envelope(
                         pixel_raw,
                         count_column="signal_count",
@@ -1469,7 +1688,7 @@ def generate_diagnostic_plots(
                         )
                         nominal_values.extend(
                             pd.to_numeric(
-                                signal_envelope["nominal_injections"], errors="coerce"
+                                signal_envelope["effective_injections"], errors="coerce"
                             ).dropna().tolist()
                         )
                         plotted = True
@@ -1493,7 +1712,7 @@ def generate_diagnostic_plots(
                         )
                         nominal_values.extend(
                             pd.to_numeric(
-                                background_envelope["nominal_injections"], errors="coerce"
+                                background_envelope["effective_injections"], errors="coerce"
                             ).dropna().tolist()
                         )
                         plotted = True
@@ -1504,14 +1723,14 @@ def generate_diagnostic_plots(
                     float(np.median(nominal_values)) if nominal_values else float("nan")
                 )
                 for axis in axes:
-                    _style_descending_raw_count_axis(axis)
+                    _style_scurve_code_axis(axis, plot_window)
                     if math.isfinite(nominal):
                         axis.axhline(
                             nominal,
                             color="black",
                             linestyle="--",
                             linewidth=1.0,
-                            label=f"Nominal N = {nominal:g}",
+                            label=f"Effective analysis N = {nominal:g}",
                         )
                     axis.legend(ncol=2)
                 axes[0].set_title("Signal median and 10-90% repeats")
@@ -1567,6 +1786,13 @@ def generate_diagnostic_plots(
                     "v50_v" if not pattern_results.empty else "threshold_voltage_v",
                 )
                 for column, row in coordinates:
+                    pixel_pattern_data = pattern_data[
+                        (pattern_data["column"] == column)
+                        & (pattern_data["row"] == row)
+                    ]
+                    plot_window = _scurve_plot_code_window(
+                        pixel_pattern_data, settings
+                    )
                     figure, axis = plt.subplots(figsize=(7.8, 5.2))
                     plotted = False
                     for amplitude_index, amplitude in enumerate(amplitudes):
@@ -1577,8 +1803,13 @@ def generate_diagnostic_plots(
                         ]
                         if points_frame.empty:
                             continue
+                        points_frame = _scurve_plot_window_rows(
+                            points_frame, plot_window
+                        )
+                        if points_frame.empty:
+                            continue
                         points = (
-                            points_frame.groupby("threshold_voltage_v")["efficiency"]
+                            points_frame.groupby("threshold_dac_code")["efficiency"]
                             .mean()
                             .sort_index()
                         )
@@ -1608,13 +1839,15 @@ def generate_diagnostic_plots(
                             "ok",
                             "poor_quality",
                         ):
-                            voltage_grid = np.linspace(
+                            code_grid = np.linspace(
                                 float(points.index.min()), float(points.index.max()), 350
                             )
-                            predicted = _scurve_prediction(fit.iloc[0], voltage_grid)
+                            predicted = _scurve_code_prediction(
+                                fit.iloc[0], code_grid
+                            )
                             if predicted is not None:
                                 axis.plot(
-                                    voltage_grid,
+                                    code_grid,
                                     predicted,
                                     color=color,
                                     linewidth=1.2,
@@ -1622,7 +1855,9 @@ def generate_diagnostic_plots(
                         plotted = True
                     if plotted:
                         axis.set_ylim(-0.05, 1.05)
-                        axis.set_xlabel("Threshold voltage, V")
+                        if plot_window is not None:
+                            axis.set_xlim(plot_window[0], plot_window[1])
+                        axis.set_xlabel("Threshold DAC code")
                         axis.set_ylabel("Detection efficiency")
                         axis.set_title(
                             f"Pixel C{column:02d} R{row:02d}: S-curves, {pattern}"
@@ -1638,6 +1873,9 @@ def generate_diagnostic_plots(
                     else:
                         plt.close(figure)
 
+                matrix_window = _scurve_plot_code_window(
+                    pattern_data, settings
+                )
                 figure, axes = plt.subplots(1, 2, figsize=(12.2, 4.7))
                 plotted_matrix = False
                 for amplitude_index, amplitude in enumerate(amplitudes):
@@ -1646,17 +1884,20 @@ def generate_diagnostic_plots(
                     ]
                     if data.empty:
                         continue
+                    data = _scurve_plot_window_rows(data, matrix_window)
+                    if data.empty:
+                        continue
                     envelope = (
-                        data.groupby("threshold_voltage_v")["efficiency"]
+                        data.groupby("threshold_dac_code")["efficiency"]
                         .agg(
                             median="median",
                             q10=lambda values: values.quantile(0.10),
                             q90=lambda values: values.quantile(0.90),
                         )
                         .reset_index()
-                        .sort_values("threshold_voltage_v")
+                        .sort_values("threshold_dac_code")
                     )
-                    x = envelope["threshold_voltage_v"].to_numpy(dtype=float)
+                    x = envelope["threshold_dac_code"].to_numpy(dtype=float)
                     y = envelope["median"].to_numpy(dtype=float)
                     color = color_map(
                         amplitude_index / max(len(amplitudes) - 1, 1)
@@ -1679,11 +1920,14 @@ def generate_diagnostic_plots(
                     plotted_matrix = True
                 if plotted_matrix:
                     axes[0].set_ylim(-0.05, 1.05)
-                    axes[0].set_xlabel("Threshold voltage, V")
+                    if matrix_window is not None:
+                        for axis in axes:
+                            axis.set_xlim(matrix_window[0], matrix_window[1])
+                    axes[0].set_xlabel("Threshold DAC code")
                     axes[0].set_ylabel("Median efficiency")
                     axes[0].set_title("S-curves, median and 10-90% pixel band")
-                    axes[1].set_xlabel("Threshold voltage, V")
-                    axes[1].set_ylabel("|d efficiency / dV|")
+                    axes[1].set_xlabel("Threshold DAC code")
+                    axes[1].set_ylabel("|d efficiency / dDAC|")
                     axes[1].set_title("Derivative of the matrix-median S-curve")
                     axes[0].legend(ncol=2, title="Injected amplitude")
                     figure.suptitle(f"Owned-matrix response, pattern {pattern}")
@@ -1767,7 +2011,7 @@ def generate_diagnostic_plots(
             summary, "requested_injection_voltage_step_v"
         )
         if actual_step.notna().any():
-            figure, axes = plt.subplots(1, 2, figsize=(10.7, 4.2))
+            figure, axes = plt.subplots(1, 3, figsize=(14.2, 4.2))
             pair_table = (
                 summary.assign(actual_step=actual_step, requested_step=requested_step)
                 .dropna(subset=["actual_step"])
@@ -1785,13 +2029,36 @@ def generate_diagnostic_plots(
                 axes[0].set_ylabel("Selected measured step, mV")
                 axes[1].bar(
                     np.arange(len(pair_table)),
-                    1000 * (pair_table["actual_step"] - pair_table["requested_step"]),
+                    1e6 * (pair_table["actual_step"] - pair_table["requested_step"]),
                     color="#4c78a8",
                 )
                 axes[1].axhline(0, color="black", linewidth=0.8)
                 axes[1].set_xlabel("Amplitude index")
-                axes[1].set_ylabel("Selection error, mV")
-                figure.suptitle("REF LUT pair-selection accuracy")
+                axes[1].set_ylabel("Selection error, uV")
+                common_mode = _numeric_series(
+                    pair_table, "reference_common_mode_v"
+                )
+                axes[2].plot(
+                    x,
+                    common_mode,
+                    marker="o",
+                    linewidth=1.0,
+                    color="#e45756",
+                )
+                if common_mode.notna().any():
+                    axes[2].axhline(
+                        float(common_mode.median()),
+                        color="black",
+                        linestyle="--",
+                        linewidth=0.9,
+                    )
+                    span_mv = 1000.0 * float(
+                        common_mode.max() - common_mode.min()
+                    )
+                    axes[2].set_title(f"Common-mode span = {span_mv:.3f} mV")
+                axes[2].set_xlabel("Requested REF1-REF2 step, mV")
+                axes[2].set_ylabel("(VREF1 + VREF2) / 2, V")
+                figure.suptitle("REF LUT pair-selection accuracy and common mode")
                 outputs["reference_pair_selection"] = _save_figure(
                     figure, plot_directory, "reference_pair_selection", settings
                 )

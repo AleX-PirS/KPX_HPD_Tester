@@ -53,6 +53,7 @@ from .measurement import (
     run_scurve_points,
 )
 from .models import (
+    AnalysisSettings,
     CharacterizationSettings,
     FRAMEWORK_VERSION,
     ScurveSettings,
@@ -147,6 +148,49 @@ def _normalized_document(value: Any) -> Any:
     return json.loads(json.dumps(convert(value), sort_keys=True, ensure_ascii=True))
 
 
+# These fields first appeared after experiments made by older framework
+# versions had already been saved.  A missing field is not an operator change:
+# it only means that the old metadata could not record the new default.  An
+# existing stored value is never replaced here, so a real settings mismatch is
+# still rejected by the strict comparison below.
+_RESUME_DEFAULT_MIGRATION_PATHS: tuple[tuple[str, ...], ...] = (
+    ("scurve", "coarse_baseline_noise_consecutive_codes"),
+    ("scurve", "reference_common_mode_step_error_slack_v"),
+    ("analysis", "infer_upo_pwm_plateau_denominator"),
+    ("analysis", "scurve_plateau_min_codes"),
+    ("analysis", "scurve_fit_core_low_fraction"),
+    ("analysis", "scurve_fit_core_high_fraction"),
+    ("analysis", "scurve_plot_zero_tail_points"),
+    ("analysis", "scurve_plot_code_margin"),
+    ("analysis", "scurve_plot_noise_peak_search_codes"),
+    ("analysis", "scurve_plot_noise_peak_support_fraction"),
+)
+
+
+def _backfill_new_resume_defaults(
+    stored: dict[str, Any], requested: Mapping[str, Any]
+) -> None:
+    for path in _RESUME_DEFAULT_MIGRATION_PATHS:
+        stored_cursor: dict[str, Any] = stored
+        requested_cursor: Mapping[str, Any] = requested
+        for name in path[:-1]:
+            requested_child = requested_cursor.get(name)
+            if not isinstance(requested_child, Mapping):
+                break
+            stored_child = stored_cursor.get(name)
+            if stored_child is None:
+                stored_child = {}
+                stored_cursor[name] = stored_child
+            if not isinstance(stored_child, dict):
+                break
+            stored_cursor = stored_child
+            requested_cursor = requested_child
+        else:
+            leaf = path[-1]
+            if leaf not in stored_cursor and leaf in requested_cursor:
+                stored_cursor[leaf] = copy.deepcopy(requested_cursor[leaf])
+
+
 def _validate_resume_inputs(
     store: ExperimentStore,
     *,
@@ -164,11 +208,12 @@ def _validate_resume_inputs(
         raise ValueError("resume bad_pixel_map differs; start a new physical experiment")
     stored_settings = copy.deepcopy(store.metadata.get("settings", {}))
     requested_settings = settings.to_dict()
-    # Worker limits affect execution time only, not acquisition or fit semantics.
+    _backfill_new_resume_defaults(stored_settings, requested_settings)
+    # Analysis and plotting settings never alter physical acquisition. They may
+    # therefore change between framework versions without blocking a hardware
+    # resume; every completed analysis records its own settings separately.
     for document in (stored_settings, requested_settings):
-        for name in ("workers", "plot_workers", "read_workers",
-                     "parallel_min_groups", "parallel_batch_size"):
-            document.get("analysis", {}).pop(name, None)
+        document.pop("analysis", None)
     if _normalized_document(stored_settings) != _normalized_document(requested_settings):
         raise ValueError(
             "resume settings differ from metadata; re-analyze offline for analysis-only changes "
@@ -579,6 +624,8 @@ def _scurve_transition_brackets(
     maximum_background_fraction: float,
     *,
     stage: str,
+    scurve_settings: ScurveSettings,
+    analysis_settings: AnalysisSettings,
 ) -> tuple[tuple[int, int], ...]:
     """Locate per-pixel 50% crossings, including 0-to-1 coarse jumps."""
 
@@ -589,6 +636,13 @@ def _scurve_transition_brackets(
         raw,
         noise_statistics=noise_statistics,
         max_background_fraction=maximum_background_fraction,
+        settings=analysis_settings,
+        baseline_noise_count_multiplier=(
+            scurve_settings.baseline_noise_count_multiplier
+        ),
+        baseline_noise_pixel_fraction=(
+            scurve_settings.baseline_noise_pixel_fraction
+        ),
     )
     valid = efficiency[
         efficiency["fit_valid"].astype(str).str.lower().isin(("true", "1"))
@@ -799,6 +853,9 @@ def characterize_comparator(
             ),
             preferred_reference_common_mode_v=(
                 selected_settings.scurve.preferred_reference_common_mode_v
+            ),
+            common_mode_step_error_slack_v=(
+                selected_settings.scurve.reference_common_mode_step_error_slack_v
             ),
             maximum_reference_step_error_v=(
                 selected_settings.scurve.maximum_reference_step_error_v
@@ -1130,6 +1187,9 @@ def characterize_comparator(
                     "preferred_reference_common_mode_v": (
                         selected_settings.scurve.preferred_reference_common_mode_v
                     ),
+                    "reference_common_mode_step_error_slack_v": (
+                        selected_settings.scurve.reference_common_mode_step_error_slack_v
+                    ),
                     "maximum_reference_step_error_v": (
                         selected_settings.scurve.maximum_reference_step_error_v
                     ),
@@ -1273,6 +1333,15 @@ def characterize_comparator(
                                 "ref2_code": item.ref2_code,
                                 "ref2_voltage_v": item.ref2_voltage_v,
                                 "reference_common_mode_v": item.reference_common_mode_v,
+                                "selected_common_mode_target_v": (
+                                    item.selected_common_mode_target_v
+                                ),
+                                "common_mode_step_error_slack_v": (
+                                    item.common_mode_step_error_slack_v
+                                ),
+                                "minimum_achievable_step_error_v": (
+                                    item.minimum_achievable_step_error_v
+                                ),
                                 "selection_method": item.selection_method,
                                 "minimum_reference_code": item.minimum_reference_code,
                                 "maximum_reference_code": item.maximum_reference_code,
@@ -1786,7 +1855,10 @@ def characterize_comparator(
                     "baseline_noise_pixel_fraction": (
                         selected_settings.scurve.baseline_noise_pixel_fraction
                     ),
-                    "retained_consecutive_noise_codes": (
+                    "coarse_retained_noise_codes": (
+                        selected_settings.scurve.coarse_baseline_noise_consecutive_codes
+                    ),
+                    "fine_retained_consecutive_noise_codes": (
                         selected_settings.scurve.baseline_noise_consecutive_codes
                     ),
                     "predicted_safe_code_minimum_from_noise_reference": min(
@@ -1805,9 +1877,11 @@ def characterize_comparator(
                 "S-curve threshold scan: "
                 f"DAC {coarse_codes[0]} -> {coarse_codes[-1]}, "
                 f"coarse шаг {selected_settings.scurve.coarse_step}; "
-                f"после {selected_settings.scurve.baseline_noise_consecutive_codes} "
-                "последовательных полностью сохраненных шумовых точек scan "
-                "остановится"
+                f"coarse остановится после "
+                f"{selected_settings.scurve.coarse_baseline_noise_consecutive_codes} "
+                "полностью сохраненной шумовой точки, fine после "
+                f"{selected_settings.scurve.baseline_noise_consecutive_codes} "
+                "соседних точек с шагом 1"
             )
 
             if run_noise_scan or run_equalization:
@@ -1939,6 +2013,8 @@ def characterize_comparator(
                             noise_statistics,
                             selected_settings.scurve.max_background_fraction,
                             stage=stage,
+                            scurve_settings=selected_settings.scurve,
+                            analysis_settings=selected_settings.analysis,
                         )
                         current_upper = max(coarse_codes)
                         if not transition_brackets:
@@ -1975,6 +2051,8 @@ def characterize_comparator(
                                     noise_statistics,
                                     selected_settings.scurve.max_background_fraction,
                                     stage=stage,
+                                    scurve_settings=selected_settings.scurve,
+                                    analysis_settings=selected_settings.analysis,
                                 )
                                 if transition_brackets:
                                     break

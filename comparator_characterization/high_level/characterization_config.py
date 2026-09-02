@@ -119,6 +119,9 @@ MAXIMUM_REFERENCE_CODE = 800
 MINIMUM_REFERENCE_VOLTAGE_V: float | None = None
 # Необязательная цель общего уровня (V_REF1 + V_REF2)/2.
 PREFERRED_REFERENCE_COMMON_MODE_V: float | None = None
+# Допустимое ухудшение относительно минимальной ошибки ступеньки. Внутри этой
+# узкой полосы селектор автоматически выравнивает common-mode всего набора.
+REFERENCE_COMMON_MODE_STEP_ERROR_SLACK_V = 50e-6
 # Максимально допустимая ошибка выбранной ступеньки, None отключает предел.
 MAXIMUM_REFERENCE_STEP_ERROR_V: float | None = None
 
@@ -211,11 +214,15 @@ SCURVE_FINE_MARGIN_CODES = 8
 # заданной доли исправных пикселей имеют background строго больше Nnom *
 # MULTIPLIER. Остановка выполняется только после двух таких кодов подряд, то
 # есть характерные 1-2 точки с количеством отсчетов намного выше N остаются в
-# raw-данных и на диагностических графиках. Одиночный выброс не останавливает
-# проход. При PWM Nnom автоматически равно round(Freal * экспозиция УПО).
+# raw-данных и на диагностических графиках. На coarse-сетке первая надежная
+# шумовая точка уже останавливает движение вниз, поскольку следующий шаг 8
+# может перескочить узкий шумовой пик. В fine-проходе остаются две соседние
+# точки с шагом 1. При PWM Nnom автоматически равно round(Freal * экспозиция
+# УПО), а offline-анализ дополнительно проверяет его по чистому плато.
 SCURVE_BASELINE_NOISE_STOP_ENABLED = True
 SCURVE_BASELINE_NOISE_COUNT_MULTIPLIER = 1.0
 SCURVE_BASELINE_NOISE_PIXEL_FRACTION = 0.10
+SCURVE_COARSE_BASELINE_NOISE_CONSECUTIVE_CODES = 1
 SCURVE_BASELINE_NOISE_CONSECUTIVE_CODES = 2
 
 # Ограничения coarse и автоматического fine сканирования включительно.
@@ -241,6 +248,18 @@ PLOT_SCURVE_PATTERNS: tuple[str, ...] = ()
 REPRESENTATIVE_PIXEL_COUNT = 6
 SAVE_PDF_PLOTS = True
 PLOT_DPI = 300
+
+# S-curve fit: робастная оценка индивидуальных плато, монотонное упорядочивание
+# точек и probit-fit только центральных 5-95% перехода. Это не сглаживает raw и
+# не меняет измеренные значения, а не дает неоднородному плато завышать sigma.
+SCURVE_FIT_CORE_LOW_FRACTION = 0.05
+SCURVE_FIT_CORE_HIGH_FRACTION = 0.95
+# На raw-графиках слева дополнительно показывается ближайший подтвержденный
+# максимум шумового плеча в пределах +/-32 кодов от матричной fit-границы.
+# Локальная baseline пикселя может быть сдвинута в любую сторону. Для защиты от
+# одиночного выброса требуется еще одна точка не ниже 5% найденного максимума.
+SCURVE_PLOT_NOISE_PEAK_SEARCH_CODES = 32
+SCURVE_PLOT_NOISE_PEAK_SUPPORT_FRACTION = 0.05
 
 # Параллельный анализ. 0 = авто, 1 = последовательно; числа >1 задают лимит.
 # Авто: до 8 процессов для больших наборов кривых, до 4 для PNG/PDF,
@@ -377,6 +396,9 @@ def build_settings(
     settings.scurve.preferred_reference_common_mode_v = (
         PREFERRED_REFERENCE_COMMON_MODE_V
     )
+    settings.scurve.reference_common_mode_step_error_slack_v = (
+        REFERENCE_COMMON_MODE_STEP_ERROR_SLACK_V
+    )
     settings.scurve.maximum_reference_step_error_v = (
         MAXIMUM_REFERENCE_STEP_ERROR_V
     )
@@ -395,6 +417,9 @@ def build_settings(
     settings.scurve.baseline_noise_pixel_fraction = (
         SCURVE_BASELINE_NOISE_PIXEL_FRACTION
     )
+    settings.scurve.coarse_baseline_noise_consecutive_codes = (
+        SCURVE_COARSE_BASELINE_NOISE_CONSECUTIVE_CODES
+    )
     settings.scurve.baseline_noise_consecutive_codes = (
         SCURVE_BASELINE_NOISE_CONSECUTIVE_CODES
     )
@@ -408,6 +433,14 @@ def build_settings(
         plot_injection_patterns=PLOT_SCURVE_PATTERNS,
         plot_dpi=PLOT_DPI,
         save_pdf_plots=SAVE_PDF_PLOTS,
+        scurve_fit_core_low_fraction=SCURVE_FIT_CORE_LOW_FRACTION,
+        scurve_fit_core_high_fraction=SCURVE_FIT_CORE_HIGH_FRACTION,
+        scurve_plot_noise_peak_search_codes=(
+            SCURVE_PLOT_NOISE_PEAK_SEARCH_CODES
+        ),
+        scurve_plot_noise_peak_support_fraction=(
+            SCURVE_PLOT_NOISE_PEAK_SUPPORT_FRACTION
+        ),
     )
     settings.validate()
     return settings
