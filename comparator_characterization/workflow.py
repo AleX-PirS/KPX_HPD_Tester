@@ -1441,8 +1441,11 @@ def characterize_comparator(
             asic_initialization_history=initialization_history,
             initial_asic_configuration=initialized_snapshot,
             acquisition_sequence={
-                "version": 4, "upo_execution": "calling_thread_only",
-                "pixel_commit": "GET_SHOT_only; cleanup_stages_PX_for_next_shot",
+                "version": 5, "upo_execution": "calling_thread_only",
+                "pixel_commit": (
+                    "explicit_SET_PIXEL_CFG_WRITE_TO_CHIP_after_each_complete_"
+                    "pixel_state_before_GET_SHOT"
+                ),
                 "ctrl_execution": (
                     "same_UPO_thread: PWM_before_GET_SHOT, CTRL0_after_response, then_GET_PIXEL"
                     if isinstance(shot_executor, UpoPwmShotExecutor)
@@ -1465,15 +1468,14 @@ def characterize_comparator(
                     measurement_fclk_values
                 ),
                 "get_shot_internal_limitation": (
-                    "GET_SHOT is monolithic and internally commits the staged matrix; "
-                    "Python cannot switch FCLK between that internal commit and the "
-                    "physical shutter-open transition"
+                    "GET_SHOT is monolithic; Python cannot observe the physical "
+                    "shutter-open transition"
                 ),
             },
         )
         store.log_status(
-            "Global-конфигурация установлена, все PX подготовлены в кеше УПО; "
-            "единственная загрузка матрицы в чип выполняется внутри GET_SHOT",
+            "Global-конфигурация установлена; полная PX-матрица явно загружена "
+            "в ASIC командой WRITE_TO_CHIP",
             overall_percent_estimate=3.0,
         )
 
@@ -2425,10 +2427,15 @@ def characterize_comparator(
                         and backend.safe_for_pixel_cleanup
                         and not bool(getattr(shot_executor, "upo_command_in_flight", False))
                     ):
-                        backend.restore_pixel_configs(pixel_snapshot)
+                        backend.restore_pixel_configs(
+                            pixel_snapshot,
+                            commit=True,
+                            commit_context="S-curve cleanup restore",
+                        )
                         store.update_metadata(pixel_cleanup={
-                            "staged_in_upo": True, "committed_to_chip": False,
-                            "note": "next GET_SHOT commits staged pixels; CTRL output disabled",
+                            "staged_in_upo": True, "committed_to_chip": True,
+                            "commit_command": "SET_PIXEL_CFG WRITE_TO_CHIP",
+                            "note": "pixel snapshot restored after CTRL output was disabled",
                         })
                     else:
                         store.record_error(

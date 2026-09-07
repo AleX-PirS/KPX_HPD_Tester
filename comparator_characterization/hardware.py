@@ -873,6 +873,25 @@ class MGPDMeasurementBackend:
         self._standard_initialization_complete = False
         self._upo_state_uncertain = False
         self._global_field_state: dict[str, int] = {}
+        self._pixel_commit_count = 0
+        self._last_pixel_commit_context: str | None = None
+
+    def _commit_pixel_matrix(self, context: str) -> None:
+        """Explicitly transfer the staged 32-bit PX matrix into the ASIC."""
+
+        message = f"PX WRITE_TO_CHIP: загрузка матрицы в ASIC ({context})"
+        logger.info(message)
+        self._report_status(message)
+        if not self.matrix.write_to_chip():
+            raise RuntimeError(
+                "SET_PIXEL_CFG WRITE_TO_CHIP failed after staging pixel matrix "
+                f"({context}); GET_SHOT is blocked"
+            )
+        self._pixel_commit_count += 1
+        self._last_pixel_commit_context = str(context)
+        message = f"PX WRITE_TO_CHIP подтвержден УПО ({context})"
+        logger.info(message)
+        self._report_status(message)
 
     def initialize_standard_configuration(
         self,
@@ -980,8 +999,6 @@ class MGPDMeasurementBackend:
             disabled_raw,
             progress_callback=report_disabled,
         )
-        # GET_SHOT commits the staged full matrix. A separate WRITE_TO_CHIP
-        # acknowledges acceptance only and could overlap UPO's next operation.
         self._current_pixel_configs = dict(disabled_configs)
 
         selected_baseline = {
@@ -1005,6 +1022,8 @@ class MGPDMeasurementBackend:
         self.restore_pixel_configs(
             selected_baseline,
             progress_callback=report_selected,
+            commit=True,
+            commit_context="standard initialization",
         )
         self._main_fclk_mhz = main_fclk_mhz
         self._measurement_fclk_mhz = measurement_fclk_mhz
@@ -1046,7 +1065,9 @@ class MGPDMeasurementBackend:
             ),
             "selected_test_pixel_count": len(selected_baseline),
             "selected_test_pixels_loaded_after_standard_disable": True,
-            "pixel_commit_policy": "stage_only_until_GET_SHOT",
+            "pixel_commit_policy": "explicit_WRITE_TO_CHIP_before_measurement",
+            "pixel_commit_count_after_initialization": self._pixel_commit_count,
+            "last_pixel_commit_context": self._last_pixel_commit_context,
             "selected_test_pixel_mask_policy": (
                 "PX_MASK=1 for selected good pixels, 0 for bad pixels; PX_TST_EN=0"
             ),
@@ -1135,6 +1156,9 @@ class MGPDMeasurementBackend:
             "get_shot_omr_preconfiguration": self.settings.configure_get_shot_omr,
             "mode_read": self.settings.mode_read,
             "crw_mode": self.settings.crw_mode,
+            "pixel_commit_policy": "explicit_WRITE_TO_CHIP_before_measurement",
+            "pixel_commit_count": self._pixel_commit_count,
+            "last_pixel_commit_context": self._last_pixel_commit_context,
         }
 
     def base_pixel_rows(self, pixels: Sequence[tuple[int, int]]) -> list[dict[str, Any]]:
@@ -1177,6 +1201,8 @@ class MGPDMeasurementBackend:
         spec: WindowSpec,
         pixels: Sequence[tuple[int, int]],
         trim_map: Mapping[tuple[int, int], int],
+        *,
+        commit: bool = True,
     ) -> dict[tuple[int, int], int]:
         self.validate_pixels(pixels)
         staged: dict[tuple[int, int], int] = {}
@@ -1193,6 +1219,9 @@ class MGPDMeasurementBackend:
             staged[(row, column)] = updated_raw
 
         self.matrix.set_pixels(staged)
+
+        if commit:
+            self._commit_pixel_matrix(f"{spec.name} trim map")
 
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
@@ -1223,7 +1252,8 @@ class MGPDMeasurementBackend:
         pixel_configs: Mapping[tuple[int, int], int],
         *,
         progress_callback: Callable[[int, int, int, int], None] | None = None,
-        commit: bool = False,
+        commit: bool = True,
+        commit_context: str = "pixel configuration restore",
     ) -> None:
         """Restore pixel words, with the permanent bad-pixel mask taking priority."""
 
@@ -1233,8 +1263,8 @@ class MGPDMeasurementBackend:
             PIXEL_CODEC.validate_raw(int(raw))
             staged[(row, column)] = self._masked_pixel_word((column, row), int(raw))
         self.matrix.set_pixels(staged, progress_callback=progress_callback)
-        if commit and not self.matrix.write_to_chip():
-            raise RuntimeError("SET_PIXEL_CFG WRITE_TO_CHIP failed while restoring pixels")
+        if commit:
+            self._commit_pixel_matrix(commit_context)
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
 
@@ -1244,6 +1274,7 @@ class MGPDMeasurementBackend:
         *,
         gain_map: Mapping[tuple[int, int], int],
         active_injection_pixels: Sequence[tuple[int, int]],
+        commit: bool = True,
     ) -> list[dict[str, Any]]:
         """Apply GAIN and documented test fields while preserving all trims."""
 
@@ -1290,11 +1321,18 @@ class MGPDMeasurementBackend:
                 }
             )
         self.matrix.set_pixels(staged)
+        if commit:
+            self._commit_pixel_matrix("S-curve pixel configuration")
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
         return rows
 
-    def program_noise_pixel_configuration(self, pixels: Sequence[tuple[int, int]]) -> None:
+    def program_noise_pixel_configuration(
+        self,
+        pixels: Sequence[tuple[int, int]],
+        *,
+        commit: bool = True,
+    ) -> None:
         """Explicitly disable injection before every noise stage, preserving trims/GAIN."""
 
         configs = {}
@@ -1303,7 +1341,11 @@ class MGPDMeasurementBackend:
             fields.update(PX_TST_EN=0, PX_MASK=int(coordinate not in self.bad_pixels),
                           PX_SH_EN=0, PX_BUF_NEN=1, PX_SHT=2)
             configs[coordinate] = PIXEL_CODEC.pack(fields)
-        self.restore_pixel_configs(configs)
+        self.restore_pixel_configs(
+            configs,
+            commit=commit,
+            commit_context="noise pixel configuration",
+        )
 
     def configure_test_pulse_amplitude(self, pulse_amplitude: Any) -> dict[str, Any]:
         """Program native REF1/REF2 codes and preserve calibrated levels."""
@@ -1563,15 +1605,14 @@ class MGPDMeasurementBackend:
             (row, column): self._masked_pixel_word((column, row), raw)
             for (column, row), raw in self._current_pixel_configs.items()
         }
-        # Recreate both halves in UPO virtual memory after reconnect. The next
-        # GET_SHOT performs the only full-matrix transfer to the chip.
+        # Recreate both halves in UPO virtual memory, then explicitly transfer
+        # the complete staged matrix before retrying the acquisition.
         self._zeroed_matrix.set_owned_half(0x00000000)
         self.matrix.set_pixels(staged)
+        self._commit_pixel_matrix("reconnect state restoration")
         for (row, column), raw in staged.items():
             self._current_pixel_configs[(column, row)] = raw
-        logger.warning(
-            "KIPIX restored and PX staged after reconnect; commit occurs in GET_SHOT"
-        )
+        logger.warning("KIPIX and PX state restored and explicitly committed after reconnect")
 
     @property
     def safe_for_pixel_cleanup(self) -> bool:
@@ -1622,6 +1663,9 @@ class MGPDMeasurementBackend:
             details={
                 **dict(shot_result.details),
                 **clock_details,
+                "pixel_commit_policy": "explicit_WRITE_TO_CHIP_before_GET_SHOT",
+                "pixel_commit_count_before_get_shot": self._pixel_commit_count,
+                "last_pixel_commit_context": self._last_pixel_commit_context,
                 "upo_acquisition_attempt_count": len(recovery_events) + 1,
                 "upo_recovery_events": recovery_events,
             },

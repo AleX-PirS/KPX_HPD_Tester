@@ -85,8 +85,8 @@ REFERENCE_VERIFICATION_SAVE_SCREENSHOTS = False
 # остается на все время блокирующей экспозиции и сразу после ответа заменяется
 # основным до первого GET_PIXEL. Допустимые значения УПО:
 # 0, 1, 5, 10, 25, 50, 75, 100, 125, 150 МГц.
-ASIC_MAIN_FCLK_MHZ = 150
-ASIC_MEASUREMENT_FCLK_MHZ = 5
+ASIC_MAIN_FCLK_MHZ = 100
+ASIC_MEASUREMENT_FCLK_MHZ = 10
 # Совместимое имя для пользовательских файлов предыдущих версий.
 ASIC_INITIALIZATION_FCLK_MHZ = ASIC_MAIN_FCLK_MHZ
 

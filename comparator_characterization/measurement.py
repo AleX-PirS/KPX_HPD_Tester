@@ -586,9 +586,13 @@ def run_noise_scan(
     ):
         raise ValueError("overall progress range must be non-decreasing")
     store.log_status(f"Noise scan {stage}: программируется trim-карта")
-    backend.program_noise_pixel_configuration(pixels)
+    # Build the final noise PX state in UPO memory first, then perform one
+    # explicit full-matrix commit after the trim map has been staged.
+    backend.program_noise_pixel_configuration(pixels, commit=False)
     programmed_trim_map = backend.program_trim_map(spec, pixels, trim_map)
-    store.log_status(f"Noise scan {stage}: trim-карта записана")
+    store.log_status(
+        f"Noise scan {stage}: trim-карта явно загружена в ASIC через WRITE_TO_CHIP"
+    )
     manual_codes = (
         tuple(int(code) for code in scan_codes)
         if scan_codes is not None
@@ -808,11 +812,19 @@ def run_scurve_points(
         f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
         "программируется PX-конфигурация"
     )
-    programmed_trim_map = backend.program_trim_map(spec, pixels, trim_map)
+    # Trim and injection fields form one logical PX configuration. Stage trim
+    # first and commit once after GAIN/MASK/TST_EN have reached their final state.
+    programmed_trim_map = backend.program_trim_map(
+        spec, pixels, trim_map, commit=False
+    )
     pixel_config_rows = backend.program_scurve_pixel_configuration(
         pixels,
         gain_map=gain_map,
         active_injection_pixels=injection_group.active_pixels,
+    )
+    store.log_status(
+        f"S-curve {stage}/{scan_phase}/{injection_group.group_id}: "
+        "PX-конфигурация явно загружена в ASIC через WRITE_TO_CHIP"
     )
     pixel_config_path = (
         store.root
