@@ -55,7 +55,7 @@ UPO_RECONNECT_BACKOFF_S = 0.5
 # осциллографе. CH1 = TST_SIG с AMUX, CH4 = CTRL. Оба входа DC, 1 МОм;
 # trigger CH4, NEG, 0.5 V; развертка 500 нс/дел. Для каждой ступеньки
 # сохраняются отдельные raw CSV при CLK OFF и CLK ON.
-VERIFY_REFERENCE_STEPS_BEFORE_TEST = True
+VERIFY_REFERENCE_STEPS_BEFORE_TEST = False
 OSCILLOSCOPE_VISA_ADDRESS: str | None = None
 OSCILLOSCOPE_IDN_SUBSTRING = "DSO9104H"
 OSCILLOSCOPE_TIMEOUT_MS = 5_000
@@ -150,8 +150,8 @@ INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 50.0, 100.0, 250.0)
 # Быстрый автономный тест шума по измерительному FCLK. Для полноценного sweep
 # задайте, например, (1, 5, 10, 25, 50). Безопасный исходный default содержит
 # одну частоту и не увеличивает время теста неожиданно.
-CLOCK_NOISE_MEASUREMENT_FCLK_MHZ = (ASIC_MEASUREMENT_FCLK_MHZ,)
-CLOCK_NOISE_INJECTION_STEP_MV = INJECTION_STEPS_MV[0]
+CLOCK_NOISE_MEASUREMENT_FCLK_MHZ = (5, 10, 25, 50, 75, 100, 125, 150)
+CLOCK_NOISE_INJECTION_STEP_MV = 100
 CLOCK_NOISE_INJECTION_PATTERN = "all"
 
 # По умолчанию оба выбранных кода строго больше 400.
