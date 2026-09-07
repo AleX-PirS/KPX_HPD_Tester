@@ -80,10 +80,15 @@ REFERENCE_VERIFICATION_RETRY_BACKOFF_S = 0.25
 REFERENCE_VERIFICATION_ABORT_ON_FAILURE = True
 REFERENCE_VERIFICATION_SAVE_SCREENSHOTS = False
 
-# Перед каждым аппаратным тестом FCLK явно устанавливается в 50 МГц, затем
-# загружаются EO_cfg.DEFAULT_REGISTERS и конфигурация всех 1024 PX:
-# Col 0..15 получают 0x00000000, Col 16..31 настраиваются по логике теста.
-ASIC_INITIALIZATION_FCLK_MHZ = 50
+# Основной FCLK используется при загрузке EO/PX, восстановлении после связи и
+# GET_PIXEL. Измерительный FCLK включается непосредственно перед GET_SHOT,
+# остается на все время блокирующей экспозиции и сразу после ответа заменяется
+# основным до первого GET_PIXEL. Допустимые значения УПО:
+# 0, 1, 5, 10, 25, 50, 75, 100, 125, 150 МГц.
+ASIC_MAIN_FCLK_MHZ = 150
+ASIC_MEASUREMENT_FCLK_MHZ = 5
+# Совместимое имя для пользовательских файлов предыдущих версий.
+ASIC_INITIALIZATION_FCLK_MHZ = ASIC_MAIN_FCLK_MHZ
 
 # Основной источник CTRL: "upo_pwm". Резервный вариант: "keysight_burst".
 # В UPO PWM параметр N_INJECTIONS игнорируется: число фронтов для анализа
@@ -141,6 +146,13 @@ REFERENCE_LUT_VOLTAGE_UNIT = "auto"
 # Единица здесь mV. Скрипт выбирает измеренные LUT-точки и всегда требует
 # физическое условие V_REF1 > V_REF2.
 INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 50.0, 100.0, 250.0)
+
+# Быстрый автономный тест шума по измерительному FCLK. Для полноценного sweep
+# задайте, например, (1, 5, 10, 25, 50). Безопасный исходный default содержит
+# одну частоту и не увеличивает время теста неожиданно.
+CLOCK_NOISE_MEASUREMENT_FCLK_MHZ = (ASIC_MEASUREMENT_FCLK_MHZ,)
+CLOCK_NOISE_INJECTION_STEP_MV = INJECTION_STEPS_MV[0]
+CLOCK_NOISE_INJECTION_PATTERN = "all"
 
 # По умолчанию оба выбранных кода строго больше 400.
 MINIMUM_REFERENCE_CODE = 401
@@ -261,9 +273,13 @@ SCURVE_BASELINE_NOISE_CONSECUTIVE_CODES = 2
 NOISE_COARSE_START = 0
 NOISE_COARSE_STOP = 1023
 NOISE_COARSE_STEP = 16
-# После обнаружения активности три полностью пустые DAC-точки подряд завершают
-# текущую фазу noise scan. None отключает умную раннюю остановку.
-NOISE_CONSECUTIVE_EMPTY_CODES_TO_STOP: int | None = 3
+# Полный список DAC-кодов всегда проходится. Если вся выбранная матрица дважды
+# подряд валидно вернула ноль на одном коде, оставшиеся повторы только этой
+# точки пропускаются. Ошибка чтения никогда не считается пустой матрицей.
+NOISE_EMPTY_MATRIX_REPEATS_TO_SKIP_REMAINING: int | None = 2
+# Устаревшая настройка оставлена для импорта старых пользовательских файлов.
+# В версии 0.13 она не обрезает хвост DAC-диапазона.
+NOISE_CONSECUTIVE_EMPTY_CODES_TO_STOP: int | None = None
 
 RESULTS_ROOT = PROJECT_ROOT / "results"
 # Нужен для отдельного S-curve/crosstalk запуска. Укажите каталог завершенного
@@ -418,6 +434,9 @@ def build_settings(
     settings.noise.stop_after_consecutive_empty_codes = (
         NOISE_CONSECUTIVE_EMPTY_CODES_TO_STOP
     )
+    settings.noise.empty_matrix_repeats_to_skip_remaining = (
+        NOISE_EMPTY_MATRIX_REPEATS_TO_SKIP_REMAINING
+    )
     settings.noise.upo_reconnect_attempts = UPO_RECONNECT_ATTEMPTS
     settings.noise.upo_reconnect_backoff_s = UPO_RECONNECT_BACKOFF_S
     settings.equalization.scan_all_trim_codes = scan_all_trim_codes
@@ -543,6 +562,7 @@ def reference_hardware_arguments(
     oscilloscope: Any,
     *,
     required_for_scurve: bool,
+    injection_steps_mv: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Передать REF LUT и при включении добавить проверку до измерений."""
 
@@ -551,7 +571,14 @@ def reference_hardware_arguments(
         return {}
     arguments: dict[str, Any] = {
         "reference_calibration_files": reference_calibration_files(),
-        "injection_voltage_steps_v": injection_voltage_steps_v(),
+        "injection_voltage_steps_v": tuple(
+            float(value) * 1e-3
+            for value in (
+                INJECTION_STEPS_MV
+                if injection_steps_mv is None
+                else injection_steps_mv
+            )
+        ),
         "reference_calibration_voltage_unit": REFERENCE_LUT_VOLTAGE_UNIT,
     }
     if verify:

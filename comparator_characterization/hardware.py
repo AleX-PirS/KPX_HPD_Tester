@@ -60,6 +60,9 @@ class ShotRequest:
     counter_mode_bits: int = 16
     mode_read: int = 0b010
     crw_mode: int = 0
+    # Optional per-shot override. Normally the workflow supplies the same
+    # measurement FCLK to every shot in one experiment branch.
+    measurement_fclk_mhz: int | None = None
 
 
 @dataclass(frozen=True)
@@ -237,9 +240,11 @@ class UpoPwmSettings:
 class UpoPwmShotExecutor:
     """Generate continuous CTRL PWM through UPO around blocking ``GET_SHOT``.
 
-    All commands use the same serialized MGPDClient connection. Background:
-    ``CTRL=0 -> GET_SHOT -> GET_PIXEL``. Signal:
-    ``CTRL PWM -> GET_SHOT -> CTRL=0 -> GET_PIXEL``. ``GET_PIXEL`` is called by
+    All commands use the same serialized MGPDClient connection. The backend
+    sets measurement FCLK before entering this executor and restores main FCLK
+    after it returns. Background: ``measurement FCLK -> CTRL=0 -> GET_SHOT ->
+    main FCLK -> GET_PIXEL``. Signal: ``measurement FCLK -> CTRL PWM ->
+    GET_SHOT -> CTRL=0 -> main FCLK -> GET_PIXEL``. ``GET_PIXEL`` is called by
     MGPDMeasurementBackend only after this executor returns successfully.
     """
 
@@ -861,7 +866,10 @@ class MGPDMeasurementBackend:
             )
         self._current_pixel_configs = dict(self._base_pixel_configs)
         self._decoder = LFSRDecoder(noise_settings.counter_mode_bits)
-        self._initialization_fclk_mhz = STANDARD_CHARACTERIZATION_FCLK_MHZ
+        self._main_fclk_mhz = STANDARD_CHARACTERIZATION_FCLK_MHZ
+        self._measurement_fclk_mhz = STANDARD_CHARACTERIZATION_FCLK_MHZ
+        # Compatibility alias used by older internal code and metadata.
+        self._initialization_fclk_mhz = self._main_fclk_mhz
         self._standard_initialization_complete = False
         self._upo_state_uncertain = False
         self._global_field_state: dict[str, int] = {}
@@ -871,6 +879,7 @@ class MGPDMeasurementBackend:
         pixels: Sequence[tuple[int, int]],
         *,
         fclk_mhz: int = STANDARD_CHARACTERIZATION_FCLK_MHZ,
+        measurement_fclk_mhz: int | None = None,
         progress_callback: Callable[[str, float], None] | None = None,
         eo_overrides: Mapping[str, int] | None = None,
     ) -> dict[str, Any]:
@@ -887,6 +896,13 @@ class MGPDMeasurementBackend:
             if progress_callback is not None:
                 progress_callback(message, percent)
 
+        main_fclk_mhz = self._validate_fclk_mhz(fclk_mhz, "main_fclk_mhz")
+        if measurement_fclk_mhz is None:
+            measurement_fclk_mhz = main_fclk_mhz
+        measurement_fclk_mhz = self._validate_fclk_mhz(
+            measurement_fclk_mhz, "measurement_fclk_mhz"
+        )
+
         # Validate the complete logical EO request before the first hardware
         # command. Direct users of the backend therefore get the same fail-fast
         # guarantee as the public workflow.
@@ -894,8 +910,8 @@ class MGPDMeasurementBackend:
         overrides = validate_eo_overrides(eo_overrides, run_scurve=False)
         self.validate_pixels(pixels)
         report("Инициализация ASIC: установка FCLK", 0.0)
-        if not self.client.set_fclk(int(fclk_mhz)):
-            raise RuntimeError(f"failed to set FCLK={fclk_mhz} MHz")
+        if not self.client.set_fclk(main_fclk_mhz):
+            raise RuntimeError(f"failed to set main FCLK={main_fclk_mhz} MHz")
         report("Инициализация ASIC: загрузка global defaults", 10.0)
         if not self.cfg.set_default():
             raise RuntimeError("failed to load EO_cfg.DEFAULT_REGISTERS")
@@ -990,7 +1006,9 @@ class MGPDMeasurementBackend:
             selected_baseline,
             progress_callback=report_selected,
         )
-        self._initialization_fclk_mhz = int(fclk_mhz)
+        self._main_fclk_mhz = main_fclk_mhz
+        self._measurement_fclk_mhz = measurement_fclk_mhz
+        self._initialization_fclk_mhz = main_fclk_mhz
         self._global_field_state = {
             name: int(value) for name, value in EO_cfg.DEFAULT_FIELD_VALUES.items()
         }
@@ -998,7 +1016,11 @@ class MGPDMeasurementBackend:
         self._standard_initialization_complete = True
 
         return {
-            "fclk_mhz": int(fclk_mhz),
+            "fclk_mhz": main_fclk_mhz,
+            "main_fclk_mhz": main_fclk_mhz,
+            "measurement_fclk_mhz": measurement_fclk_mhz,
+            "measurement_fclk_usage": "immediately_before_and_during_blocking_GET_SHOT",
+            "main_fclk_restore": "after_GET_SHOT_return_before_first_GET_PIXEL",
             "fclk_acknowledged_no_readback_command": True,
             "global_configuration_source": "EO_cfg.DEFAULT_REGISTERS",
             "global_logical_defaults": dict(EO_cfg.DEFAULT_FIELD_VALUES),
@@ -1036,6 +1058,15 @@ class MGPDMeasurementBackend:
             "permanently_disabled_pixel_count": len(self.bad_pixels),
             "bad_pixel_policy": "PX_MASK=0 and PX_TST_EN=0 on every pixel write",
         }
+
+    @staticmethod
+    def _validate_fclk_mhz(value: int, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+        if value not in MGPDClient.FCLK_ALLOWED_MHZ:
+            allowed = ", ".join(str(item) for item in MGPDClient.FCLK_ALLOWED_MHZ)
+            raise ValueError(f"{name} must be one of: {allowed}")
+        return int(value)
 
     def active_pixels(
         self, pixels: Sequence[tuple[int, int]]
@@ -1376,22 +1407,85 @@ class MGPDMeasurementBackend:
     def _execute_shot_with_recovery(
         self,
         request: ShotRequest,
-    ) -> tuple[ShotExecutionResult | int | None, list[dict[str, Any]]]:
+    ) -> tuple[
+        ShotExecutionResult | int | None,
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
         recovery_events: list[dict[str, Any]] = []
+        measurement_fclk_mhz = self._validate_fclk_mhz(
+            (
+                self._measurement_fclk_mhz
+                if request.measurement_fclk_mhz is None
+                else request.measurement_fclk_mhz
+            ),
+            "measurement_fclk_mhz",
+        )
         for acquisition_attempt in range(self.settings.upo_reconnect_attempts + 1):
+            clock_details: dict[str, Any] = {
+                "main_fclk_mhz": int(self._main_fclk_mhz),
+                "measurement_fclk_mhz": measurement_fclk_mhz,
+                "measurement_fclk_set_before_get_shot": False,
+                "main_fclk_restored_after_get_shot": False,
+                "main_fclk_restored_before_get_pixel": False,
+                "get_shot_is_blocking": True,
+            }
             try:
                 self._upo_state_uncertain = True
+                if not self.client.set_fclk(measurement_fclk_mhz):
+                    raise RuntimeError(
+                        f"failed to set measurement FCLK={measurement_fclk_mhz} MHz"
+                    )
+                clock_details["measurement_fclk_set_utc"] = (
+                    datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z")
+                )
+                clock_details["measurement_fclk_set_before_get_shot"] = True
                 logger.debug("GET_SHOT begin: %s/%s, thread=%s",
                              request.measurement_kind, request.acquisition_type,
                              threading.current_thread().name)
                 result = self.shot_executor.execute(self.client, request)
+                clock_details["get_shot_returned_utc"] = (
+                    datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z")
+                )
+                if not self.client.set_fclk(self._main_fclk_mhz):
+                    raise RuntimeError(
+                        f"failed to restore main FCLK={self._main_fclk_mhz} MHz"
+                    )
+                clock_details["main_fclk_restored_utc"] = (
+                    datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z")
+                )
+                clock_details["main_fclk_restored_after_get_shot"] = True
+                clock_details["main_fclk_restored_before_get_pixel"] = True
                 self._upo_state_uncertain = False
                 logger.debug("GET_SHOT complete; pixel readout permitted")
-                return result, recovery_events
+                return result, recovery_events, clock_details
             except BaseException as error:
+                executor_in_flight = bool(
+                    getattr(self.shot_executor, "upo_command_in_flight", False)
+                )
+                if not executor_in_flight and bool(self.client.connected):
+                    try:
+                        restored = bool(self.client.set_fclk(self._main_fclk_mhz))
+                    except BaseException as restore_error:
+                        clock_details["emergency_main_fclk_restore_error"] = str(
+                            restore_error
+                        )
+                    else:
+                        clock_details["emergency_main_fclk_restored"] = restored
+                        # Restoring only the clock does not prove that a failed
+                        # GET_SHOT left the matrix/buffer state usable. Keep
+                        # cleanup blocked until a complete retried acquisition
+                        # succeeds after reconnect.
                 retryable = self._contains_transport_error(error) or (
                     "MGPDLab GET_SHOT" in str(error)
                     or "GET_SHOT failed" in str(error)
+                    or "FCLK" in str(error)
                 )
                 if (
                     not retryable
@@ -1440,6 +1534,7 @@ class MGPDMeasurementBackend:
                         "error_type": type(error).__name__,
                         "error": str(error),
                         "failed_shot_data_discarded": True,
+                        "clock_sequence": clock_details,
                     }
                 )
         raise RuntimeError("unreachable acquisition retry state")
@@ -1453,7 +1548,7 @@ class MGPDMeasurementBackend:
             self.shot_executor.recover_safe_state(self.client)
         if not self._standard_initialization_complete:
             return
-        if not self.client.set_fclk(self._initialization_fclk_mhz):
+        if not self.client.set_fclk(self._main_fclk_mhz):
             raise RuntimeError("failed to restore FCLK after UPO reconnect")
         if not self.cfg.set_default():
             raise RuntimeError("failed to restore EO defaults after UPO reconnect")
@@ -1493,7 +1588,9 @@ class MGPDMeasurementBackend:
     ) -> tuple[list[dict[str, Any]], ShotExecutionResult]:
         pixels = self.active_pixels(pixels)
         self.validate_pixels(pixels)
-        executor_result, recovery_events = self._execute_shot_with_recovery(request)
+        executor_result, recovery_events, clock_details = (
+            self._execute_shot_with_recovery(request)
+        )
         if isinstance(executor_result, ShotExecutionResult):
             shot_result = executor_result
         elif executor_result is None:
@@ -1516,19 +1613,19 @@ class MGPDMeasurementBackend:
             )
         else:
             raise RuntimeError("ShotExecutor returned an unsupported result type")
-        if recovery_events:
-            shot_result = ShotExecutionResult(
-                requested_injections=shot_result.requested_injections,
-                programmed_injections=shot_result.programmed_injections,
-                actual_injections=shot_result.actual_injections,
-                injections_for_analysis=shot_result.injections_for_analysis,
-                injection_count_source=shot_result.injection_count_source,
-                details={
-                    **dict(shot_result.details),
-                    "upo_acquisition_attempt_count": len(recovery_events) + 1,
-                    "upo_recovery_events": recovery_events,
-                },
-            )
+        shot_result = ShotExecutionResult(
+            requested_injections=shot_result.requested_injections,
+            programmed_injections=shot_result.programmed_injections,
+            actual_injections=shot_result.actual_injections,
+            injections_for_analysis=shot_result.injections_for_analysis,
+            injection_count_source=shot_result.injection_count_source,
+            details={
+                **dict(shot_result.details),
+                **clock_details,
+                "upo_acquisition_attempt_count": len(recovery_events) + 1,
+                "upo_recovery_events": recovery_events,
+            },
+        )
         if request.test_pulses:
             if shot_result.injections_for_analysis is None:
                 raise RuntimeError("test-pulse shot did not report an injection denominator")

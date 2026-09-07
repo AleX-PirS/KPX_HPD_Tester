@@ -750,6 +750,7 @@ def choose_measured_trim_map(
 
 _SCURVE_STAGE_COLUMNS = (
     "stage",
+    "measurement_fclk_mhz",
     "pulse_amplitude_native",
     "injection_pattern",
 )
@@ -995,6 +996,7 @@ def _paired_scurve_efficiency(
     selected_settings.validate()
     frame = raw.copy()
     defaults: dict[str, Any] = {
+        "measurement_fclk_mhz": np.nan,
         "injection_pattern": "all",
         "injection_group_id": "all",
         "injection_phase_column": "",
@@ -1055,6 +1057,7 @@ def _paired_scurve_efficiency(
         "injection_charge_electrons",
         "injection_capacitance_f",
         "injection_capacitance_relative_uncertainty",
+        "measurement_fclk_mhz",
     ):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame["injections_for_analysis"] = frame["injections_for_analysis"].fillna(
@@ -1085,6 +1088,7 @@ def _paired_scurve_efficiency(
         "injection_phase_row",
         "active_injection_pixel_bool",
         "active_injection_pixel_count",
+        "measurement_fclk_mhz",
     ]
     background = frame[frame["acquisition_type"] == "background"][
         keys
@@ -1158,6 +1162,7 @@ def _paired_scurve_efficiency(
     )
     phase_identity = [
         "stage",
+        "measurement_fclk_mhz",
         "threshold_dac_code",
         "pulse_amplitude_native",
         "repeat_index",
@@ -1598,7 +1603,7 @@ def fit_scurves(
     selected_settings = settings or AnalysisSettings()
     selected_settings.validate()
     group_columns = [
-        "stage", "pulse_amplitude_native", "injection_pattern",
+        "stage", "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern",
         "column", "row", "local_trim_code",
     ]
     metadata_columns = [column for column in (
@@ -1736,6 +1741,7 @@ def summarize_scurve_branch_and_precision(
     precision_rows: list[dict[str, Any]] = []
     result_group_columns = [
         "stage",
+        "measurement_fclk_mhz",
         "pulse_amplitude_native",
         "injection_pattern",
         "column",
@@ -1835,6 +1841,11 @@ def calculate_injection_crosstalk_metrics(
     if efficiency.empty or "injection_pattern" not in efficiency:
         return pd.DataFrame(), pd.DataFrame()
     frame = efficiency.copy()
+    if "measurement_fclk_mhz" not in frame:
+        frame["measurement_fclk_mhz"] = -1
+    frame["measurement_fclk_mhz"] = pd.to_numeric(
+        frame["measurement_fclk_mhz"], errors="coerce"
+    ).fillna(-1)
     frame["active_injection_pixel_count"] = pd.to_numeric(
         frame["active_injection_pixel_count"], errors="coerce"
     )
@@ -1843,29 +1854,50 @@ def calculate_injection_crosstalk_metrics(
     )
     density = (
         frame.groupby(
-            ["pulse_amplitude_native", "injection_pattern"],
+            ["measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
             as_index=False,
             dropna=False,
         )["active_injection_pixel_count"]
         .median()
         .rename(columns={"active_injection_pixel_count": "median_active_pixels_per_shot"})
     )
-    reference_by_amplitude = (
+    reference_by_clock_amplitude = (
         density.sort_values(
-            ["pulse_amplitude_native", "median_active_pixels_per_shot", "injection_pattern"]
+            [
+                "measurement_fclk_mhz",
+                "pulse_amplitude_native",
+                "median_active_pixels_per_shot",
+                "injection_pattern",
+            ]
         )
-        .drop_duplicates("pulse_amplitude_native", keep="first")
-        .set_index("pulse_amplitude_native")["injection_pattern"]
+        .drop_duplicates(
+            ["measurement_fclk_mhz", "pulse_amplitude_native"], keep="first"
+        )
+        .set_index(["measurement_fclk_mhz", "pulse_amplitude_native"])[
+            "injection_pattern"
+        ]
         .to_dict()
     )
 
     pixel_metrics = pd.DataFrame()
     if not scurve_results.empty:
         results = scurve_results.copy()
+        if "measurement_fclk_mhz" not in results:
+            results["measurement_fclk_mhz"] = -1
+        results["measurement_fclk_mhz"] = pd.to_numeric(
+            results["measurement_fclk_mhz"], errors="coerce"
+        ).fillna(-1)
+        scurve_results = results
         reference_rows = []
-        for amplitude, reference_pattern in reference_by_amplitude.items():
+        for (clock_mhz, amplitude), reference_pattern in (
+            reference_by_clock_amplitude.items()
+        ):
             subset = results[
-                (results["pulse_amplitude_native"] == amplitude)
+                (
+                    results["measurement_fclk_mhz"].fillna(-1)
+                    == (-1 if pd.isna(clock_mhz) else clock_mhz)
+                )
+                & (results["pulse_amplitude_native"] == amplitude)
                 & (results["injection_pattern"] == reference_pattern)
             ].copy()
             subset["reference_injection_pattern"] = reference_pattern
@@ -1878,6 +1910,7 @@ def calculate_injection_crosstalk_metrics(
         if not reference.empty:
             reference = reference[
                 [
+                    "measurement_fclk_mhz",
                     "pulse_amplitude_native",
                     "column",
                     "row",
@@ -1893,7 +1926,12 @@ def calculate_injection_crosstalk_metrics(
             )
             pixel_metrics = results.merge(
                 reference,
-                on=["pulse_amplitude_native", "column", "row"],
+                on=[
+                    "measurement_fclk_mhz",
+                    "pulse_amplitude_native",
+                    "column",
+                    "row",
+                ],
                 how="left",
                 validate="many_to_one",
             )
@@ -1908,8 +1946,8 @@ def calculate_injection_crosstalk_metrics(
             )
 
     summary_rows: list[dict[str, Any]] = []
-    for (amplitude, pattern), group in frame.groupby(
-        ["pulse_amplitude_native", "injection_pattern"],
+    for (clock_mhz, amplitude, pattern), group in frame.groupby(
+        ["measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
         dropna=False,
         sort=True,
     ):
@@ -1921,7 +1959,11 @@ def calculate_injection_crosstalk_metrics(
         ]["inactive_excess_hit_fraction"].dropna()
         fitted = (
             scurve_results[
-                (scurve_results["pulse_amplitude_native"] == amplitude)
+                (
+                    scurve_results["measurement_fclk_mhz"].fillna(-1)
+                    == (-1 if pd.isna(clock_mhz) else clock_mhz)
+                )
+                & (scurve_results["pulse_amplitude_native"] == amplitude)
                 & (scurve_results["injection_pattern"] == pattern)
             ]
             if not scurve_results.empty
@@ -1929,7 +1971,11 @@ def calculate_injection_crosstalk_metrics(
         )
         pixel_subset = (
             pixel_metrics[
-                (pixel_metrics["pulse_amplitude_native"] == amplitude)
+                (
+                    pixel_metrics["measurement_fclk_mhz"].fillna(-1)
+                    == (-1 if pd.isna(clock_mhz) else clock_mhz)
+                )
+                & (pixel_metrics["pulse_amplitude_native"] == amplitude)
                 & (pixel_metrics["injection_pattern"] == pattern)
             ]
             if not pixel_metrics.empty
@@ -1937,9 +1983,12 @@ def calculate_injection_crosstalk_metrics(
         )
         summary_rows.append(
             {
+                "measurement_fclk_mhz": clock_mhz,
                 "pulse_amplitude_native": amplitude,
                 "injection_pattern": pattern,
-                "reference_injection_pattern": reference_by_amplitude.get(amplitude),
+                "reference_injection_pattern": reference_by_clock_amplitude.get(
+                    (clock_mhz, amplitude)
+                ),
                 "group_count": int(group["injection_group_id"].nunique()),
                 "median_active_pixels_per_shot": float(
                     group["active_injection_pixel_count"].median()
@@ -1965,6 +2014,126 @@ def calculate_injection_crosstalk_metrics(
                 "inactive_excess_hit_fraction_max": float(inactive.max())
                 if len(inactive)
                 else float("nan"),
+            }
+        )
+    summary = pd.DataFrame(summary_rows)
+    for table in (pixel_metrics, summary):
+        if not table.empty and "measurement_fclk_mhz" in table:
+            table["measurement_fclk_mhz"] = table[
+                "measurement_fclk_mhz"
+            ].replace(-1, np.nan)
+    return pixel_metrics, summary
+
+
+def calculate_measurement_clock_noise_metrics(
+    scurve_results: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Summarize S-curve width versus the FCLK used during GET_SHOT.
+
+    ``sigma_dac_codes`` is a threshold-domain, Gaussian-equivalent width of the
+    fitted transition. It is a comparative pixel-noise indicator and must not
+    be interpreted as a spectral noise density.
+    """
+
+    if scurve_results.empty or "measurement_fclk_mhz" not in scurve_results:
+        return pd.DataFrame(), pd.DataFrame()
+    frame = scurve_results.copy()
+    frame["measurement_fclk_mhz"] = pd.to_numeric(
+        frame["measurement_fclk_mhz"], errors="coerce"
+    )
+    frame = frame[frame["measurement_fclk_mhz"].notna()].copy()
+    if frame.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    frame["sigma_dac_codes"] = pd.to_numeric(
+        frame.get("sigma_dac_codes"), errors="coerce"
+    )
+    frame["sigma_v"] = pd.to_numeric(frame.get("sigma_v"), errors="coerce")
+    frame["sigma_mv"] = 1_000.0 * frame["sigma_v"]
+    frame["d50_code"] = pd.to_numeric(frame.get("d50_code"), errors="coerce")
+    frame["v50_v"] = pd.to_numeric(frame.get("v50_v"), errors="coerce")
+    frame["fit_r2"] = pd.to_numeric(frame.get("fit_r2"), errors="coerce")
+    frame["fit_rmse_efficiency"] = pd.to_numeric(
+        frame.get("fit_rmse_efficiency"), errors="coerce"
+    )
+    pixel_columns = [
+        "measurement_fclk_mhz",
+        "pulse_amplitude_native",
+        "injection_pattern",
+        "column",
+        "row",
+        "fit_status",
+        "d50_code",
+        "v50_v",
+        "sigma_dac_codes",
+        "sigma_v",
+        "sigma_mv",
+        "fit_r2",
+        "fit_rmse_efficiency",
+        "injection_voltage_step_v",
+        "requested_injection_voltage_step_v",
+        "injection_charge_electrons",
+        "ref1_dac_code",
+        "ref2_dac_code",
+    ]
+    pixel_metrics = frame.reindex(columns=pixel_columns).copy()
+
+    summary_rows: list[dict[str, Any]] = []
+    for (clock_mhz, amplitude, pattern), group in frame.groupby(
+        ["measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
+        dropna=False,
+        sort=True,
+    ):
+        usable = group[group["fit_status"].isin(("ok", "poor_quality"))].copy()
+        sigma_dac = pd.to_numeric(
+            usable["sigma_dac_codes"], errors="coerce"
+        ).dropna()
+        sigma_mv = pd.to_numeric(usable["sigma_mv"], errors="coerce").dropna()
+        d50 = pd.to_numeric(usable["d50_code"], errors="coerce").dropna()
+        r2 = pd.to_numeric(usable["fit_r2"], errors="coerce").dropna()
+        summary_rows.append(
+            {
+                "measurement_fclk_mhz": float(clock_mhz),
+                "pulse_amplitude_native": amplitude,
+                "injection_pattern": pattern,
+                "pixel_count": int(len(group)),
+                "successful_fit_count": int((group["fit_status"] == "ok").sum()),
+                "usable_fit_count": int(len(usable)),
+                "usable_fit_fraction": (
+                    float(len(usable) / len(group)) if len(group) else float("nan")
+                ),
+                "sigma_dac_mean": (
+                    float(sigma_dac.mean()) if len(sigma_dac) else float("nan")
+                ),
+                "sigma_dac_median": (
+                    float(sigma_dac.median()) if len(sigma_dac) else float("nan")
+                ),
+                "sigma_dac_mad": _mad(sigma_dac),
+                "sigma_dac_q10": (
+                    float(sigma_dac.quantile(0.10))
+                    if len(sigma_dac)
+                    else float("nan")
+                ),
+                "sigma_dac_q90": (
+                    float(sigma_dac.quantile(0.90))
+                    if len(sigma_dac)
+                    else float("nan")
+                ),
+                "sigma_mv_mean": (
+                    float(sigma_mv.mean()) if len(sigma_mv) else float("nan")
+                ),
+                "sigma_mv_median": (
+                    float(sigma_mv.median()) if len(sigma_mv) else float("nan")
+                ),
+                "d50_code_median": (
+                    float(d50.median()) if len(d50) else float("nan")
+                ),
+                "fit_r2_median": (
+                    float(r2.median()) if len(r2) else float("nan")
+                ),
+                "metric_definition": (
+                    "Gaussian-equivalent S-curve sigma in threshold DAC codes; "
+                    "comparative indicator, not spectral density"
+                ),
             }
         )
     return pixel_metrics, pd.DataFrame(summary_rows)
@@ -2089,14 +2258,20 @@ def summarize_uniform_trim_characterization(
 def summarize_scurve_amplitudes(scurve_results: pd.DataFrame) -> pd.DataFrame:
     if scurve_results.empty:
         return pd.DataFrame()
+    if "measurement_fclk_mhz" not in scurve_results:
+        scurve_results = scurve_results.copy()
+        scurve_results["measurement_fclk_mhz"] = np.nan
     rows: list[dict[str, Any]] = []
-    group_columns = ["pulse_amplitude_native", "injection_pattern"]
+    group_columns = [
+        "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"
+    ]
     for keys, group in scurve_results.groupby(group_columns, dropna=False, sort=True):
-        amplitude, pattern = keys
+        measurement_fclk_mhz, amplitude, pattern = keys
         valid = group[group["fit_status"].isin(("ok", "poor_quality"))]
         v50 = pd.to_numeric(valid["v50_v"], errors="coerce").dropna()
         sigma = pd.to_numeric(valid["sigma_v"], errors="coerce").dropna()
         row: dict[str, Any] = {
+            "measurement_fclk_mhz": measurement_fclk_mhz,
             "pulse_amplitude_native": amplitude,
             "injection_pattern": pattern,
             "pixel_count": int(len(group)),
@@ -2136,6 +2311,9 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
 
     if scurve_results.empty or "injection_voltage_step_v" not in scurve_results:
         return pd.DataFrame()
+    if "measurement_fclk_mhz" not in scurve_results:
+        scurve_results = scurve_results.copy()
+        scurve_results["measurement_fclk_mhz"] = np.nan
     frame = scurve_results[scurve_results["fit_status"].isin(("ok", "poor_quality"))].copy()
     frame["injection_voltage_step_v"] = pd.to_numeric(
         frame["injection_voltage_step_v"], errors="coerce"
@@ -2148,8 +2326,10 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
     frame["v50_v"] = pd.to_numeric(frame["v50_v"], errors="coerce")
     frame = frame.dropna(subset=["injection_voltage_step_v", "v50_v"])
     rows: list[dict[str, Any]] = []
-    for (pattern, column, row), group in frame.groupby(
-        ["injection_pattern", "column", "row"], sort=True
+    for (measurement_fclk_mhz, pattern, column, row), group in frame.groupby(
+        ["measurement_fclk_mhz", "injection_pattern", "column", "row"],
+        dropna=False,
+        sort=True,
     ):
         points = (
             group.groupby("injection_voltage_step_v", as_index=False)
@@ -2177,6 +2357,7 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
             gain_mv_per_ke = float(charge_parameters[0]) * 1e6
         rows.append(
             {
+                "measurement_fclk_mhz": measurement_fclk_mhz,
                 "injection_pattern": pattern,
                 "column": int(column),
                 "row": int(row),
@@ -2440,6 +2621,8 @@ def analyze_saved_experiment(
     scurve_transition_precision = pd.DataFrame()
     crosstalk_pixels = pd.DataFrame()
     crosstalk_summary = pd.DataFrame()
+    measurement_clock_pixels = pd.DataFrame()
+    measurement_clock_summary = pd.DataFrame()
     if not raw_scurve.empty:
         if n_injections is not None:
             count_columns = [
@@ -2531,6 +2714,9 @@ def analyze_saved_experiment(
         crosstalk_pixels, crosstalk_summary = calculate_injection_crosstalk_metrics(
             scurve_efficiency, scurve_results
         )
+        measurement_clock_pixels, measurement_clock_summary = (
+            calculate_measurement_clock_noise_metrics(scurve_results)
+        )
         store.write_table(
             analysis_dir / "injection_crosstalk_pixel_metrics.csv",
             crosstalk_pixels,
@@ -2538,6 +2724,14 @@ def analyze_saved_experiment(
         store.write_table(
             analysis_dir / "injection_crosstalk_summary.csv",
             crosstalk_summary,
+        )
+        store.write_table(
+            analysis_dir / "measurement_clock_noise_pixel_metrics.csv",
+            measurement_clock_pixels,
+        )
+        store.write_table(
+            analysis_dir / "measurement_clock_noise_summary.csv",
+            measurement_clock_summary,
         )
         outputs["scurve_efficiency"] = analysis_dir / "scurve_efficiency.csv"
         outputs["scurve_results"] = analysis_dir / "scurve_results.csv"
@@ -2559,6 +2753,12 @@ def analyze_saved_experiment(
         outputs["injection_crosstalk_summary"] = (
             analysis_dir / "injection_crosstalk_summary.csv"
         )
+        outputs["measurement_clock_noise_pixel_metrics"] = (
+            analysis_dir / "measurement_clock_noise_pixel_metrics.csv"
+        )
+        outputs["measurement_clock_noise_summary"] = (
+            analysis_dir / "measurement_clock_noise_summary.csv"
+        )
 
     if generate_plots:
         from .plots import generate_diagnostic_plots
@@ -2575,6 +2775,8 @@ def analyze_saved_experiment(
             scurve_gain_results=scurve_gain_results,
             crosstalk_pixel_metrics=crosstalk_pixels,
             crosstalk_summary=crosstalk_summary,
+            measurement_clock_pixel_metrics=measurement_clock_pixels,
+            measurement_clock_summary=measurement_clock_summary,
             target_voltage=selected_target,
             settings=selected_settings,
         )
@@ -2599,6 +2801,7 @@ def analyze_saved_experiment(
         scurve_branch_summary=scurve_branch_summary,
         scurve_transition_precision=scurve_transition_precision,
         crosstalk_summary=crosstalk_summary,
+        measurement_clock_summary=measurement_clock_summary,
         target_voltage=selected_target,
     )
 
@@ -2700,6 +2903,8 @@ def analyze_saved_noise_statistics(
             scurve_efficiency=pd.DataFrame(), scurve_results=pd.DataFrame(),
             scurve_amplitude_summary=pd.DataFrame(), scurve_gain_results=pd.DataFrame(),
             crosstalk_pixel_metrics=pd.DataFrame(), crosstalk_summary=pd.DataFrame(),
+            measurement_clock_pixel_metrics=pd.DataFrame(),
+            measurement_clock_summary=pd.DataFrame(),
             target_voltage=target_voltage, settings=selected_settings,
         )
         outputs["plots"].update(generate_recommendation_plots(directory, selected_settings))
@@ -2727,6 +2932,7 @@ def analyze_saved_noise_statistics(
         scurve_branch_summary=pd.DataFrame(),
         scurve_transition_precision=pd.DataFrame(),
         crosstalk_summary=pd.DataFrame(),
+        measurement_clock_summary=pd.DataFrame(),
         target_voltage=target_voltage,
     )
     atomic_write_json(directory / "analysis_manifest.json", {

@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.12.0"
+FRAMEWORK_VERSION = "0.13.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -149,9 +149,12 @@ class NoiseScanSettings:
     mode_read: int = 0b010
     crw_mode: int = 0
     continue_after_pixel_read_error: bool = True
-    # Stop only on the trailing empty side of an already observed noise peak.
-    # Initial zero-count DAC points never trigger early termination.
-    stop_after_consecutive_empty_codes: int | None = 3
+    # Retained only for compatibility with older saved settings. Version 0.13
+    # never truncates the requested DAC-code range.
+    stop_after_consecutive_empty_codes: int | None = None
+    # Skip only the remaining repeats of one DAC point after this many
+    # consecutive, fully valid, all-pixel-zero acquisitions.
+    empty_matrix_repeats_to_skip_remaining: int | None = 2
     # Number of reconnect-and-retry cycles after a transient UPO failure.
     upo_reconnect_attempts: int = 3
     upo_reconnect_backoff_s: float = 0.5
@@ -202,6 +205,16 @@ class NoiseScanSettings:
             ):
                 raise ValueError(
                     "stop_after_consecutive_empty_codes must be None or an integer >= 2"
+                )
+        if self.empty_matrix_repeats_to_skip_remaining is not None:
+            if (
+                not isinstance(self.empty_matrix_repeats_to_skip_remaining, int)
+                or isinstance(self.empty_matrix_repeats_to_skip_remaining, bool)
+                or self.empty_matrix_repeats_to_skip_remaining < 2
+            ):
+                raise ValueError(
+                    "empty_matrix_repeats_to_skip_remaining must be None or "
+                    "an integer >= 2"
                 )
         if (
             not isinstance(self.upo_reconnect_attempts, int)

@@ -169,6 +169,12 @@ def _validated_request(request: dict[str, Any]) -> dict[str, Any]:
     )
     amplitude = _request_value(result, "amplitude_index", "all")
     result["amplitude_index"] = "all" if amplitude in (None, "", "all") else int(amplitude)
+    measurement_fclk = _request_value(result, "measurement_fclk_mhz", "all")
+    result["measurement_fclk_mhz"] = (
+        "all"
+        if measurement_fclk in (None, "", "all")
+        else int(measurement_fclk)
+    )
     return result
 
 
@@ -205,6 +211,7 @@ class AnalysisPlotData:
         key = (
             request["injection_pattern"],
             request["amplitude_index"],
+            request["measurement_fclk_mhz"],
             request["branch_view"],
             pixel,
         )
@@ -218,6 +225,7 @@ class AnalysisPlotData:
             "background_count", "efficiency", "physical_branch_valid",
             "injection_voltage_step_v", "requested_injection_voltage_step_v",
             "injection_charge_electrons", "effective_injections_for_analysis",
+            "measurement_fclk_mhz",
         }
         available = self._scurve_columns()
         usecols = [name for name in available if name in wanted]
@@ -245,6 +253,7 @@ class AnalysisPlotData:
             "stage", "threshold_dac_code", "injection_pattern",
             "active_injection_pixel_bool", "physical_branch_valid", "efficiency",
             "injection_voltage_step_v", "injection_charge_electrons",
+            "measurement_fclk_mhz",
         }
         available = self._scurve_columns()
         usecols = [name for name in available if name in wanted]
@@ -339,6 +348,10 @@ class AnalysisPlotData:
                     label += f" ({1000.0 * step:.4g} mV)"
                 amplitudes_by_index.setdefault(index, {"value": index, "label": label})
         amplitudes = [amplitudes_by_index[index] for index in sorted(amplitudes_by_index)]
+        measurement_fclk_values = sorted(
+            int(value)
+            for value in _numeric(scurve, "measurement_fclk_mhz").dropna().unique()
+        )
         default_pixel = min(pixels) if pixels else None
         return {
             "analysis_directory": str(self.analysis_directory),
@@ -354,6 +367,7 @@ class AnalysisPlotData:
             "noise_stages": stages,
             "scurve_patterns": patterns,
             "amplitudes": amplitudes,
+            "measurement_fclk_values_mhz": measurement_fclk_values,
             "available": {
                 "noise": not noise.empty or not noise_fit.empty,
             "scurve": (self.analysis_directory / "scurve_efficiency.csv").is_file(),
@@ -470,7 +484,12 @@ def _select_scurve(frame: pd.DataFrame, request: dict[str, Any]) -> pd.DataFrame
     amplitude = request["amplitude_index"]
     if amplitude != "all" and "stage" in data:
         token = f"pulse_amplitude_{int(amplitude):03d}_"
-        data = data[data["stage"].astype(str).str.startswith(token)]
+        data = data[data["stage"].astype(str).str.contains(token, regex=False)]
+    measurement_fclk = request["measurement_fclk_mhz"]
+    if measurement_fclk != "all" and "measurement_fclk_mhz" in data:
+        data = data[
+            _numeric(data, "measurement_fclk_mhz") == int(measurement_fclk)
+        ]
     if request["branch_view"] == "positive" and "physical_branch_valid" in data:
         data = data[_bool_series(data, "physical_branch_valid")]
     return data
@@ -869,6 +888,7 @@ _HTML = r"""<!doctype html>
 <label>Язык<select id="language"><option value="ru">Русский</option><option value="en">English</option></select></label>
 <label>Пиксель<select id="pixel"></select></label><label>Noise stage<select id="stage"><option value="all">Все</option></select></label>
 <label>S-curve pattern<select id="pattern"><option value="all">Все</option></select></label><label>Амплитуда<select id="amplitude"><option value="all">Все</option></select></label>
+<label>FCLK измерения<select id="measurement_fclk"><option value="all">Все</option></select></label>
 <label>Ветвь S-curve<select id="branch"><option value="positive">Положительная, стандарт</option><option value="full">Полная / bipolar</option></select></label>
 <label>Метрика heatmap<select id="metric"><option value="noise_center_v">Noise center, V</option><option value="noise_sigma_v">Noise sigma, V</option><option value="trim_code">Trim code</option><option value="scurve_d50_code">S-curve D50, DAC</option><option value="scurve_sigma_codes">S-curve sigma, DAC</option><option value="scurve_v50_v">S-curve V50, V</option></select></label>
 <label>Геометрия PX<select id="geometry"><option value="square">Квадратные ячейки</option><option value="stretched">Растянуть поле</option></select></label><label>Формат<select id="format"><option>png</option><option>pdf</option><option>svg</option></select></label>
@@ -879,9 +899,9 @@ _HTML = r"""<!doctype html>
 </div><p class="hint">Стандартный вид S-кривой показывает только физическую положительную ветвь. Полный вид оставляет обе полярности. Эти файлы добавляются в custom_plots и не изменяют автоматические графики.</p><div id="status" class="status"></div></div><div id="cards" class="cards"></div></div>
 <script>
 const $=id=>document.getElementById(id);let options={};
-async function init(){let r=await fetch('api/options');options=await r.json();$('source').textContent='Источник: '+options.analysis_directory;for(const p of options.pixels){let o=document.createElement('option');o.value=p.column+','+p.row;o.textContent=p.label;$('pixel').appendChild(o)}for(const s of options.noise_stages){let o=document.createElement('option');o.value=s;o.textContent=s;$('stage').appendChild(o)}for(const p of options.scurve_patterns){let o=document.createElement('option');o.value=p;o.textContent=p;$('pattern').appendChild(o)}for(const a of options.amplitudes){let o=document.createElement('option');o.value=a.value;o.textContent=a.label;$('amplitude').appendChild(o)}}
+async function init(){let r=await fetch('api/options');options=await r.json();$('source').textContent='Источник: '+options.analysis_directory;for(const p of options.pixels){let o=document.createElement('option');o.value=p.column+','+p.row;o.textContent=p.label;$('pixel').appendChild(o)}for(const s of options.noise_stages){let o=document.createElement('option');o.value=s;o.textContent=s;$('stage').appendChild(o)}for(const p of options.scurve_patterns){let o=document.createElement('option');o.value=p;o.textContent=p;$('pattern').appendChild(o)}for(const a of options.amplitudes){let o=document.createElement('option');o.value=a.value;o.textContent=a.label;$('amplitude').appendChild(o)}for(const f of options.measurement_fclk_values_mhz||[]){let o=document.createElement('option');o.value=f;o.textContent=f+' МГц';$('measurement_fclk').appendChild(o)}}
 function num(id){return $(id).value===''?null:Number($(id).value)}
-$('render').onclick=async()=>{let px=$('pixel').value.split(',');let body={plot_type:$('plot_type').value,language:$('language').value,column:px[0]?Number(px[0]):null,row:px[1]?Number(px[1]):null,stage:$('stage').value,injection_pattern:$('pattern').value,amplitude_index:$('amplitude').value,branch_view:$('branch').value,heatmap_metric:$('metric').value,pixel_geometry:$('geometry').value,output_format:$('format').value,dac_min:num('dac_min'),dac_max:num('dac_max'),title_font_size:num('title_font'),axis_font_size:num('axis_font'),tick_font_size:num('tick_font'),legend_font_size:num('legend_font'),dpi:num('dpi')};$('render').disabled=true;$('status').textContent='Построение...';$('cards').innerHTML='';try{let r=await fetch('api/render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let out=await r.json();if(!r.ok)throw Error(out.error||r.statusText);$('status').textContent='Создано: '+out.output_directory;for(const f of out.files){let d=document.createElement('div');d.className='card';if(f.preview){let i=document.createElement('img');i.src=f.url;d.appendChild(i)}let a=document.createElement('a');a.href=f.url;a.target='_blank';a.textContent=f.name;d.appendChild(a);$('cards').appendChild(d)}}catch(e){$('status').textContent='Ошибка: '+e.message}finally{$('render').disabled=false}};init().catch(e=>$('status').textContent='Ошибка загрузки: '+e.message);
+$('render').onclick=async()=>{let px=$('pixel').value.split(',');let body={plot_type:$('plot_type').value,language:$('language').value,column:px[0]?Number(px[0]):null,row:px[1]?Number(px[1]):null,stage:$('stage').value,injection_pattern:$('pattern').value,amplitude_index:$('amplitude').value,measurement_fclk_mhz:$('measurement_fclk').value,branch_view:$('branch').value,heatmap_metric:$('metric').value,pixel_geometry:$('geometry').value,output_format:$('format').value,dac_min:num('dac_min'),dac_max:num('dac_max'),title_font_size:num('title_font'),axis_font_size:num('axis_font'),tick_font_size:num('tick_font'),legend_font_size:num('legend_font'),dpi:num('dpi')};$('render').disabled=true;$('status').textContent='Построение...';$('cards').innerHTML='';try{let r=await fetch('api/render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let out=await r.json();if(!r.ok)throw Error(out.error||r.statusText);$('status').textContent='Создано: '+out.output_directory;for(const f of out.files){let d=document.createElement('div');d.className='card';if(f.preview){let i=document.createElement('img');i.src=f.url;d.appendChild(i)}let a=document.createElement('a');a.href=f.url;a.target='_blank';a.textContent=f.name;d.appendChild(a);$('cards').appendChild(d)}}catch(e){$('status').textContent='Ошибка: '+e.message}finally{$('render').disabled=false}};init().catch(e=>$('status').textContent='Ошибка загрузки: '+e.message);
 </script></body></html>"""
 
 

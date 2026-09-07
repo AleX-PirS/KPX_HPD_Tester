@@ -161,6 +161,7 @@ def _normalized_document(value: Any) -> Any:
 # existing stored value is never replaced here, so a real settings mismatch is
 # still rejected by the strict comparison below.
 _RESUME_DEFAULT_MIGRATION_PATHS: tuple[tuple[str, ...], ...] = (
+    ("noise", "empty_matrix_repeats_to_skip_remaining"),
     ("scurve", "coarse_baseline_noise_consecutive_codes"),
     ("scurve", "reference_common_mode_step_error_slack_v"),
     ("analysis", "infer_upo_pwm_plateau_denominator"),
@@ -221,6 +222,12 @@ def _validate_resume_inputs(
     # resume; every completed analysis records its own settings separately.
     for document in (stored_settings, requested_settings):
         document.pop("analysis", None)
+        # This field used to truncate the DAC tail. It is retained only so old
+        # metadata can be read; framework 0.13 always visits every requested
+        # code and may shorten only the repeats within one empty code.
+        noise_document = document.get("noise")
+        if isinstance(noise_document, dict):
+            noise_document.pop("stop_after_consecutive_empty_codes", None)
     if _normalized_document(stored_settings) != _normalized_document(requested_settings):
         raise ValueError(
             "resume settings differ from metadata; re-analyze offline for analysis-only changes "
@@ -786,6 +793,9 @@ def characterize_comparator(
     resume_experiment: str | Path | None = None,
     additional_metadata: Mapping[str, Any] | None = None,
     initialization_fclk_mhz: int = STANDARD_CHARACTERIZATION_FCLK_MHZ,
+    measurement_fclk_mhz: int | None = None,
+    scurve_measurement_fclk_values_mhz: Sequence[int] | None = None,
+    allow_scurve_without_noise_reference: bool = False,
     eo_overrides: Mapping[str, int] | None = None,
 ) -> CharacterizationResult:
     """Characterize one AB, BC or CD counting window.
@@ -804,6 +814,35 @@ def characterize_comparator(
     makes the same selected steps run through AMUX ``TST_SIG`` and an
     oscilloscope before any noise or S-curve acquisition.
     """
+
+    def validate_fclk(value: int, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+        if value not in MGPDClient.FCLK_ALLOWED_MHZ:
+            allowed = ", ".join(str(item) for item in MGPDClient.FCLK_ALLOWED_MHZ)
+            raise ValueError(f"{name} must be one of: {allowed}")
+        return int(value)
+
+    initialization_fclk_mhz = validate_fclk(
+        initialization_fclk_mhz, "initialization_fclk_mhz"
+    )
+    if measurement_fclk_mhz is None:
+        measurement_fclk_mhz = initialization_fclk_mhz
+    measurement_fclk_mhz = validate_fclk(
+        measurement_fclk_mhz, "measurement_fclk_mhz"
+    )
+    measurement_clock_sweep = scurve_measurement_fclk_values_mhz is not None
+    if scurve_measurement_fclk_values_mhz is None:
+        measurement_fclk_values = (measurement_fclk_mhz,)
+    else:
+        measurement_fclk_values = tuple(
+            dict.fromkeys(
+                validate_fclk(value, "scurve_measurement_fclk_values_mhz item")
+                for value in scurve_measurement_fclk_values_mhz
+            )
+        )
+        if not measurement_fclk_values:
+            raise ValueError("scurve_measurement_fclk_values_mhz must not be empty")
 
     eo_overrides = validate_eo_overrides(eo_overrides, run_scurve=run_scurve)
     selected_settings = (
@@ -1082,6 +1121,35 @@ def characterize_comparator(
             raise ValueError("resume EO overrides differ from the original experiment")
         if store.metadata.get("window") != spec.name:
             raise ValueError("resume experiment window does not match requested window")
+        stored_run_options = store.metadata.get("run_options", {})
+        stored_main_fclk = int(
+            stored_run_options.get(
+                "main_fclk_mhz",
+                stored_run_options.get(
+                    "initialization_fclk_mhz", initialization_fclk_mhz
+                ),
+            )
+        )
+        stored_measurement_fclk = int(
+            stored_run_options.get("measurement_fclk_mhz", stored_main_fclk)
+        )
+        stored_measurement_sweep = tuple(
+            int(value)
+            for value in stored_run_options.get(
+                "scurve_measurement_fclk_values_mhz",
+                [stored_measurement_fclk],
+            )
+        )
+        if stored_main_fclk != initialization_fclk_mhz:
+            raise ValueError("resume main FCLK differs from the original experiment")
+        if stored_measurement_fclk != measurement_fclk_mhz:
+            raise ValueError(
+                "resume default measurement FCLK differs from the original experiment"
+            )
+        if stored_measurement_sweep != measurement_fclk_values:
+            raise ValueError(
+                "resume S-curve measurement FCLK sweep differs from the original experiment"
+            )
         stored_pixels = {
             (int(item["column"]), int(item["row"]))
             for item in store.metadata.get("pixel_selection", [])
@@ -1151,6 +1219,15 @@ def characterize_comparator(
                 ),
                 "use_reference_trim_map": use_reference_trim_map,
                 "initialization_fclk_mhz": int(initialization_fclk_mhz),
+                "main_fclk_mhz": int(initialization_fclk_mhz),
+                "measurement_fclk_mhz": int(measurement_fclk_mhz),
+                "scurve_measurement_fclk_values_mhz": list(
+                    measurement_fclk_values
+                ),
+                "measurement_clock_sweep": measurement_clock_sweep,
+                "allow_scurve_without_noise_reference": bool(
+                    allow_scurve_without_noise_reference
+                ),
                 "verify_reference_steps_before_measurement": (
                     reference_verification_enabled
                 ),
@@ -1341,6 +1418,7 @@ def characterize_comparator(
         initialization_record = backend.initialize_standard_configuration(
             selected_pixels,
             fclk_mhz=initialization_fclk_mhz,
+            measurement_fclk_mhz=measurement_fclk_mhz,
             eo_overrides=eo_overrides,
             progress_callback=lambda message, percent: store.log_status(
                 message,
@@ -1363,7 +1441,7 @@ def characterize_comparator(
             asic_initialization_history=initialization_history,
             initial_asic_configuration=initialized_snapshot,
             acquisition_sequence={
-                "version": 3, "upo_execution": "calling_thread_only",
+                "version": 4, "upo_execution": "calling_thread_only",
                 "pixel_commit": "GET_SHOT_only; cleanup_stages_PX_for_next_shot",
                 "ctrl_execution": (
                     "same_UPO_thread: PWM_before_GET_SHOT, CTRL0_after_response, then_GET_PIXEL"
@@ -1376,6 +1454,21 @@ def characterize_comparator(
                     if isinstance(shot_executor, UpoPwmShotExecutor) else None),
                 "upo_pwm_count_derivation": upo_pwm_count_metadata,
                 "shutter_open_observed": False,
+                "fclk_sequence": (
+                    "main_FCLK_for_configuration; measurement_FCLK_immediately_"
+                    "before_and_during_blocking_GET_SHOT; main_FCLK_after_"
+                    "GET_SHOT_response_before_first_GET_PIXEL"
+                ),
+                "main_fclk_mhz": int(initialization_fclk_mhz),
+                "default_measurement_fclk_mhz": int(measurement_fclk_mhz),
+                "scurve_measurement_fclk_values_mhz": list(
+                    measurement_fclk_values
+                ),
+                "get_shot_internal_limitation": (
+                    "GET_SHOT is monolithic and internally commits the staged matrix; "
+                    "Python cannot switch FCLK between that internal commit and the "
+                    "physical shutter-open transition"
+                ),
             },
         )
         store.log_status(
@@ -1923,9 +2016,13 @@ def characterize_comparator(
                 if run_noise_scan or run_equalization
                 else 10.0
             )
-            total_scurve_groups = len(selected_settings.scurve.pulse_amplitudes) * sum(
-                len(build_injection_groups(selected_pixels, pattern))
-                for pattern in selected_settings.scurve.injection_patterns
+            total_scurve_groups = (
+                len(measurement_fclk_values)
+                * len(selected_settings.scurve.pulse_amplitudes)
+                * sum(
+                    len(build_injection_groups(selected_pixels, pattern))
+                    for pattern in selected_settings.scurve.injection_patterns
+                )
             )
             completed_scurve_groups = 0
             ctrl_sequence_text = (
@@ -1951,19 +2048,28 @@ def characterize_comparator(
                     store, threshold_calibration, selected_settings
                 )
             if noise_statistics.empty:
-                raise RuntimeError(
-                    "S-curve requires noise data from this experiment or "
-                    "noise_reference_experiment"
+                if not allow_scurve_without_noise_reference:
+                    raise RuntimeError(
+                        "S-curve requires noise data from this experiment or "
+                        "noise_reference_experiment"
+                    )
+                store.log_status(
+                    "S-curve запущена без noise reference: границы и fit "
+                    "используют только парные background acquisitions"
                 )
             assert normalized_gain_map is not None
             assert selected_settings.scurve.shutter_duration_s is not None
-            predicted_safe_codes = _safe_background_codes(
-                noise_statistics,
-                n_injections=selected_settings.scurve.n_injections,
-                maximum_fraction=selected_settings.scurve.max_background_fraction,
-                scurve_shutter_duration_s=(
-                    selected_settings.scurve.shutter_duration_s
-                ),
+            predicted_safe_codes = (
+                _safe_background_codes(
+                    noise_statistics,
+                    n_injections=selected_settings.scurve.n_injections,
+                    maximum_fraction=selected_settings.scurve.max_background_fraction,
+                    scurve_shutter_duration_s=(
+                        selected_settings.scurve.shutter_duration_s
+                    ),
+                )
+                if not noise_statistics.empty
+                else ()
             )
             coarse_codes = _ordered_scurve_codes(
                 threshold_calibration, selected_settings.scurve
@@ -2005,12 +2111,13 @@ def characterize_comparator(
                     "fine_retained_consecutive_noise_codes": (
                         selected_settings.scurve.baseline_noise_consecutive_codes
                     ),
-                    "predicted_safe_code_minimum_from_noise_reference": min(
-                        predicted_safe_codes
+                    "predicted_safe_code_minimum_from_noise_reference": (
+                        min(predicted_safe_codes) if predicted_safe_codes else None
                     ),
-                    "predicted_safe_code_maximum_from_noise_reference": max(
-                        predicted_safe_codes
+                    "predicted_safe_code_maximum_from_noise_reference": (
+                        max(predicted_safe_codes) if predicted_safe_codes else None
                     ),
+                    "noise_reference_available": not noise_statistics.empty,
                     "note": (
                         "noise reference is used for prediction and fit filtering; "
                         "it does not sparsify the programmable S-curve DAC grid"
@@ -2108,6 +2215,7 @@ def characterize_comparator(
                 codes: Sequence[int],
                 amplitude: Any,
                 amplitude_configuration: Mapping[str, Any],
+                active_measurement_fclk_mhz: int,
             ) -> tuple[ScurveScanRun, ...]:
                 runs: list[ScurveScanRun] = []
                 for group in groups:
@@ -2128,144 +2236,178 @@ def characterize_comparator(
                         upper_non_limiting_code=upper_non_limiting_code,
                         noise_settings=selected_settings.noise,
                         scurve_settings=selected_settings.scurve,
+                        measurement_fclk_mhz=active_measurement_fclk_mhz,
                     ))
                 return tuple(runs)
 
             try:
-                for amplitude_index, amplitude in enumerate(
-                    selected_settings.scurve.pulse_amplitudes
-                ):
+                scurve_jobs = [
+                    (clock_index, clock_mhz, amplitude_index, amplitude, pattern)
+                    for clock_index, clock_mhz in enumerate(measurement_fclk_values)
+                    for amplitude_index, amplitude in enumerate(
+                        selected_settings.scurve.pulse_amplitudes
+                    )
+                    for pattern in selected_settings.scurve.injection_patterns
+                ]
+                for (
+                    clock_index,
+                    active_measurement_fclk_mhz,
+                    amplitude_index,
+                    amplitude,
+                    pattern,
+                ) in scurve_jobs:
                     amplitude_configuration = backend.configure_test_pulse_amplitude(
                         amplitude
                     )
-                    for pattern in selected_settings.scurve.injection_patterns:
-                        groups = build_injection_groups(selected_pixels, pattern)
-                        stage = (
-                            f"pulse_amplitude_{amplitude_index:03d}_"
-                            f"pattern_{pattern}"
-                        )
-                        coarse_runs = acquire_groups(
-                            groups,
-                            stage=stage,
-                            phase="coarse",
-                            codes=coarse_codes,
-                            amplitude=amplitude,
-                            amplitude_configuration=amplitude_configuration,
-                        )
-                        transition_brackets = _scurve_transition_brackets(
-                            store,
-                            noise_statistics,
-                            selected_settings.scurve.max_background_fraction,
-                            stage=stage,
-                            scurve_settings=selected_settings.scurve,
-                            analysis_settings=selected_settings.analysis,
-                        )
-                        current_upper = max(coarse_codes)
-                        if not transition_brackets:
-                            for round_index in range(
-                                1, selected_settings.scurve.max_expand_rounds + 1
-                            ):
-                                next_upper = min(
-                                    threshold_calibration.max_code,
-                                    current_upper
-                                    + selected_settings.scurve.expand_codes,
-                                )
-                                if next_upper <= current_upper:
-                                    break
-                                expansion = _ordered_scurve_codes(
-                                    threshold_calibration,
-                                    selected_settings.scurve,
-                                    high_code=next_upper,
-                                    low_code=current_upper + 1,
-                                    step=selected_settings.scurve.coarse_step,
-                                )
-                                if not expansion:
-                                    break
-                                acquire_groups(
-                                    groups,
-                                    stage=stage,
-                                    phase=f"expand_{round_index:02d}",
-                                    codes=expansion,
-                                    amplitude=amplitude,
-                                    amplitude_configuration=amplitude_configuration,
-                                )
-                                current_upper = next_upper
-                                transition_brackets = _scurve_transition_brackets(
-                                    store,
-                                    noise_statistics,
-                                    selected_settings.scurve.max_background_fraction,
-                                    stage=stage,
-                                    scurve_settings=selected_settings.scurve,
-                                    analysis_settings=selected_settings.analysis,
-                                )
-                                if transition_brackets:
-                                    break
-
-                        fine_codes, fine_diagnostics = _fine_codes_from_brackets(
-                            transition_brackets,
-                            threshold_calibration,
-                            selected_settings.scurve,
-                        )
-                        fine_diagnostics.update({
-                            "stage": stage,
-                            "injection_pattern": pattern,
-                            "coarse_baseline_stop_codes": [
-                                run.baseline_stop_event.get("stop_code")
-                                for run in coarse_runs
-                                if run.baseline_stop_event is not None
-                            ],
-                        })
-                        previous_fine_diagnostics = list(
-                            store.metadata.get("scurve_fine_range_diagnostics", [])
-                        )
-                        previous_fine_diagnostics = [
-                            item
-                            for item in previous_fine_diagnostics
-                            if not (
-                                item.get("stage") == stage
-                                and item.get("injection_pattern") == pattern
+                    groups = build_injection_groups(selected_pixels, pattern)
+                    stage_prefix = (
+                        f"measurement_fclk_{active_measurement_fclk_mhz:03d}mhz_"
+                        if measurement_clock_sweep
+                        else ""
+                    )
+                    stage = (
+                        f"{stage_prefix}pulse_amplitude_{amplitude_index:03d}_"
+                        f"pattern_{pattern}"
+                    )
+                    store.log_status(
+                        f"S-curve: FCLK измерения "
+                        f"{active_measurement_fclk_mhz} МГц "
+                        f"({clock_index + 1}/{len(measurement_fclk_values)}), "
+                        f"амплитуда {amplitude_index + 1}/"
+                        f"{len(selected_settings.scurve.pulse_amplitudes)}, "
+                        f"режим {pattern}"
+                    )
+                    coarse_runs = acquire_groups(
+                        groups,
+                        stage=stage,
+                        phase="coarse",
+                        codes=coarse_codes,
+                        amplitude=amplitude,
+                        amplitude_configuration=amplitude_configuration,
+                        active_measurement_fclk_mhz=active_measurement_fclk_mhz,
+                    )
+                    transition_brackets = _scurve_transition_brackets(
+                        store,
+                        noise_statistics,
+                        selected_settings.scurve.max_background_fraction,
+                        stage=stage,
+                        scurve_settings=selected_settings.scurve,
+                        analysis_settings=selected_settings.analysis,
+                    )
+                    current_upper = max(coarse_codes)
+                    if not transition_brackets:
+                        for round_index in range(
+                            1, selected_settings.scurve.max_expand_rounds + 1
+                        ):
+                            next_upper = min(
+                                threshold_calibration.max_code,
+                                current_upper + selected_settings.scurve.expand_codes,
                             )
-                        ]
-                        previous_fine_diagnostics.append(fine_diagnostics)
-                        store.update_metadata(
-                            scurve_fine_range_diagnostics=previous_fine_diagnostics
-                        )
-                        if fine_codes:
-                            store.log_status(
-                                f"S-curve {stage}/{pattern}: fine scan, "
-                                f"{len(fine_codes)} кодов с шагом "
-                                f"{selected_settings.scurve.fine_step}, "
-                                f"диапазонов {len(fine_diagnostics['fine_bands'])}"
+                            if next_upper <= current_upper:
+                                break
+                            expansion = _ordered_scurve_codes(
+                                threshold_calibration,
+                                selected_settings.scurve,
+                                high_code=next_upper,
+                                low_code=current_upper + 1,
+                                step=selected_settings.scurve.coarse_step,
                             )
+                            if not expansion:
+                                break
                             acquire_groups(
                                 groups,
                                 stage=stage,
-                                phase="fine",
-                                codes=fine_codes,
+                                phase=f"expand_{round_index:02d}",
+                                codes=expansion,
                                 amplitude=amplitude,
                                 amplitude_configuration=amplitude_configuration,
+                                active_measurement_fclk_mhz=(
+                                    active_measurement_fclk_mhz
+                                ),
                             )
-                        else:
-                            store.log_status(
-                                f"S-curve {stage}/{pattern}: положительный переход "
-                                "не ограничен соседними coarse-точками; fine scan "
-                                "не выполняется"
+                            current_upper = next_upper
+                            transition_brackets = _scurve_transition_brackets(
+                                store,
+                                noise_statistics,
+                                selected_settings.scurve.max_background_fraction,
+                                stage=stage,
+                                scurve_settings=selected_settings.scurve,
+                                analysis_settings=selected_settings.analysis,
                             )
-                        completed_scurve_groups += len(groups)
-                        scurve_fraction = completed_scurve_groups / max(
-                            total_scurve_groups, 1
+                            if transition_brackets:
+                                break
+
+                    fine_codes, fine_diagnostics = _fine_codes_from_brackets(
+                        transition_brackets,
+                        threshold_calibration,
+                        selected_settings.scurve,
+                    )
+                    fine_diagnostics.update({
+                        "stage": stage,
+                        "injection_pattern": pattern,
+                        "measurement_fclk_mhz": active_measurement_fclk_mhz,
+                        "coarse_baseline_stop_codes": [
+                            run.baseline_stop_event.get("stop_code")
+                            for run in coarse_runs
+                            if run.baseline_stop_event is not None
+                        ],
+                    })
+                    previous_fine_diagnostics = list(
+                        store.metadata.get("scurve_fine_range_diagnostics", [])
+                    )
+                    previous_fine_diagnostics = [
+                        item
+                        for item in previous_fine_diagnostics
+                        if not (
+                            item.get("stage") == stage
+                            and item.get("injection_pattern") == pattern
+                            and int(item.get("measurement_fclk_mhz", -1))
+                            == active_measurement_fclk_mhz
                         )
+                    ]
+                    previous_fine_diagnostics.append(fine_diagnostics)
+                    store.update_metadata(
+                        scurve_fine_range_diagnostics=previous_fine_diagnostics
+                    )
+                    if fine_codes:
                         store.log_status(
-                            f"S-curve: завершено групп {completed_scurve_groups}/"
-                            f"{total_scurve_groups}, амплитуда {amplitude_index + 1}/"
-                            f"{len(selected_settings.scurve.pulse_amplitudes)}, "
-                            f"режим {pattern}",
-                            stage_percent=100.0 * scurve_fraction,
-                            overall_percent_estimate=(
-                                scurve_progress_start
-                                + (96.0 - scurve_progress_start) * scurve_fraction
-                            ),
+                            f"S-curve {stage}/{pattern}: fine scan, "
+                            f"{len(fine_codes)} кодов с шагом "
+                            f"{selected_settings.scurve.fine_step}, "
+                            f"диапазонов {len(fine_diagnostics['fine_bands'])}"
                         )
+                        acquire_groups(
+                            groups,
+                            stage=stage,
+                            phase="fine",
+                            codes=fine_codes,
+                            amplitude=amplitude,
+                            amplitude_configuration=amplitude_configuration,
+                            active_measurement_fclk_mhz=active_measurement_fclk_mhz,
+                        )
+                    else:
+                        store.log_status(
+                            f"S-curve {stage}/{pattern}: положительный переход "
+                            "не ограничен соседними coarse-точками; fine scan "
+                            "не выполняется"
+                        )
+                    completed_scurve_groups += len(groups)
+                    scurve_fraction = completed_scurve_groups / max(
+                        total_scurve_groups, 1
+                    )
+                    store.log_status(
+                        f"S-curve: завершено групп {completed_scurve_groups}/"
+                        f"{total_scurve_groups}, FCLK измерения "
+                        f"{active_measurement_fclk_mhz} МГц, амплитуда "
+                        f"{amplitude_index + 1}/"
+                        f"{len(selected_settings.scurve.pulse_amplitudes)}, "
+                        f"режим {pattern}",
+                        stage_percent=100.0 * scurve_fraction,
+                        overall_percent_estimate=(
+                            scurve_progress_start
+                            + (96.0 - scurve_progress_start) * scurve_fraction
+                        ),
+                    )
             finally:
                 original_error = sys.exc_info()[1]
                 try:
@@ -2396,5 +2538,89 @@ def characterize_injection_crosstalk(
         run_scurve=True,
         noise_reference_experiment=noise_reference_experiment,
         bad_pixel_map=bad_pixel_map,
+        **characterization_arguments,
+    )
+
+
+def characterize_measurement_clock_noise(
+    client: MGPDClient,
+    threshold_calibration_files: Mapping[
+        str, str | Path | ThresholdDacCalibration
+    ],
+    *,
+    measurement_fclk_values_mhz: Sequence[int],
+    injection_pattern: str = "all",
+    settings: CharacterizationSettings | None = None,
+    bad_pixel_map: BadPixelMapInput = None,
+    **characterization_arguments: Any,
+) -> CharacterizationResult:
+    """Quick standalone S-curve comparison of measurement FCLK values.
+
+    The test deliberately uses exactly one injected REF step and does not need
+    a previously measured noise experiment. Each signal point still has its
+    paired background acquisition, so the threshold-domain width remains a
+    comparable pixel-noise indicator. Tile patterns execute every phase needed
+    to cover all selected pixels, exactly like the normal S-curve workflow.
+    """
+
+    allowed_patterns = {"all", "tile_2x2", "tile_4x4", "tile_8x8"}
+    if injection_pattern not in allowed_patterns:
+        raise ValueError(
+            "injection_pattern must be all, tile_2x2, tile_4x4 or tile_8x8"
+        )
+    forbidden = {
+        "run_noise_scan",
+        "run_equalization",
+        "run_scurve",
+        "noise_reference_experiment",
+        "use_reference_trim_map",
+        "allow_scurve_without_noise_reference",
+        "scurve_measurement_fclk_values_mhz",
+        "settings",
+    } & set(characterization_arguments)
+    if forbidden:
+        raise TypeError(
+            "characterize_measurement_clock_noise fixes these argument(s): "
+            + ", ".join(sorted(forbidden))
+        )
+    selected_settings = (
+        copy.deepcopy(settings) if settings is not None else CharacterizationSettings()
+    )
+    selected_settings.scurve.injection_patterns = (injection_pattern,)
+    voltage_steps = characterization_arguments.get("injection_voltage_steps_v")
+    if voltage_steps is not None:
+        if len(tuple(voltage_steps)) != 1:
+            raise ValueError(
+                "clock-noise test requires exactly one injection_voltage_steps_v value"
+            )
+    elif len(selected_settings.scurve.pulse_amplitudes) != 1:
+        raise ValueError(
+            "clock-noise test requires exactly one manual pulse amplitude or one REF step"
+        )
+    additional_metadata = dict(
+        characterization_arguments.pop("additional_metadata", {}) or {}
+    )
+    additional_metadata.update(
+        {
+            "test_kind": "measurement_clock_noise",
+            "measurement_clock_noise_definition": (
+                "per-pixel Gaussian-equivalent S-curve sigma in threshold domain"
+            ),
+            "measurement_clock_noise_injection_pattern": injection_pattern,
+        }
+    )
+    return characterize_comparator(
+        client,
+        threshold_calibration_files,
+        settings=selected_settings,
+        run_noise_scan=False,
+        run_equalization=False,
+        run_scurve=True,
+        noise_reference_experiment=None,
+        use_reference_trim_map=False,
+        allow_scurve_without_noise_reference=True,
+        scurve_measurement_fclk_values_mhz=measurement_fclk_values_mhz,
+        bad_pixel_map=bad_pixel_map,
+        additional_metadata=additional_metadata,
         **characterization_arguments,
     )

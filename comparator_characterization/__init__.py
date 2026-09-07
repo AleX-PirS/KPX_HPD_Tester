@@ -57,6 +57,7 @@ from .workflow import (
     ManualExposureChange,
     characterize_comparator,
     characterize_injection_crosstalk,
+    characterize_measurement_clock_noise,
     interactive_exposure_pause,
 )
 from .sweep import (
@@ -103,6 +104,7 @@ __all__ = [
     "build_injection_groups",
     "characterize_comparator",
     "characterize_injection_crosstalk",
+    "characterize_measurement_clock_noise",
     "get_window_spec",
     "load_threshold_dac_calibrations",
     "load_reference_dac_calibrations",

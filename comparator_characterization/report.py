@@ -113,6 +113,10 @@ def _key_figures(analysis_directory: Path) -> list[tuple[str, Path]]:
         ("Распределения порогов", plot_directory / "threshold_distributions_individual_scale.png"),
         ("Матрица до и после эквализации", plot_directory / "baseline_equalization_overview.png"),
         ("S-кривые матрицы", plot_directory / "matrix_scurves_all.png"),
+        (
+            "Шум пикселей при разных FCLK",
+            plot_directory / "measurement_clock_noise_summary.png",
+        ),
         ("Выбор фиксированного REF1 и REF2", plot_directory / "reference_pair_selection.png"),
         ("Качество S-curve fit", plot_directory / "scurve_fit_quality.png"),
     ]
@@ -134,6 +138,7 @@ def generate_analysis_report(
     scurve_branch_summary: pd.DataFrame,
     scurve_transition_precision: pd.DataFrame,
     crosstalk_summary: pd.DataFrame,
+    measurement_clock_summary: pd.DataFrame,
     target_voltage: float | None,
 ) -> Path:
     """Create a concise Russian measurement report from saved analysis products."""
@@ -256,6 +261,21 @@ def generate_analysis_report(
         conclusions.append(
             "Crosstalk между режимами разбиения не оценен, поскольку измерен только один pattern."
         )
+    if not measurement_clock_summary.empty:
+        usable_clock = measurement_clock_summary.copy()
+        usable_clock["sigma_dac_median"] = pd.to_numeric(
+            usable_clock.get("sigma_dac_median"), errors="coerce"
+        )
+        usable_clock = usable_clock.dropna(subset=["sigma_dac_median"])
+        if not usable_clock.empty:
+            best = usable_clock.sort_values(
+                ["sigma_dac_median", "measurement_fclk_mhz"]
+            ).iloc[0]
+            conclusions.append(
+                "Минимальная медианная ширина S-кривой получена при FCLK "
+                f"{_fmt(best.get('measurement_fclk_mhz'), digits=0, suffix=' МГц')}: "
+                f"sigma {_fmt(best.get('sigma_dac_median'), digits=3, suffix=' DAC')}."
+            )
     if not reference_pairs.empty and "ref1_voltage_v" in reference_pairs:
         ref1_values = pd.to_numeric(
             reference_pairs["ref1_voltage_v"], errors="coerce"
@@ -495,6 +515,7 @@ def generate_analysis_report(
             ) if not result.empty else 0
             amplitude_rows.append(
                 [
+                    _fmt(branch.get("measurement_fclk_mhz"), digits=0),
                     _fmt(1000 * _number(branch.get("injection_voltage_step_v")), digits=3),
                     _fmt(_number(branch.get("injection_charge_electrons")) / 1000.0, digits=3),
                     _fmt(branch.get("baseline_noise_boundary_code"), digits=0),
@@ -513,6 +534,7 @@ def generate_analysis_report(
         lines.extend(
             _markdown_table(
                 [
+                    "FCLK, МГц",
                     "Step, mV",
                     "Qnom, ke",
                     "Baseline DAC",
@@ -568,6 +590,7 @@ def generate_analysis_report(
             )
             grid_rows.append(
                 [
+                    _fmt(branch.get("measurement_fclk_mhz"), digits=0),
                     _fmt(
                         1000 * _number(branch.get("injection_voltage_step_v")),
                         digits=3,
@@ -584,7 +607,7 @@ def generate_analysis_report(
                 "### Фактически измеренная сетка DAC",
                 "",
                 *_markdown_table(
-                    ["Step, mV", "Парных acquisitions", "Coarse", "Expand", "Fine"],
+                    ["FCLK, МГц", "Step, mV", "Парных acquisitions", "Coarse", "Expand", "Fine"],
                     grid_rows,
                 ),
             ]
@@ -639,6 +662,48 @@ def generate_analysis_report(
                 "Заряд номинальный, его масштаб наследует допуск инжекционной емкости."
             )
 
+    if not measurement_clock_summary.empty:
+        lines.extend(["", "## Шум в зависимости от FCLK измерения", ""])
+        clock_rows: list[list[Any]] = []
+        for _, row in measurement_clock_summary.sort_values(
+            ["measurement_fclk_mhz", "injection_pattern"]
+        ).iterrows():
+            clock_rows.append(
+                [
+                    _fmt(row.get("measurement_fclk_mhz"), digits=0),
+                    row.get("injection_pattern", ""),
+                    _fmt(row.get("sigma_dac_median"), digits=3),
+                    _fmt(row.get("sigma_dac_mean"), digits=3),
+                    _fmt(row.get("sigma_dac_q10"), digits=3),
+                    _fmt(row.get("sigma_dac_q90"), digits=3),
+                    _fmt(row.get("sigma_mv_median"), digits=3),
+                    _fmt(row.get("usable_fit_fraction"), digits=3),
+                ]
+            )
+        lines.extend(
+            _markdown_table(
+                [
+                    "FCLK, МГц",
+                    "Pattern",
+                    "Sigma median, DAC",
+                    "Sigma mean, DAC",
+                    "Sigma q10, DAC",
+                    "Sigma q90, DAC",
+                    "Sigma median, mV",
+                    "Usable fraction",
+                ],
+                clock_rows,
+            )
+        )
+        lines.extend(
+            [
+                "",
+                "Sigma здесь является гауссово-эквивалентной шириной S-кривой "
+                "в пороговой области. Это сравнительная метрика шума пикселя, "
+                "а не спектральная плотность шума.",
+            ]
+        )
+
     lines.extend(["", "## Crosstalk", ""])
     patterns = (
         sorted(crosstalk_summary["injection_pattern"].dropna().astype(str).unique())
@@ -655,6 +720,7 @@ def generate_analysis_report(
         for _, row in crosstalk_summary.iterrows():
             rows.append(
                 [
+                    _fmt(row.get("measurement_fclk_mhz"), digits=0),
                     row.get("injection_pattern", ""),
                     _fmt(row.get("median_active_pixels_per_shot"), digits=0),
                     _fmt(1000 * _number(row.get("median_abs_delta_v50_v_to_reference")), digits=3),
@@ -664,7 +730,7 @@ def generate_analysis_report(
             )
         lines.extend(
             _markdown_table(
-                ["Pattern", "Active pixels", "|Delta V50|, mV", "Sigma ratio", "Inactive excess p95"],
+                ["FCLK, МГц", "Pattern", "Active pixels", "|Delta V50|, mV", "Sigma ratio", "Inactive excess p95"],
                 rows,
             )
         )
@@ -698,6 +764,11 @@ def generate_analysis_report(
         ("scurve_branch_summary.csv", "Границы ветви и denominator"),
         ("scurve_transition_precision.csv", "Проверка fine шага около V50"),
         ("injection_crosstalk_summary.csv", "Crosstalk summary"),
+        ("measurement_clock_noise_summary.csv", "Шум по FCLK, summary"),
+        (
+            "measurement_clock_noise_pixel_metrics.csv",
+            "Шум по FCLK, метрики пикселей",
+        ),
     ):
         path = analysis_directory / filename
         if path.exists():

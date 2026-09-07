@@ -669,6 +669,8 @@ def generate_diagnostic_plots(
     scurve_gain_results: pd.DataFrame,
     crosstalk_pixel_metrics: pd.DataFrame,
     crosstalk_summary: pd.DataFrame,
+    measurement_clock_pixel_metrics: pd.DataFrame,
+    measurement_clock_summary: pd.DataFrame,
     target_voltage: float | None,
     settings: AnalysisSettings,
 ) -> dict[str, list[Path]]:
@@ -703,6 +705,42 @@ def generate_diagnostic_plots(
         scurve_gain_results = selected_pattern_rows(scurve_gain_results)
         crosstalk_pixel_metrics = selected_pattern_rows(crosstalk_pixel_metrics)
         crosstalk_summary = selected_pattern_rows(crosstalk_summary)
+        measurement_clock_pixel_metrics = selected_pattern_rows(
+            measurement_clock_pixel_metrics
+        )
+        measurement_clock_summary = selected_pattern_rows(
+            measurement_clock_summary
+        )
+
+    # Keep all FCLK branches for the dedicated comparison plots. Existing
+    # generic S-curve figures intentionally show one clock only so values from
+    # different acquisition conditions can never be averaged together.
+    clock_scurve_efficiency = scurve_efficiency.copy()
+    clock_scurve_results = scurve_results.copy()
+    clock_values = sorted(
+        int(value)
+        for value in pd.to_numeric(
+            clock_scurve_efficiency.get(
+                "measurement_fclk_mhz", pd.Series(dtype=float)
+            ),
+            errors="coerce",
+        ).dropna().unique()
+    )
+    if len(clock_values) > 1:
+        default_clock = clock_values[0]
+
+        def one_clock(frame: pd.DataFrame) -> pd.DataFrame:
+            if frame.empty or "measurement_fclk_mhz" not in frame:
+                return frame
+            values = pd.to_numeric(frame["measurement_fclk_mhz"], errors="coerce")
+            return frame[values == default_clock].copy()
+
+        scurve_efficiency = one_clock(scurve_efficiency)
+        scurve_results = one_clock(scurve_results)
+        scurve_amplitude_summary = one_clock(scurve_amplitude_summary)
+        scurve_gain_results = one_clock(scurve_gain_results)
+        crosstalk_pixel_metrics = one_clock(crosstalk_pixel_metrics)
+        crosstalk_summary = one_clock(crosstalk_summary)
 
     stage_styles = {
         "trim_00": ("Trim = 0", "#1f77b4"),
@@ -1436,7 +1474,7 @@ def generate_diagnostic_plots(
         r2 = _finite_values(noise_fits, "fit_r2")
         if len(r2):
             figure, axis = plt.subplots(figsize=(7.2, 4.5))
-            axis.hist(r2, bins=30, color="#7a5195", edgecolor="white")
+            axis.hist(r2, bins="auto", color="#7a5195", edgecolor="white")
             axis.axvline(settings.gaussian_min_r2, color="black", linestyle="--")
             axis.set_xlabel("Noise-curve fit $R^2$")
             axis.set_ylabel("Fit count")
@@ -2200,7 +2238,7 @@ def generate_diagnostic_plots(
         r2 = _finite_values(scurve_results, "fit_r2")
         if len(r2):
             figure, axis = plt.subplots(figsize=(7.2, 4.5))
-            axis.hist(r2, bins=30, color="#ef5675", edgecolor="white")
+            axis.hist(r2, bins="auto", color="#ef5675", edgecolor="white")
             axis.axvline(0.8, color="black", linestyle="--")
             axis.set_xlabel("S-curve fit $R^2$")
             axis.set_ylabel("Fit count")
@@ -2366,5 +2404,173 @@ def generate_diagnostic_plots(
                 f"injection_crosstalk_metrics{suffix}",
                 settings,
             )
+
+    if not measurement_clock_summary.empty:
+        summary = measurement_clock_summary.copy()
+        summary["measurement_fclk_mhz"] = pd.to_numeric(
+            summary["measurement_fclk_mhz"], errors="coerce"
+        )
+        summary = summary.dropna(subset=["measurement_fclk_mhz"])
+        if not summary.empty:
+            figure, axes = plt.subplots(1, 2, figsize=(10.8, 4.4))
+            for (amplitude, pattern), data in summary.groupby(
+                ["pulse_amplitude_native", "injection_pattern"],
+                dropna=False,
+                sort=True,
+            ):
+                data = data.sort_values("measurement_fclk_mhz")
+                x = data["measurement_fclk_mhz"].to_numpy(dtype=float)
+                label = f"{pattern}, {_amplitude_label(data)}"
+                axes[0].plot(
+                    x,
+                    pd.to_numeric(data["sigma_dac_median"], errors="coerce"),
+                    marker="o",
+                    label=label,
+                )
+                axes[0].plot(
+                    x,
+                    pd.to_numeric(data["sigma_dac_mean"], errors="coerce"),
+                    linestyle="--",
+                    linewidth=1.0,
+                )
+                axes[0].fill_between(
+                    x,
+                    pd.to_numeric(data["sigma_dac_q10"], errors="coerce").to_numpy(dtype=float),
+                    pd.to_numeric(data["sigma_dac_q90"], errors="coerce").to_numpy(dtype=float),
+                    alpha=0.16,
+                )
+                axes[1].plot(
+                    x,
+                    pd.to_numeric(data["usable_fit_fraction"], errors="coerce"),
+                    marker="o",
+                    label=label,
+                )
+            axes[0].set_xlabel("Measurement FCLK, MHz")
+            axes[0].set_ylabel("S-curve sigma, threshold DAC codes")
+            axes[0].set_title("Median, dashed mean and 10-90% pixel band")
+            axes[1].set_xlabel("Measurement FCLK, MHz")
+            axes[1].set_ylabel("Usable pixel-fit fraction")
+            axes[1].set_ylim(-0.02, 1.02)
+            axes[1].set_title("Fit coverage")
+            for axis in axes:
+                axis.legend(fontsize=8)
+            figure.suptitle(
+                "Pixel noise versus FCLK during blocking GET_SHOT"
+            )
+            outputs["measurement_clock_noise_summary"] = _save_figure(
+                figure,
+                plot_directory,
+                "measurement_clock_noise_summary",
+                settings,
+            )
+
+    if len(clock_values) > 1 and not clock_scurve_efficiency.empty:
+        clock_data = clock_scurve_efficiency.copy()
+        clock_data["measurement_fclk_mhz"] = pd.to_numeric(
+            clock_data["measurement_fclk_mhz"], errors="coerce"
+        )
+        clock_data = clock_data[
+            _truthy_series(clock_data, "fit_valid")
+            & _truthy_series(clock_data, "active_injection_pixel_bool")
+        ]
+        for plot_index, ((amplitude, pattern), data) in enumerate(
+            clock_data.groupby(
+                ["pulse_amplitude_native", "injection_pattern"],
+                dropna=False,
+                sort=True,
+            )
+        ):
+            figure, axis = plt.subplots(figsize=(7.8, 5.1))
+            plotted = False
+            for clock_mhz, clock_group in data.groupby(
+                "measurement_fclk_mhz", sort=True
+            ):
+                curve = (
+                    clock_group.groupby("threshold_dac_code")["efficiency"]
+                    .agg(
+                        median="median",
+                        q10=lambda values: values.quantile(0.10),
+                        q90=lambda values: values.quantile(0.90),
+                    )
+                    .reset_index()
+                    .sort_values("threshold_dac_code")
+                )
+                if curve.empty:
+                    continue
+                x = curve["threshold_dac_code"].to_numpy(dtype=float)
+                axis.plot(x, curve["median"], marker="o", markersize=2.5,
+                          label=f"{clock_mhz:g} MHz")
+                axis.fill_between(
+                    x,
+                    curve["q10"].to_numpy(dtype=float),
+                    curve["q90"].to_numpy(dtype=float),
+                    alpha=0.10,
+                )
+                plotted = True
+            if plotted:
+                axis.set_xlabel("Threshold DAC code")
+                axis.set_ylabel("Detection efficiency")
+                axis.set_ylim(-0.04, 1.04)
+                axis.set_title(
+                    f"Matrix S-curves versus measurement FCLK\n"
+                    f"{_amplitude_label(data)}, pattern {pattern}"
+                )
+                axis.legend(title="Measurement FCLK")
+                stem = (
+                    "measurement_clock_matrix_scurves_"
+                    f"{_safe_stem(pattern)}_{plot_index:03d}"
+                )
+                outputs[stem] = _save_figure(
+                    figure, plot_directory, stem, settings
+                )
+            else:
+                plt.close(figure)
+
+            result_subset = clock_scurve_results[
+                (clock_scurve_results["pulse_amplitude_native"] == amplitude)
+                & (clock_scurve_results["injection_pattern"] == pattern)
+            ] if not clock_scurve_results.empty else pd.DataFrame()
+            coordinates = _plot_coordinates(
+                settings,
+                result_subset if not result_subset.empty else data,
+                "v50_v" if not result_subset.empty else "threshold_voltage_v",
+            )
+            for column, row in coordinates:
+                pixel = data[
+                    (pd.to_numeric(data["column"], errors="coerce") == column)
+                    & (pd.to_numeric(data["row"], errors="coerce") == row)
+                ]
+                figure, axis = plt.subplots(figsize=(7.4, 4.9))
+                plotted = False
+                for clock_mhz, clock_group in pixel.groupby(
+                    "measurement_fclk_mhz", sort=True
+                ):
+                    curve = (
+                        clock_group.groupby("threshold_dac_code")["efficiency"]
+                        .mean()
+                        .sort_index()
+                    )
+                    if curve.empty:
+                        continue
+                    axis.plot(curve.index, curve.values, marker="o", markersize=2.8,
+                              label=f"{clock_mhz:g} MHz")
+                    plotted = True
+                if plotted:
+                    axis.set_xlabel("Threshold DAC code")
+                    axis.set_ylabel("Detection efficiency")
+                    axis.set_ylim(-0.04, 1.04)
+                    axis.set_title(
+                        f"Pixel C{column:02d} R{row:02d}: FCLK comparison, {pattern}"
+                    )
+                    axis.legend(title="Measurement FCLK")
+                    stem = (
+                        f"pixel_C{column:02d}_R{row:02d}_"
+                        f"measurement_clock_scurves_{_safe_stem(pattern)}"
+                    )
+                    outputs[stem] = _save_figure(
+                        figure, plot_directory, stem, settings
+                    )
+                else:
+                    plt.close(figure)
 
     return outputs

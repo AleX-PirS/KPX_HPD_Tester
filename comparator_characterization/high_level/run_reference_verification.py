@@ -35,7 +35,8 @@ def main() -> None:
             run_noise_scan=False,
             run_equalization=False,
             run_scurve=False,
-            initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
+            initialization_fclk_mhz=config.ASIC_MAIN_FCLK_MHZ,
+            measurement_fclk_mhz=config.ASIC_MEASUREMENT_FCLK_MHZ,
             **config.reference_hardware_arguments(
                 oscilloscope, required_for_scurve=False
             ),

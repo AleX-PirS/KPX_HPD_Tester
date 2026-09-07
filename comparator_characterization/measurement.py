@@ -268,6 +268,13 @@ def _raw_rows(
                 "shot_execution_details_json": json.dumps(
                     dict(shot_result.details), ensure_ascii=False, sort_keys=True
                 ),
+                "main_fclk_mhz": shot_result.details.get("main_fclk_mhz"),
+                "measurement_fclk_mhz": shot_result.details.get(
+                    "measurement_fclk_mhz"
+                ),
+                "main_fclk_restored_before_get_pixel": shot_result.details.get(
+                    "main_fclk_restored_before_get_pixel", False
+                ),
                 **charge,
                 **sample,
             }
@@ -408,8 +415,7 @@ def _run_noise_phase(
     settings: NoiseScanSettings,
     overall_progress_start: float | None = None,
     overall_progress_end: float | None = None,
-    minimum_early_stop_code: int | None = None,
-) -> tuple[int, tuple[int, ...], dict[str, Any] | None]:
+) -> tuple[int, tuple[int, ...], tuple[dict[str, Any], ...]]:
     planned_codes = tuple(dict.fromkeys(int(code) for code in codes))
     saved_outcomes = _saved_noise_outcomes(
         store,
@@ -417,11 +423,9 @@ def _run_noise_phase(
         phase=phase,
         pixels=pixels,
     )
-    activity_seen = False
-    empty_streak = 0
     completed = 0
     executed_codes: list[int] = []
-    early_stop: dict[str, Any] | None = None
+    repeat_shortcuts: list[dict[str, Any]] = []
     last_logged_bucket = -1
 
     def overall_at(stage_percent: float) -> float | None:
@@ -445,6 +449,7 @@ def _run_noise_phase(
         if settings.settling_time_s:
             time.sleep(settings.settling_time_s)
         repeat_outcomes: list[AcquisitionOutcome] = []
+        consecutive_empty_repeats = 0
         for repeat in range(settings.noise_repeats):
             descriptor = {
                 "measurement_kind": "noise",
@@ -496,26 +501,44 @@ def _run_noise_phase(
                     }
                 )
 
+            if outcome.all_pixels_valid_and_zero:
+                consecutive_empty_repeats += 1
+            else:
+                # Invalid/incomplete readout and any non-zero count both reset
+                # the sequence. Neither can be used as proof of an empty matrix.
+                consecutive_empty_repeats = 0
+            shortcut_count = settings.empty_matrix_repeats_to_skip_remaining
+            if (
+                shortcut_count is not None
+                and consecutive_empty_repeats >= shortcut_count
+                and repeat + 1 < settings.noise_repeats
+            ):
+                event = {
+                    "timestamp_utc": utc_now_text(),
+                    "stage": stage,
+                    "scan_phase": phase,
+                    "threshold_dac_code": int(code),
+                    "reason": "consecutive_fully_valid_all_pixel_zero_repeats",
+                    "configured_empty_repeat_count": int(shortcut_count),
+                    "last_completed_repeat_index": int(repeat),
+                    "completed_repeat_indices": list(range(repeat + 1)),
+                    "skipped_repeat_indices": list(
+                        range(repeat + 1, settings.noise_repeats)
+                    ),
+                    "dac_code_was_not_skipped": True,
+                    "remaining_dac_codes_will_still_be_measured": True,
+                    "invalid_reads_never_count_as_empty": True,
+                }
+                repeat_shortcuts.append(event)
+                store.log_status(
+                    f"Noise {stage}/{phase}: DAC={code}, матрица полностью "
+                    f"пуста {shortcut_count} раза подряд; пропущено "
+                    f"{len(event['skipped_repeat_indices'])} повторов только "
+                    "этой точки"
+                )
+                break
+
         executed_codes.append(code)
-        point_has_activity = any(
-            outcome.any_nonzero_count for outcome in repeat_outcomes
-        )
-        point_is_completely_empty = (
-            len(repeat_outcomes) == settings.noise_repeats
-            and all(
-                outcome.all_pixels_valid_and_zero
-                for outcome in repeat_outcomes
-            )
-        )
-        if point_has_activity:
-            activity_seen = True
-            empty_streak = 0
-        elif activity_seen and point_is_completely_empty:
-            empty_streak += 1
-        else:
-            # Invalid/incomplete readout cannot be used as evidence of zero
-            # activity and therefore breaks the empty-point sequence.
-            empty_streak = 0
 
         stage_percent = 100.0 * (code_index + 1) / max(len(planned_codes), 1)
         bucket = int(stage_percent // 5)
@@ -529,35 +552,7 @@ def _run_noise_phase(
                 overall_percent_estimate=overall_at(stage_percent),
             )
 
-        stop_count = settings.stop_after_consecutive_empty_codes
-        if (
-            stop_count is not None
-            and activity_seen
-            and empty_streak >= stop_count
-            and (minimum_early_stop_code is None or code >= minimum_early_stop_code)
-        ):
-            early_stop = {
-                "timestamp_utc": utc_now_text(),
-                "stage": stage,
-                "scan_phase": phase,
-                "reason": "consecutive_all_pixel_zero_DAC_points_after_activity",
-                "consecutive_empty_codes": empty_streak,
-                "configured_stop_count": stop_count,
-                "last_acquired_code": code,
-                "skipped_codes": list(planned_codes[code_index + 1 :]),
-                "initial_empty_codes_do_not_stop_scan": True,
-                "invalid_reads_never_count_as_empty": True,
-            }
-            store.update_metadata(last_noise_scan_early_stop=early_stop)
-            store.log_status(
-                f"Noise {stage}/{phase}: ранняя остановка после DAC={code}; "
-                f"пропущено {len(early_stop['skipped_codes'])} НЕИЗМЕРЕННЫХ хвостовых точек",
-                stage_percent=stage_percent,
-                overall_percent_estimate=overall_at(stage_percent),
-            )
-            break
-
-    return completed, tuple(executed_codes), early_stop
+    return completed, tuple(executed_codes), tuple(repeat_shortcuts)
 
 
 def run_noise_scan(
@@ -576,7 +571,7 @@ def run_noise_scan(
     overall_progress_start: float | None = None,
     overall_progress_end: float | None = None,
 ) -> NoiseScanRun:
-    """Acquire repeated raw noise counts with safe trailing-empty early stop."""
+    """Acquire every requested DAC code and shorten only proven-empty repeats."""
 
     pixels = backend.active_pixels(pixels)
     settings.validate()
@@ -604,14 +599,14 @@ def run_noise_scan(
     coarse_codes: tuple[int, ...] = ()
     fine_planned: tuple[int, ...] = ()
     fine_codes: tuple[int, ...] = ()
-    early_stops: list[dict[str, Any]] = []
+    repeat_shortcuts: list[dict[str, Any]] = []
 
     if manual_codes is not None:
         if not manual_codes:
             raise ValueError("scan code sequence is empty")
         auto_fine = False
         fine_planned = tuple(dict.fromkeys(manual_codes))
-        completed, fine_codes, early_stop = _run_noise_phase(
+        completed, fine_codes, shortcuts = _run_noise_phase(
             backend=backend,
             store=store,
             calibration=calibration,
@@ -627,8 +622,7 @@ def run_noise_scan(
             overall_progress_end=overall_progress_end,
         )
         completed_acquisitions += completed
-        if early_stop is not None:
-            early_stops.append(early_stop)
+        repeat_shortcuts.extend(shortcuts)
         fine_diagnostics: dict[str, Any] = {
             "method": "explicit_scan_codes",
             "fine_start": min(fine_planned),
@@ -647,7 +641,7 @@ def run_noise_scan(
             and overall_progress_end is not None
             else overall_progress_end
         )
-        completed, coarse_codes, early_stop = _run_noise_phase(
+        completed, coarse_codes, shortcuts = _run_noise_phase(
             backend=backend,
             store=store,
             calibration=calibration,
@@ -663,8 +657,7 @@ def run_noise_scan(
             overall_progress_end=coarse_progress_end,
         )
         completed_acquisitions += completed
-        if early_stop is not None:
-            early_stops.append(early_stop)
+        repeat_shortcuts.extend(shortcuts)
         fine_diagnostics = {}
 
     if auto_fine:
@@ -673,7 +666,7 @@ def run_noise_scan(
             stage=stage,
             settings=settings,
         )
-        completed, fine_codes, early_stop = _run_noise_phase(
+        completed, fine_codes, shortcuts = _run_noise_phase(
             backend=backend,
             store=store,
             calibration=calibration,
@@ -682,7 +675,6 @@ def run_noise_scan(
             trim_map=programmed_trim_map,
             stage=stage,
             phase="fine",
-            minimum_early_stop_code=fine_diagnostics.get("last_observed_peak_code"),
             codes=fine_planned,
             upper_non_limiting_code=upper_non_limiting_code,
             settings=settings,
@@ -695,11 +687,10 @@ def run_noise_scan(
             overall_progress_end=overall_progress_end,
         )
         completed_acquisitions += completed
-        if early_stop is not None:
-            early_stops.append(early_stop)
+        repeat_shortcuts.extend(shortcuts)
 
     fine_diagnostics = dict(fine_diagnostics)
-    fine_diagnostics["early_stop_events"] = early_stops
+    fine_diagnostics["repeat_shortcut_events"] = repeat_shortcuts
     store.update_metadata(
         noise_scan_progress={
             "stage": stage,
@@ -708,10 +699,16 @@ def run_noise_scan(
             "coarse_codes_acquired": list(coarse_codes),
             "fine_codes_planned": list(fine_planned),
             "fine_codes_acquired": list(fine_codes),
-            "early_stop_enabled": (
-                settings.stop_after_consecutive_empty_codes is not None
+            "all_planned_dac_codes_visited": (
+                tuple(coarse_planned) == tuple(coarse_codes)
+                and tuple(fine_planned) == tuple(fine_codes)
             ),
-            "early_stop_events": early_stops,
+            "empty_repeat_shortcut_enabled": (
+                settings.empty_matrix_repeats_to_skip_remaining is not None
+            ),
+            "empty_repeat_shortcut_events": repeat_shortcuts,
+            "empty_repeat_shortcut_event_count": len(repeat_shortcuts),
+            "legacy_dac_tail_early_stop_disabled": True,
             "fine_range_diagnostics": fine_diagnostics,
         }
     )
@@ -792,6 +789,7 @@ def run_scurve_points(
     upper_non_limiting_code: int,
     noise_settings: NoiseScanSettings,
     scurve_settings: ScurveSettings,
+    measurement_fclk_mhz: int | None = None,
 ) -> ScurveScanRun:
     """Acquire paired S-curve points and retain a measured baseline boundary."""
 
@@ -856,6 +854,7 @@ def run_scurve_points(
                     pulse_amplitude,
                     injection_group.pattern,
                     injection_group.group_id,
+                    measurement_fclk_mhz,
                 ],
                 ensure_ascii=True,
                 sort_keys=True,
@@ -870,6 +869,7 @@ def run_scurve_points(
                 "pulse_amplitude": pulse_amplitude,
                 "injection_pattern": injection_group.pattern,
                 "injection_group_id": injection_group.group_id,
+                "measurement_fclk_mhz": measurement_fclk_mhz,
             }
             background_descriptor = {**common, "acquisition_type": "background"}
             background_request = ShotRequest(
@@ -881,6 +881,7 @@ def run_scurve_points(
                 counter_mode_bits=noise_settings.counter_mode_bits,
                 mode_read=noise_settings.mode_read,
                 crw_mode=noise_settings.crw_mode,
+                measurement_fclk_mhz=measurement_fclk_mhz,
             )
             background_outcome = _acquire_point(
                 backend=backend,
@@ -916,6 +917,7 @@ def run_scurve_points(
                 counter_mode_bits=noise_settings.counter_mode_bits,
                 mode_read=noise_settings.mode_read,
                 crw_mode=noise_settings.crw_mode,
+                measurement_fclk_mhz=measurement_fclk_mhz,
             )
             signal_outcome = _acquire_point(
                 backend=backend,

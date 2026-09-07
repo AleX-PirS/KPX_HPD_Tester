@@ -40,7 +40,8 @@ def main() -> None:
             results_root=config.RESULTS_ROOT,
             settings=settings,
             gain_map=config.gain_map(),
-            initialization_fclk_mhz=config.ASIC_INITIALIZATION_FCLK_MHZ,
+            initialization_fclk_mhz=config.ASIC_MAIN_FCLK_MHZ,
+            measurement_fclk_mhz=config.ASIC_MEASUREMENT_FCLK_MHZ,
             eo_overrides=config.EO_OVERRIDES,
             resume_experiment=config.RESUME_EXPERIMENT,
             **config.reference_hardware_arguments(

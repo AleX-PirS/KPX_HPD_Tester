@@ -18,6 +18,7 @@ python -m comparator_characterization.high_level.run_scurve
 python -m comparator_characterization.high_level.run_full_characterization
 python -m comparator_characterization.high_level.run_eo_parameter_sweep
 python -m comparator_characterization.high_level.run_crosstalk
+python -m comparator_characterization.high_level.run_clock_noise
 python -m comparator_characterization.high_level.plot_characterization results/EXPERIMENT
 python -m comparator_characterization.high_level.run_plot_dashboard results/EXPERIMENT
 ```
@@ -36,7 +37,7 @@ python comparator_characterization/high_level/run_scurve.py
 при исходных trim (16 по умолчанию). Для подстроек нужны endpoint/full trim
 данные из `run_noise_equalization.py` или `run_full_trim_sweep.py`.
 
-Каждый аппаратный запуск автоматически устанавливает FCLK 50 МГц, global
+Каждый аппаратный запуск автоматически устанавливает основной FCLK, global
 `EO_cfg.DEFAULT_REGISTERS` и PX-конфигурацию всей физической матрицы.
 В другой половине, Col 0..15, Row 0..31, все 512 слов равны `0x00000000`.
 Для вашей половины Col 16..31 сохраняется стандартная логика теста.
@@ -46,10 +47,13 @@ python comparator_characterization/high_level/run_scurve.py
 Исключенные пиксели всегда имеют `MASK=0, TST_EN=0`, включая reconnect и cleanup.
 PX сначала полностью ставятся в виртуальную память УПО. Отдельный
 `WRITE_TO_CHIP` перед съемом не вызывается: единственную загрузку матрицы в ASIC
-делает `GET_SHOT` в своей фазе `Load settings`. Сам `GET_SHOT` выполняется в
-основном потоке и полностью завершается до первого `GET_PIXEL`. В основном
+делает `GET_SHOT` в своей фазе `Load settings`. Непосредственно перед ним
+выставляется измерительный FCLK. Сам `GET_SHOT` выполняется в основном потоке и
+полностью завершается, затем восстанавливается основной FCLK, и только после
+этого разрешен первый `GET_PIXEL`. В основном
 режиме CTRL также управляется последовательно через тот же канал УПО:
-`PWM -> GET_SHOT -> CTRL=0 -> GET_PIXEL`. Во время теста не нажимайте команды в
+`measurement FCLK -> PWM -> GET_SHOT -> CTRL=0 -> main FCLK -> GET_PIXEL`.
+Для background вместо PWM явно устанавливается `CTRL=0`. Во время теста не нажимайте команды в
 отдельном GUI УПО, поскольку межпроцессную конкуренцию Python заблокировать не может.
 
 Для AB свипируется B, A устанавливается на верхнюю границу по LUT,
@@ -60,6 +64,8 @@ C и D получают код 1023. Аналогично для BC компар
 
 ```python
 CTRL_INJECTION_SOURCE = "upo_pwm"
+ASIC_MAIN_FCLK_MHZ = 50
+ASIC_MEASUREMENT_FCLK_MHZ = 5
 UPO_CTRL_FREQUENCY_KHZ = 100
 UPO_CTRL_HIGH_TIME_NS = 5000
 SCURVE_SHUTTER_DURATION_S = 0.010
@@ -82,7 +88,12 @@ MAXIMUM_REFERENCE_STEP_ERROR_V = 1e-3
 NOISE_COARSE_START = 400     # пример, подберите по своему пилотному скану
 NOISE_COARSE_STOP = 900
 NOISE_COARSE_STEP = 4
+NOISE_EMPTY_MATRIX_REPEATS_TO_SKIP_REMAINING = 2
 BAD_PIXEL_MAP = [(16, 0), (20, 5)]  # либо путь CSV/JSON, либо None
+
+CLOCK_NOISE_MEASUREMENT_FCLK_MHZ = (1, 5, 10, 25, 50)
+CLOCK_NOISE_INJECTION_STEP_MV = 10.0
+CLOCK_NOISE_INJECTION_PATTERN = "all"
 ```
 
 Для полного набора амплитуд REF-пары выбираются совместно. Алгоритм находит один
@@ -293,6 +304,15 @@ GAIN не требуется, они остаются `MASK=0, TST_EN=0`. Noise-
 Дополнительная маска: `--bad-pixels configs/bad_pixels.json`. Полная инструкция
 на русском находится в `COMPARATOR_CHARACTERIZATION.md` в корне проекта.
 
+`run_clock_noise.py` является быстрым самостоятельным S-curve тестом одной
+REF-ступеньки при массиве измерительных FCLK. Старый noise reference не нужен:
+каждая signal-точка имеет собственный paired background. Для tile-режима
+скрипт проходит все фазы подматрицы, поэтому каждый выбранный пиксель реально
+инжектируется. Итоги находятся в `measurement_clock_noise_*.csv`, графиках и
+`REPORT.md`.
+
 Краткий статус и проценты видны в консоли и сохраняются в
-`results/EXPERIMENT/experiment.log`. Параметры ранней остановки noise scan и
-переподключения УПО находятся в `characterization_config.py`.
+`results/EXPERIMENT/experiment.log`. Noise scan всегда посещает весь заданный
+список DAC-кодов. После двух валидных полностью нулевых снимков он пропускает
+лишь оставшиеся повторы текущего кода. Параметры оптимизации и переподключения
+УПО находятся в `characterization_config.py`.
