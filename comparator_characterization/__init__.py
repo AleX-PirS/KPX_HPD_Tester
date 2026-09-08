@@ -6,7 +6,11 @@ reprocessed later with :func:`analyze_saved_experiment` without importing or
 connecting any instrument driver.
 """
 
-from .analysis import analyze_saved_experiment, analyze_saved_noise_statistics
+from .analysis import (
+    analyze_saved_experiment,
+    analyze_saved_noise_statistics,
+    analyze_spatial_baseline,
+)
 from .calibration import (
     ReferenceDacCalibration,
     ReferencePairSelection,
@@ -60,6 +64,14 @@ from .workflow import (
     characterize_measurement_clock_noise,
     interactive_exposure_pause,
 )
+from .multi_window import (
+    AllWindowCharacterizationResult,
+    AllWindowExposureChange,
+    AllWindowSettings,
+    analyze_all_windows,
+    characterize_all_windows,
+    interactive_all_window_noise_pause,
+)
 from .sweep import (
     ParameterSweepResult, SweepNoiseExposure, characterize_parameter_sweep,
     interactive_noise_exposure_pause,
@@ -67,6 +79,9 @@ from .sweep import (
 
 __all__ = [
     "AnalysisSettings",
+    "AllWindowCharacterizationResult",
+    "AllWindowExposureChange",
+    "AllWindowSettings",
     "ParameterSweepResult",
     "SweepNoiseExposure",
     "characterize_parameter_sweep",
@@ -98,11 +113,14 @@ __all__ = [
     "ThresholdDacCalibration",
     "WindowSpec",
     "analyze_saved_experiment",
+    "analyze_all_windows",
     "analyze_saved_noise_statistics",
+    "analyze_spatial_baseline",
     "propose_noise_trim_maps",
     "load_recommended_trim_map",
     "build_injection_groups",
     "characterize_comparator",
+    "characterize_all_windows",
     "characterize_injection_crosstalk",
     "characterize_measurement_clock_noise",
     "get_window_spec",
@@ -111,6 +129,7 @@ __all__ = [
     "load_gain_map_csv",
     "ManualExposureChange",
     "interactive_exposure_pause",
+    "interactive_all_window_noise_pause",
     "resolve_gain_map",
     "normalize_bad_pixel_map",
     "select_reference_dac_pairs",

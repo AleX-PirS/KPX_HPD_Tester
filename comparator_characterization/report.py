@@ -109,7 +109,19 @@ def _dac_grid_description(frame: pd.DataFrame) -> str:
 
 def _key_figures(analysis_directory: Path) -> list[tuple[str, Path]]:
     plot_directory = analysis_directory / "plots"
-    candidates = [
+    spatial = sorted(
+        plot_directory.glob("spatial_baseline_scurve_zero_charge_intercept_*.png")
+    )
+    if not spatial:
+        spatial = sorted(
+            plot_directory.glob(
+                "spatial_baseline_noise_effective_threshold_equalized_final_*.png"
+            )
+        )
+    candidates: list[tuple[str, Path]] = []
+    if spatial:
+        candidates.append(("Пространственный градиент базовой линии", spatial[0]))
+    candidates.extend([
         ("Распределения порогов", plot_directory / "threshold_distributions_individual_scale.png"),
         ("Матрица до и после эквализации", plot_directory / "baseline_equalization_overview.png"),
         ("S-кривые матрицы", plot_directory / "matrix_scurves_all.png"),
@@ -119,7 +131,7 @@ def _key_figures(analysis_directory: Path) -> list[tuple[str, Path]]:
         ),
         ("Выбор фиксированного REF1 и REF2", plot_directory / "reference_pair_selection.png"),
         ("Качество S-curve fit", plot_directory / "scurve_fit_quality.png"),
-    ]
+    ])
     return [(label, path) for label, path in candidates if path.exists()]
 
 
@@ -140,10 +152,28 @@ def generate_analysis_report(
     crosstalk_summary: pd.DataFrame,
     measurement_clock_summary: pd.DataFrame,
     target_voltage: float | None,
+    spatial_baseline_summary: pd.DataFrame | None = None,
+    scurve_gain_compensated: pd.DataFrame | None = None,
+    scurve_gain_comparison: pd.DataFrame | None = None,
 ) -> Path:
     """Create a concise Russian measurement report from saved analysis products."""
 
     metadata = dict(metadata or {})
+    spatial_baseline_summary = (
+        spatial_baseline_summary
+        if spatial_baseline_summary is not None
+        else pd.DataFrame()
+    )
+    scurve_gain_compensated = (
+        scurve_gain_compensated
+        if scurve_gain_compensated is not None
+        else pd.DataFrame()
+    )
+    scurve_gain_comparison = (
+        scurve_gain_comparison
+        if scurve_gain_comparison is not None
+        else pd.DataFrame()
+    )
     report_path = analysis_directory / "REPORT.md"
     experiment_id = metadata.get("experiment_id") or (
         experiment_root.name if experiment_root is not None else "offline_statistics"
@@ -311,6 +341,35 @@ def generate_analysis_report(
             conclusions.append(
                 "Максимальное изменение измеренной ступеньки при включении CLK: "
                 f"{_fmt(maximum_clock_shift, digits=3, suffix=' mV')}."
+            )
+    if not spatial_baseline_summary.empty:
+        preferred = spatial_baseline_summary[
+            spatial_baseline_summary["source_kind"].astype(str)
+            == "scurve_zero_charge_intercept"
+        ]
+        if preferred.empty:
+            preferred = spatial_baseline_summary[
+                (spatial_baseline_summary["source_kind"].astype(str)
+                 == "noise_effective_threshold")
+                & (spatial_baseline_summary["source_stage"].astype(str)
+                   == "equalized_final")
+            ]
+        if preferred.empty:
+            preferred = spatial_baseline_summary.copy()
+        preferred = preferred.sort_values(
+            ["maximum_slope_significance", "plane_fit_r2"],
+            ascending=False,
+            na_position="last",
+        )
+        if not preferred.empty:
+            spatial = preferred.iloc[0]
+            conclusions.append(
+                "Пространственная неоднородность effective baseline: "
+                f"сдвиг row min->max {_fmt(1000 * _number(spatial.get('row_index_min_to_max_shift_v')), digits=3, suffix=' mV')}, "
+                f"column min->max {_fmt(1000 * _number(spatial.get('column_index_min_to_max_shift_v')), digits=3, suffix=' mV')}, "
+                f"plane span {_fmt(1000 * _number(spatial.get('plane_peak_to_peak_v')), digits=3, suffix=' mV')}, "
+                f"status `{spatial.get('spatial_gradient_status', 'н/д')}`. "
+                "Это пространственный диагностический признак, а не доказательство IR-drop."
             )
     for item in conclusions:
         lines.append(f"- {item}")
@@ -661,6 +720,119 @@ def generate_analysis_report(
             lines.append(
                 "Заряд номинальный, его масштаб наследует допуск инжекционной емкости."
             )
+        if not scurve_gain_compensated.empty:
+            valid_compensated = scurve_gain_compensated[
+                pd.to_numeric(
+                    scurve_gain_compensated.get("fit_r2"), errors="coerce"
+                )
+                >= 0.8
+            ]
+            lines.extend(
+                [
+                    "",
+                    "#### Диагностическая компенсация baseline/IR-drop",
+                    "",
+                    "Дополнительная карта получена после удаления пространственной "
+                    "плоскости V50 отдельно на каждой измеренной амплитуде и повторного "
+                    "fit V50(Q). Простое вычитание одной baseline-карты не меняло бы "
+                    "наклон. Исходный gain остается основным результатом: такая "
+                    "компенсация может удалить не только IR-drop, но и реальный "
+                    "пространственный градиент усиления.",
+                    "",
+                    f"Медиана diagnostic gain: "
+                    f"{_fmt(_median(valid_compensated, 'nominal_gain_mv_per_ke'), digits=3, suffix=' mV/ke')}; "
+                    f"пикселей с R2 >= 0.8: {len(valid_compensated)}.",
+                ]
+            )
+            if not scurve_gain_comparison.empty:
+                raw_std = _std(
+                    scurve_gain_comparison, "nominal_gain_mv_per_ke_raw"
+                )
+                compensated_std = _std(
+                    scurve_gain_comparison,
+                    "nominal_gain_mv_per_ke_compensated",
+                )
+                lines.append(
+                    "Std распределения gain: raw "
+                    f"{_fmt(raw_std, digits=3, suffix=' mV/ke')}, diagnostic "
+                    f"{_fmt(compensated_std, digits=3, suffix=' mV/ke')}."
+                )
+
+    if not spatial_baseline_summary.empty:
+        lines.extend(["", "## Пространственный градиент базовой линии", ""])
+        lines.extend(
+            [
+                "Анализ разделяет наблюдаемую карту на плоскость `b0 + bx*x + by*y` "
+                "и локальный остаток. Знак `row min->max` относится к росту физического "
+                "индекса строки, а не автоматически к направлению низ-верх на кристалле.",
+                "",
+                "`noise_effective_threshold` включает baseline ЗЧУ, смещение компаратора "
+                "и примененный trim. `scurve_v50_at_injected_step` дополнительно включает "
+                "gain и заряд. `scurve_zero_charge_intercept` строится только при минимум "
+                "трех амплитудах и `R2 >= 0.8`; это наиболее чистая доступная оценка, но "
+                "она остается экстраполяцией V50(Q).",
+                "",
+            ]
+        )
+        spatial_rows: list[list[Any]] = []
+        ordered_spatial = spatial_baseline_summary.sort_values(
+            ["source_kind", "source_stage", "measurement_fclk_mhz"],
+            na_position="last",
+        )
+        for _, row in ordered_spatial.head(30).iterrows():
+            spatial_rows.append(
+                [
+                    row.get("source_kind", ""),
+                    row.get("source_stage", ""),
+                    row.get("injection_pattern", ""),
+                    _fmt(row.get("measurement_fclk_mhz"), digits=0),
+                    _fmt(1000 * _number(row.get("injection_voltage_step_v")), digits=3),
+                    _int_or_zero(row.get("pixel_count")),
+                    _fmt(1000 * _number(row.get("row_index_min_to_max_shift_v")), digits=3),
+                    _fmt(1000 * _number(row.get("column_index_min_to_max_shift_v")), digits=3),
+                    _fmt(1000 * _number(row.get("plane_peak_to_peak_v")), digits=3),
+                    _fmt(row.get("plane_fit_r2"), digits=3),
+                    _fmt(1000 * _number(row.get("detrended_residual_mad_v")), digits=3),
+                    row.get("spatial_gradient_status", ""),
+                ]
+            )
+        lines.extend(
+            _markdown_table(
+                [
+                    "Источник",
+                    "Stage",
+                    "Pattern",
+                    "FCLK, МГц",
+                    "Step, mV",
+                    "Pixels",
+                    "Row shift, mV",
+                    "Column shift, mV",
+                    "Plane span, mV",
+                    "R2",
+                    "Residual MAD, mV",
+                    "Status",
+                ],
+                spatial_rows,
+            )
+        )
+        if len(ordered_spatial) > 30:
+            lines.extend(
+                [
+                    "",
+                    "В REPORT показаны первые 30 наборов. Полная таблица сохранена "
+                    "в `spatial_baseline_summary.csv`.",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "IR-drop согласуется с устойчивым координатным градиентом, но для "
+                "идентификации причины нужны повторения при изменении тока, FCLK, "
+                "одновременной активности пикселей и направления обхода. Если slope "
+                "масштабируется с потребляемым током и воспроизводит геометрию питания, "
+                "гипотеза IR-drop становится существенно сильнее.",
+            ]
+        )
 
     if not measurement_clock_summary.empty:
         lines.extend(["", "## Шум в зависимости от FCLK измерения", ""])
@@ -761,6 +933,14 @@ def generate_analysis_report(
         ("noise_fit_results.csv", "Noise fit по пикселям"),
         ("scurve_efficiency.csv", "Paired S-curve points"),
         ("scurve_results.csv", "V50 и sigma по пикселям"),
+        (
+            "scurve_pixel_gain_spatially_compensated.csv",
+            "Диагностический gain после пространственной компенсации",
+        ),
+        (
+            "scurve_gain_compensation_comparison.csv",
+            "Сравнение raw и compensated gain",
+        ),
         ("scurve_branch_summary.csv", "Границы ветви и denominator"),
         ("scurve_transition_precision.csv", "Проверка fine шага около V50"),
         ("injection_crosstalk_summary.csv", "Crosstalk summary"),
@@ -769,6 +949,8 @@ def generate_analysis_report(
             "measurement_clock_noise_pixel_metrics.csv",
             "Шум по FCLK, метрики пикселей",
         ),
+        ("spatial_baseline_summary.csv", "Пространственный градиент baseline, summary"),
+        ("spatial_baseline_pixel_metrics.csv", "Baseline, plane и detrended residual по пикселям"),
     ):
         path = analysis_directory / filename
         if path.exists():
@@ -801,6 +983,9 @@ def generate_analysis_report(
             "доказательством физически битого пикселя.",
             "- Оптимальный GAIN нельзя выбирать без явного sweep GAIN и сравнения "
             "одинаковых тестовых условий.",
+            "- Пространственный slope сам по себе не доказывает IR-drop: он также может "
+            "возникать из градиента mismatch, bias, температуры, связи цифровой части "
+            "или геометрии тестовой инжекции.",
             "",
             "Методическая структура отчета следует принятой практике: baseline "
             "equalization по threshold scan, per-pixel распределения, карты trim/noise, "

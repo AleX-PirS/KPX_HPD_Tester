@@ -110,8 +110,8 @@ SHUTTER_START_DELAY_S = 0.8
 # сигнал shutter; окончательно проверьте взаимное положение SHUTTER/CTRL.
 POST_BURST_GUARD_S = 0.1
 
-# Окно и пиксели. Возможные окна: AB, BC, CD.
-WINDOW = "AB"
+# Окно и пиксели. Возможные окна: AB, BC, CD, ALL.
+WINDOW = "ALL"
 PIXELS: str | list[tuple[int, int]] = "all"
 # None: использовать все выбранные пиксели. Или путь к CSV/JSON либо список
 # физических (column, row): [(16, 0), (20, 7)]. True/1 в карте = ИСКЛЮЧИТЬ.
@@ -236,7 +236,7 @@ NOISE_SHUTTER_DURATION_S = 0.001
 # N_nom=round(Freal*T). Оно должно совпадать с ручной настройкой GUI УПО.
 # При 100 кГц и 0.010 с получается номинально 1000 отрицательных фронтов.
 SCURVE_SHUTTER_DURATION_S = 0.010
-NOISE_REPEATS = 10
+NOISE_REPEATS = 4
 # Пороговый ЦАП S-curve идет от большого кода к меньшему. Это оставляет в
 # измерении полезную инжекцию на отрицательном фронте CTRL и не продолжает
 # скан далеко ниже базовой линии к ветви противоположной полярности.
@@ -276,7 +276,7 @@ NOISE_COARSE_STEP = 16
 # Полный список DAC-кодов всегда проходится. Если вся выбранная матрица дважды
 # подряд валидно вернула ноль на одном коде, оставшиеся повторы только этой
 # точки пропускаются. Ошибка чтения никогда не считается пустой матрицей.
-NOISE_EMPTY_MATRIX_REPEATS_TO_SKIP_REMAINING: int | None = 2
+NOISE_EMPTY_MATRIX_REPEATS_TO_SKIP_REMAINING: int | None = 1
 # Устаревшая настройка оставлена для импорта старых пользовательских файлов.
 # В версии 0.13 она не обрезает хвост DAC-диапазона.
 NOISE_CONSECUTIVE_EMPTY_CODES_TO_STOP: int | None = None
@@ -294,6 +294,9 @@ PLOT_SCURVE_PATTERNS: tuple[str, ...] = ()
 REPRESENTATIVE_PIXEL_COUNT = 6
 SAVE_PDF_PLOTS = True
 PLOT_DPI = 300
+# False: квадратная область карты, как в прежних gain-графиках. True:
+# физически квадратные ячейки и прямоугольная принадлежащая половина 16x32.
+PLOT_SQUARE_PHYSICAL_PIXELS = False
 
 # Источник для локальной HTML-страницы. Допустим каталог эксперимента или
 # конкретный analysis/vNNN. None означает, что путь задается в командной строке.
@@ -321,6 +324,19 @@ PLOT_WORKERS = 0
 RAW_READ_WORKERS = 0
 # Небольшие наборы считаются без процессов, чтобы не тратить время на spawn.
 ANALYSIS_PARALLEL_MIN_GROUPS = 2048
+
+# Дополнительный этап только для WINDOW="ALL". После независимых AB/BC/CD
+# пороги D/C/B равномерно распределяются по измеренному напряжению, A=1023,
+# затем REF2 свипируется при одном фиксированном REF1. На каждом Q выполняется
+# указанное число парных background/signal экспозиций.
+ALL_WINDOW_FINAL_REF_SWEEP_ENABLED = True
+ALL_WINDOW_FINAL_REF_STEP_COUNT = 200
+ALL_WINDOW_FINAL_REF_REPEATS = 4
+ALL_WINDOW_FINAL_REF_INJECTION_PATTERN = "all"
+ALL_WINDOW_COMMON_SHIFT_Z_THRESHOLD = 3.0
+ALL_WINDOW_COMMON_SHIFT_MAX_DIFFERENTIAL_Z = 1.0
+ALL_WINDOW_COMPARATOR_OUTLIER_Z_THRESHOLD = 3.0
+ALL_WINDOW_GOOD_FIT_R2 = 0.80
 
 
 def configure_runtime_logging() -> None:
@@ -488,6 +504,7 @@ def build_settings(
         plot_injection_patterns=PLOT_SCURVE_PATTERNS,
         plot_dpi=PLOT_DPI,
         save_pdf_plots=SAVE_PDF_PLOTS,
+        square_physical_pixels=PLOT_SQUARE_PHYSICAL_PIXELS,
         scurve_fit_core_low_fraction=SCURVE_FIT_CORE_LOW_FRACTION,
         scurve_fit_core_high_fraction=SCURVE_FIT_CORE_HIGH_FRACTION,
         scurve_plot_noise_peak_search_codes=(
@@ -650,7 +667,39 @@ def injection_hardware_arguments(generator: Any) -> dict[str, Any]:
 
 def run_characterization(client, calibration_files, **kwargs):
     """Общий вход run_*.py: одиночный запуск либо возобновляемая EO-серия."""
-    from comparator_characterization import characterize_comparator, characterize_parameter_sweep
+    from comparator_characterization import (
+        AllWindowSettings,
+        characterize_all_windows,
+        characterize_comparator,
+        characterize_parameter_sweep,
+    )
+    requested_window = str(kwargs.get("window", WINDOW)).strip().upper()
+    if requested_window == "ALL":
+        if EO_PARAMETER_GRID or RESUME_SWEEP is not None:
+            raise ValueError("WINDOW='ALL' пока не объединяется с EO_PARAMETER_GRID")
+        if EO_OVERRIDES:
+            kwargs["eo_overrides"] = EO_OVERRIDES
+        kwargs.pop("window", None)
+        return characterize_all_windows(
+            client,
+            calibration_files,
+            resume_experiment=RESUME_EXPERIMENT,
+            all_window_settings=AllWindowSettings(
+                final_ref_sweep_enabled=ALL_WINDOW_FINAL_REF_SWEEP_ENABLED,
+                final_ref_step_count=ALL_WINDOW_FINAL_REF_STEP_COUNT,
+                final_ref_repeats=ALL_WINDOW_FINAL_REF_REPEATS,
+                final_ref_injection_pattern=ALL_WINDOW_FINAL_REF_INJECTION_PATTERN,
+                common_shift_z_threshold=ALL_WINDOW_COMMON_SHIFT_Z_THRESHOLD,
+                common_shift_max_differential_z=(
+                    ALL_WINDOW_COMMON_SHIFT_MAX_DIFFERENTIAL_Z
+                ),
+                comparator_outlier_z_threshold=(
+                    ALL_WINDOW_COMPARATOR_OUTLIER_Z_THRESHOLD
+                ),
+                good_fit_r2=ALL_WINDOW_GOOD_FIT_R2,
+            ),
+            **kwargs,
+        )
     if EO_PARAMETER_GRID or RESUME_SWEEP is not None:
         if RESUME_EXPERIMENT is not None or EO_OVERRIDES:
             raise ValueError("Для EO-серии используйте только EO_PARAMETER_GRID и RESUME_SWEEP")
@@ -665,7 +714,16 @@ def run_characterization(client, calibration_files, **kwargs):
 
 
 def print_result_paths(result):
-    if hasattr(result, "combinations"):
+    if hasattr(result, "window_results"):
+        for window, child in result.window_results.items():
+            print(f"Окно {window}: {child.experiment_path}")
+            print_recommendation_paths(child.analysis_path)
+        print(f"Совместный отчет: {result.analysis_path / 'REPORT.md'}")
+        for method in ("fit", "centroid", "maximum"):
+            path = result.analysis_path / f"combined_trim_map_{method}.csv"
+            if path.exists():
+                print(f"Совместная trim-карта {method}: {path}")
+    elif hasattr(result, "combinations"):
         for entry in result.combinations:
             print(f"EO {entry['eo_overrides']}: {entry['status']}")
             if entry.get("analysis"):

@@ -6,7 +6,21 @@ import logging
 from pathlib import Path
 
 from .analysis import analyze_saved_experiment, analyze_saved_noise_statistics
+from .multi_window import analyze_all_windows
 from .models import AnalysisSettings
+
+
+def _json_serializable(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _json_serializable(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_serializable(item) for item in value]
+    return value
 
 
 def main() -> int:
@@ -77,6 +91,23 @@ def main() -> int:
         help="Сохранять только PNG, без дублирования графиков в PDF.",
     )
     parser.add_argument(
+        "--square-pixels",
+        action="store_true",
+        help=(
+            "Показывать физически квадратные ячейки: принадлежащая половина "
+            "матрицы будет прямоугольной 16x32. По умолчанию область карты "
+            "визуально квадратная, а ячейки растянуты по ширине."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-child-analysis",
+        action="store_true",
+        help=(
+            "Для WINDOW=ALL не пересчитывать три дочерних анализа. По умолчанию "
+            "они пересчитываются, чтобы новые настройки графиков применились ко всем окнам."
+        ),
+    )
+    parser.add_argument(
         "--dpi",
         type=int,
         default=300,
@@ -98,29 +129,36 @@ def main() -> int:
         plot_all_trim_heatmaps=args.all_trim_heatmaps,
         plot_dpi=args.dpi,
         save_pdf_plots=not args.no_pdf,
+        square_physical_pixels=args.square_pixels,
     )
     common = dict(
         settings=analysis_settings, target_voltage=args.target_voltage,
         bad_pixel_map=args.bad_pixels, generate_plots=not args.no_plots,
     )
     if (args.experiment / "metadata.json").is_file():
-        outputs = analyze_saved_experiment(args.experiment, n_injections=args.n_injections, **common)
+        metadata = json.loads(
+            (args.experiment / "metadata.json").read_text(encoding="utf-8")
+        )
+        if str(metadata.get("window", "")).upper() == "ALL":
+            if args.n_injections is not None:
+                parser.error("Для родительского WINDOW=ALL --n-injections не применяется")
+            outputs = analyze_all_windows(
+                args.experiment,
+                settings=analysis_settings,
+                reanalyze_children=not args.reuse_child_analysis,
+                generate_plots=not args.no_plots,
+            )
+        else:
+            outputs = analyze_saved_experiment(args.experiment, n_injections=args.n_injections, **common)
     else:
         if args.n_injections is not None:
             parser.error("Для noise_statistics.csv число S-curve инжекций не применяется")
         outputs = analyze_saved_noise_statistics(args.experiment, **common)
-    serializable = {}
-    for key, value in outputs.items():
-        if isinstance(value, Path):
-            serializable[key] = str(value)
-        elif isinstance(value, dict):
-            serializable[key] = {
-                nested_key: [str(item) for item in nested_value]
-                for nested_key, nested_value in value.items()
-            }
-        else:
-            serializable[key] = value
-    print(json.dumps(serializable, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            _json_serializable(outputs), ensure_ascii=False, indent=2
+        )
+    )
     return 0
 
 

@@ -1196,6 +1196,30 @@ class MGPDMeasurementBackend:
             raise RuntimeError(f"failed to set {spec.threshold_dac}={code}")
         self._global_field_state[spec.threshold_dac] = int(code)
 
+    def configure_threshold_codes(self, threshold_codes: Mapping[str, int]) -> None:
+        """Program an explicit set of global comparator thresholds.
+
+        This method only writes global DAC fields. It intentionally does not
+        issue the pixel-matrix WRITE_TO_CHIP command, which is reserved for
+        32-bit per-pixel configuration words.
+        """
+
+        allowed = {"DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D"}
+        unknown = set(threshold_codes) - allowed
+        if unknown:
+            raise ValueError(
+                "unknown comparator threshold DAC(s): " + ", ".join(sorted(unknown))
+            )
+        for name in ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D"):
+            if name not in threshold_codes:
+                continue
+            value = threshold_codes[name]
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1023:
+                raise ValueError(f"{name} must be an integer in 0..1023")
+            if not self.cfg.set_data(name, int(value)):
+                raise RuntimeError(f"failed to set {name}={value}")
+            self._global_field_state[name] = int(value)
+
     def program_trim_map(
         self,
         spec: WindowSpec,
@@ -1426,6 +1450,11 @@ class MGPDMeasurementBackend:
         if decoded is None:
             return None, False
         return int(decoded), True
+
+    def _decode_counter(self, raw_value: int) -> tuple[int | None, bool, bool]:
+        decoded, valid = self._decode_selected_counter(raw_value)
+        maximum = (1 << self.settings.counter_mode_bits) - 2
+        return decoded, valid, bool(valid and decoded == maximum)
 
     @staticmethod
     def _contains_transport_error(error: BaseException) -> bool:
@@ -1701,6 +1730,15 @@ class MGPDMeasurementBackend:
                         "counter_low_raw": "",
                         "counter_mid_raw": "",
                         "counter_high_raw": "",
+                        "counter_low_count": "",
+                        "counter_mid_count": "",
+                        "counter_high_count": "",
+                        "counter_low_decode_valid": False,
+                        "counter_mid_decode_valid": False,
+                        "counter_high_decode_valid": False,
+                        "counter_low_saturated": False,
+                        "counter_mid_saturated": False,
+                        "counter_high_saturated": False,
                         "selected_counter_key": self.counter_key,
                         "selected_counter_raw": "",
                         "selected_count": "",
@@ -1716,6 +1754,9 @@ class MGPDMeasurementBackend:
 
             selected_raw = int(result[self.counter_key])
             selected_count, decode_valid = self._decode_selected_counter(selected_raw)
+            low_count, low_valid, low_saturated = self._decode_counter(int(result["low"]))
+            mid_count, mid_valid, mid_saturated = self._decode_counter(int(result["mid"]))
+            high_count, high_valid, high_saturated = self._decode_counter(int(result["high"]))
             maximum_decoded_count = (1 << self.settings.counter_mode_bits) - 2
             counter_saturated = bool(
                 decode_valid and selected_count == maximum_decoded_count
@@ -1728,6 +1769,15 @@ class MGPDMeasurementBackend:
                     "counter_low_raw": int(result["low"]),
                     "counter_mid_raw": int(result["mid"]),
                     "counter_high_raw": int(result["high"]),
+                    "counter_low_count": low_count if low_count is not None else "",
+                    "counter_mid_count": mid_count if mid_count is not None else "",
+                    "counter_high_count": high_count if high_count is not None else "",
+                    "counter_low_decode_valid": low_valid,
+                    "counter_mid_decode_valid": mid_valid,
+                    "counter_high_decode_valid": high_valid,
+                    "counter_low_saturated": low_saturated,
+                    "counter_mid_saturated": mid_saturated,
+                    "counter_high_saturated": high_saturated,
                     "selected_counter_key": self.counter_key,
                     "selected_counter_raw": selected_raw,
                     "selected_count": selected_count if selected_count is not None else "",

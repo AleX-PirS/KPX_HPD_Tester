@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.14.0"
+FRAMEWORK_VERSION = "0.16.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -210,11 +210,11 @@ class NoiseScanSettings:
             if (
                 not isinstance(self.empty_matrix_repeats_to_skip_remaining, int)
                 or isinstance(self.empty_matrix_repeats_to_skip_remaining, bool)
-                or self.empty_matrix_repeats_to_skip_remaining < 2
+                or self.empty_matrix_repeats_to_skip_remaining < 1
             ):
                 raise ValueError(
                     "empty_matrix_repeats_to_skip_remaining must be None or "
-                    "an integer >= 2"
+                    "an integer >= 1"
                 )
         if (
             not isinstance(self.upo_reconnect_attempts, int)
@@ -435,6 +435,10 @@ class AnalysisSettings:
     plot_all_trim_heatmaps: bool = False
     plot_dpi: int = 300
     save_pdf_plots: bool = True
+    # False keeps the displayed 16x32 owned half visually square, as in the
+    # historical project figures. True preserves geometrically square pixel
+    # cells and therefore renders the owned half as a 1:2 rectangle.
+    square_physical_pixels: bool = False
     # 0 = automatic (up to 8 CPUs); 1 disables process parallelism.
     workers: int = 0
     # Avoid process startup overhead for small collections of independent curves.
@@ -552,6 +556,8 @@ class AnalysisSettings:
             raise ValueError("plot_dpi must be at least 72")
         if not isinstance(self.plot_all_trim_heatmaps, bool):
             raise TypeError("plot_all_trim_heatmaps must be bool")
+        if not isinstance(self.square_physical_pixels, bool):
+            raise TypeError("square_physical_pixels must be bool")
 
 
 @dataclass

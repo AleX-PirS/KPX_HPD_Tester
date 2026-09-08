@@ -16,11 +16,13 @@ python -m comparator_characterization.high_level.run_noise_equalization
 python -m comparator_characterization.high_level.run_full_trim_sweep
 python -m comparator_characterization.high_level.run_scurve
 python -m comparator_characterization.high_level.run_full_characterization
+python -m comparator_characterization.high_level.run_all_windows
 python -m comparator_characterization.high_level.run_eo_parameter_sweep
 python -m comparator_characterization.high_level.run_crosstalk
 python -m comparator_characterization.high_level.run_clock_noise
 python -m comparator_characterization.high_level.plot_characterization results/EXPERIMENT
 python -m comparator_characterization.high_level.run_plot_dashboard results/EXPERIMENT
+python -m comparator_characterization.high_level.analyze_all_windows results/PARENT_ALL
 ```
 
 Допустим и прямой запуск файла, например:
@@ -31,6 +33,23 @@ python comparator_characterization/high_level/run_scurve.py
 
 Перед реальным измерением проверьте все пути и параметры, затем осознанно
 установите `ENABLE_HARDWARE_RUN = True`.
+
+Для последовательной характеризации трех окон задайте `WINDOW = "ALL"`.
+`run_full_characterization.py` создаст один родительский каталог и три
+дочерних AB/BC/CD. Константы `ALL_WINDOW_FINAL_REF_STEP_COUNT` и
+`ALL_WINDOW_FINAL_REF_REPEATS` управляют дополнительным финальным sweep REF2
+при фиксированных и равномерно разнесенных по измеренному напряжению порогах
+D/C/B. Подробная физическая интерпретация и ограничения приведены в
+`COMPARATOR_CHARACTERIZATION.md`.
+
+Файл `run_all_windows.py` выполняет тот же связанный сценарий независимо от
+текущего значения `WINDOW`. Все остальные параметры, включая
+`RESUME_EXPERIMENT`, он берет из `characterization_config.py`.
+
+Визуализация карт по умолчанию сохраняет квадратную область изображения.
+`PLOT_SQUARE_PHYSICAL_PIXELS=True` показывает физически квадратные ячейки и
+прямоугольную половину 16x32. Для offline-запуска используйте
+`--square-pixels`.
 
 `run_noise_scan.py` подходит для короткого пилота с ограниченной областью DAC:
 он не измеряет trim 0/31 и не проводит эквализацию, а сохраняет baseline noise
@@ -219,6 +238,21 @@ noise-stage, `all/tile_2x2/tile_4x4/tile_8x8`, амплитуду, русски�
 только положительная физическая ветвь; вариант `Полная / bipolar` оставляет обе
 полярности. Новые файлы и точный JSON запроса сохраняются в
 `analysis/vNNN/custom_plots/render_TIMESTAMP`.
+
+Обычный `plot_characterization.py` также автоматически строит пространственный
+анализ effective baseline. Основные файлы находятся в новом `analysis/vNNN`:
+
+- `spatial_baseline_summary.csv`;
+- `spatial_baseline_pixel_metrics.csv`;
+- `plots/spatial_baseline_*.png` и, если включено, `.pdf`;
+- раздел `Пространственный градиент базовой линии` в `REPORT.md`.
+
+Для наиболее чистой оценки запускайте S-кривую минимум с тремя различными
+ступеньками REF. Тогда дополнительно строится zero-charge intercept V50(DeltaV).
+При одной ступеньке карта V50 сохраняется, но baseline и gain по ней разделить
+нельзя. Карта из noise scan тоже полезна, однако содержит offset компаратора и
+влияние trim. Слова IR-drop в отчете трактуются как гипотеза, а не автоматически
+установленная причина градиента.
 
 Резервный `keysight_burst` сохраняет задержку 0.8 s, `*TRG` и конечное число
 периодов `N_INJECTIONS`. В основном режиме `upo_pwm` внешний генератор и VISA не

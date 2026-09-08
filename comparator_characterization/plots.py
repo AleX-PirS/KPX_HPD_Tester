@@ -185,6 +185,7 @@ def _heatmap(
     colorbar_label: str,
     cmap: str = "viridis",
     center_zero: bool = False,
+    aspect: str = "auto",
 ) -> plt.Figure | None:
     if frame.empty or value_column not in frame:
         return None
@@ -206,7 +207,7 @@ def _heatmap(
     image = axis.imshow(
         array,
         origin="lower",
-        aspect="auto",
+        aspect=aspect,
         interpolation="nearest",
         extent=(columns[0] - 0.5, columns[-1] + 0.5, -0.5, 31.5),
         cmap=cmap,
@@ -218,6 +219,10 @@ def _heatmap(
     colorbar = figure.colorbar(image, ax=axis, pad=0.02)
     colorbar.set_label(colorbar_label)
     return figure
+
+
+def _matrix_aspect(settings: AnalysisSettings) -> str:
+    return "equal" if settings.square_physical_pixels else "auto"
 
 
 def _representative_coordinates(
@@ -596,7 +601,10 @@ def generate_recommendation_plots(directory: Path, settings: AnalysisSettings) -
             ("trim_range_limited_map", f"trim_range_limited_{method}", f"{method}: target outside measured trim range", "1 = trim range limited; NOT a dead-pixel claim"),
             ("review_required_map", f"review_required_{method}", f"{method}: pixels requiring review", "1 = inspect reason_codes"),
         ):
-            figure = _heatmap(data, value_column=field, title=title, colorbar_label=label)
+            figure = _heatmap(
+                data, value_column=field, title=title, colorbar_label=label,
+                aspect=_matrix_aspect(settings),
+            )
             if figure is not None:
                 outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
     diagnostic_path = directory / "noise_curve_diagnostics.csv"
@@ -614,7 +622,10 @@ def generate_recommendation_plots(directory: Path, settings: AnalysisSettings) -
                     data = data.copy()
                     data[field] = data[field].astype(str).str.lower().isin(("true", "1")).astype(int)
                 stem = f"{stage}_{field}"
-                figure = _heatmap(data, value_column=field, title=f"{stage}: {label}", colorbar_label=label)
+                figure = _heatmap(
+                    data, value_column=field, title=f"{stage}: {label}",
+                    colorbar_label=label, aspect=_matrix_aspect(settings),
+                )
                 if figure is not None:
                     outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
     return outputs
@@ -673,11 +684,35 @@ def generate_diagnostic_plots(
     measurement_clock_summary: pd.DataFrame,
     target_voltage: float | None,
     settings: AnalysisSettings,
+    spatial_baseline_pixel_metrics: pd.DataFrame | None = None,
+    spatial_baseline_summary: pd.DataFrame | None = None,
+    scurve_gain_compensated: pd.DataFrame | None = None,
+    scurve_gain_comparison: pd.DataFrame | None = None,
 ) -> dict[str, list[Path]]:
     """Generate every plot exclusively from saved/processed experiment data."""
 
     plot_directory = analysis_directory / "plots"
     outputs: dict[str, list[Path]] = {}
+    spatial_baseline_pixel_metrics = (
+        spatial_baseline_pixel_metrics
+        if spatial_baseline_pixel_metrics is not None
+        else pd.DataFrame()
+    )
+    spatial_baseline_summary = (
+        spatial_baseline_summary
+        if spatial_baseline_summary is not None
+        else pd.DataFrame()
+    )
+    scurve_gain_compensated = (
+        scurve_gain_compensated
+        if scurve_gain_compensated is not None
+        else pd.DataFrame()
+    )
+    scurve_gain_comparison = (
+        scurve_gain_comparison
+        if scurve_gain_comparison is not None
+        else pd.DataFrame()
+    )
     plt.rcParams.update(
         {
             "font.size": 10,
@@ -703,6 +738,8 @@ def generate_diagnostic_plots(
         scurve_results = selected_pattern_rows(scurve_results)
         scurve_amplitude_summary = selected_pattern_rows(scurve_amplitude_summary)
         scurve_gain_results = selected_pattern_rows(scurve_gain_results)
+        scurve_gain_compensated = selected_pattern_rows(scurve_gain_compensated)
+        scurve_gain_comparison = selected_pattern_rows(scurve_gain_comparison)
         crosstalk_pixel_metrics = selected_pattern_rows(crosstalk_pixel_metrics)
         crosstalk_summary = selected_pattern_rows(crosstalk_summary)
         measurement_clock_pixel_metrics = selected_pattern_rows(
@@ -711,6 +748,24 @@ def generate_diagnostic_plots(
         measurement_clock_summary = selected_pattern_rows(
             measurement_clock_summary
         )
+        if (
+            not spatial_baseline_pixel_metrics.empty
+            and "injection_pattern" in spatial_baseline_pixel_metrics
+        ):
+            pattern = spatial_baseline_pixel_metrics["injection_pattern"].astype(str)
+            spatial_baseline_pixel_metrics = spatial_baseline_pixel_metrics[
+                pattern.isin(selected_patterns) | (pattern == "none")
+            ].copy()
+            retained_groups = set(
+                spatial_baseline_pixel_metrics.get(
+                    "analysis_group", pd.Series(dtype=str)
+                ).astype(str)
+            )
+            spatial_baseline_summary = spatial_baseline_summary[
+                spatial_baseline_summary.get(
+                    "analysis_group", pd.Series(dtype=str)
+                ).astype(str).isin(retained_groups)
+            ].copy()
 
     # Keep all FCLK branches for the dedicated comparison plots. Existing
     # generic S-curve figures intentionally show one clock only so values from
@@ -739,6 +794,8 @@ def generate_diagnostic_plots(
         scurve_results = one_clock(scurve_results)
         scurve_amplitude_summary = one_clock(scurve_amplitude_summary)
         scurve_gain_results = one_clock(scurve_gain_results)
+        scurve_gain_compensated = one_clock(scurve_gain_compensated)
+        scurve_gain_comparison = one_clock(scurve_gain_comparison)
         crosstalk_pixel_metrics = one_clock(crosstalk_pixel_metrics)
         crosstalk_summary = one_clock(crosstalk_summary)
 
@@ -1004,7 +1061,7 @@ def generate_diagnostic_plots(
                     image = axis.imshow(
                         array,
                         origin="lower",
-                        aspect="auto",
+                        aspect=_matrix_aspect(settings),
                         interpolation="nearest",
                         extent=(
                             columns[0] - 0.5,
@@ -1044,6 +1101,7 @@ def generate_diagnostic_plots(
                 title=f"{label}: effective-threshold map",
                 colorbar_label="Effective threshold, V",
                 cmap="viridis",
+                aspect=_matrix_aspect(settings),
             )
             if center_map is not None:
                 outputs[f"threshold_map_{stage}"] = _save_figure(
@@ -1065,6 +1123,7 @@ def generate_diagnostic_plots(
                 colorbar_label="Offset, V",
                 cmap="coolwarm",
                 center_zero=True,
+                aspect=_matrix_aspect(settings),
             )
             if offset_map is not None:
                 outputs[f"spatial_offset_map_{stage}"] = _save_figure(
@@ -1233,6 +1292,7 @@ def generate_diagnostic_plots(
                         title=f"Uniform trim {int(trim_code):02d}: effective threshold",
                         colorbar_label="Effective threshold, V",
                         cmap="viridis",
+                        aspect=_matrix_aspect(settings),
                     )
                     if figure is not None:
                         stem = f"uniform_trim_{int(trim_code):02d}_threshold_map"
@@ -1358,6 +1418,7 @@ def generate_diagnostic_plots(
                 colorbar_label=label,
                 cmap=cmap,
                 center_zero=centered,
+                aspect=_matrix_aspect(settings),
             )
             if figure is not None:
                 outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
@@ -1998,7 +2059,7 @@ def generate_diagnostic_plots(
                         image_v50 = axes[0, 0].imshow(
                             v50_array,
                             origin="lower",
-                            aspect="auto",
+                            aspect=_matrix_aspect(settings),
                             interpolation="nearest",
                             extent=(columns[0] - 0.5, columns[-1] + 0.5, rows[0] - 0.5, rows[-1] + 0.5),
                             cmap="viridis",
@@ -2007,7 +2068,7 @@ def generate_diagnostic_plots(
                         image_sigma = axes[0, 1].imshow(
                             1000 * sigma_array,
                             origin="lower",
-                            aspect="auto",
+                            aspect=_matrix_aspect(settings),
                             interpolation="nearest",
                             extent=(sigma_columns[0] - 0.5, sigma_columns[-1] + 0.5, sigma_rows[0] - 0.5, sigma_rows[-1] + 0.5),
                             cmap="magma",
@@ -2163,7 +2224,7 @@ def generate_diagnostic_plots(
             image = axes[0].imshow(
                 array,
                 origin="lower",
-                aspect="auto",
+                aspect=_matrix_aspect(settings),
                 interpolation="nearest",
                 extent=(columns[0] - 0.5, columns[-1] + 0.5, rows[0] - 0.5, rows[-1] + 0.5),
                 cmap="viridis",
@@ -2183,6 +2244,274 @@ def generate_diagnostic_plots(
                 f"Per-pixel nominal charge response, pattern {pattern}"
             )
             stem = f"nominal_gain_{_safe_stem(pattern)}"
+            outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
+
+    if not scurve_gain_compensated.empty and not scurve_gain_comparison.empty:
+        for pattern, compensated_data in scurve_gain_compensated.groupby(
+            "injection_pattern", sort=True
+        ):
+            comparison = scurve_gain_comparison[
+                scurve_gain_comparison["injection_pattern"].astype(str)
+                == str(pattern)
+            ].copy()
+            compensated_map = _matrix_array(
+                compensated_data, "nominal_gain_mv_per_ke"
+            )
+            delta_map = _matrix_array(comparison, "gain_delta_mv_per_ke")
+            if compensated_map is None or delta_map is None:
+                continue
+            compensated_array, columns, rows = compensated_map
+            delta_array = delta_map[0]
+            figure, axes = plt.subplots(2, 2, figsize=(11.0, 8.4))
+            image = axes[0, 0].imshow(
+                compensated_array,
+                origin="lower",
+                aspect=_matrix_aspect(settings),
+                interpolation="nearest",
+                extent=(
+                    columns[0] - 0.5,
+                    columns[-1] + 0.5,
+                    rows[0] - 0.5,
+                    rows[-1] + 0.5,
+                ),
+                cmap="viridis",
+            )
+            figure.colorbar(
+                image, ax=axes[0, 0], pad=0.02,
+                label="Spatially compensated gain, mV/ke",
+            )
+            finite_delta = delta_array[np.isfinite(delta_array)]
+            delta_limit = (
+                float(np.nanpercentile(np.abs(finite_delta), 98))
+                if len(finite_delta)
+                else 1.0
+            )
+            if not math.isfinite(delta_limit) or delta_limit <= 0:
+                delta_limit = 1.0
+            delta_image = axes[0, 1].imshow(
+                delta_array,
+                origin="lower",
+                aspect=_matrix_aspect(settings),
+                interpolation="nearest",
+                extent=(
+                    columns[0] - 0.5,
+                    columns[-1] + 0.5,
+                    rows[0] - 0.5,
+                    rows[-1] + 0.5,
+                ),
+                cmap="coolwarm",
+                vmin=-delta_limit,
+                vmax=delta_limit,
+            )
+            figure.colorbar(
+                delta_image, ax=axes[0, 1], pad=0.02,
+                label="Compensated - raw gain, mV/ke",
+            )
+            raw = pd.to_numeric(
+                comparison["nominal_gain_mv_per_ke_raw"], errors="coerce"
+            )
+            compensated = pd.to_numeric(
+                comparison["nominal_gain_mv_per_ke_compensated"], errors="coerce"
+            )
+            axes[1, 0].hist(
+                [raw.dropna(), compensated.dropna()],
+                bins="auto",
+                label=("Raw", "Spatially compensated"),
+                color=("#4e79a7", "#e15759"),
+                alpha=0.65,
+            )
+            axes[1, 0].set_xlabel("Nominal gain, mV/ke")
+            axes[1, 0].set_ylabel("Pixel count")
+            axes[1, 0].legend()
+            finite = raw.notna() & compensated.notna()
+            axes[1, 1].scatter(
+                raw[finite], compensated[finite], s=10, alpha=0.55
+            )
+            if finite.any():
+                low = float(min(raw[finite].min(), compensated[finite].min()))
+                high = float(max(raw[finite].max(), compensated[finite].max()))
+                axes[1, 1].plot([low, high], [low, high], "k--", linewidth=1)
+            axes[1, 1].set_xlabel("Raw gain, mV/ke")
+            axes[1, 1].set_ylabel("Spatially compensated gain, mV/ke")
+            for axis in axes[0, :]:
+                axis.set_xlabel("Physical column")
+                axis.set_ylabel("Physical row")
+            figure.suptitle(
+                f"Diagnostic baseline/IR-drop compensation, pattern {pattern}\n"
+                "A per-amplitude spatial plane is removed; raw gain remains primary"
+            )
+            figure.tight_layout(rect=(0, 0, 1, 0.93))
+            stem = f"nominal_gain_spatially_compensated_{_safe_stem(pattern)}"
+            outputs[stem] = _save_figure(
+                figure, plot_directory, stem, settings
+            )
+
+    if not spatial_baseline_pixel_metrics.empty:
+        summary_by_group = {
+            str(row["analysis_group"]): row
+            for _, row in spatial_baseline_summary.iterrows()
+        }
+        for group_name, data in spatial_baseline_pixel_metrics.groupby(
+            "analysis_group", sort=True
+        ):
+            summary_row = summary_by_group.get(str(group_name))
+            if summary_row is None:
+                continue
+            observed_map = _matrix_array(data, "effective_baseline_v")
+            plane_map = _matrix_array(data, "spatial_plane_v")
+            residual_map = _matrix_array(data, "detrended_residual_v")
+            if observed_map is None or plane_map is None or residual_map is None:
+                continue
+            observed, columns, rows = observed_map
+            plane = plane_map[0]
+            residual = residual_map[0]
+            finite_observed = observed[np.isfinite(observed)]
+            finite_residual = residual[np.isfinite(residual)]
+            if not len(finite_observed):
+                continue
+            color_low, color_high = np.nanpercentile(finite_observed, [2, 98])
+            if not math.isfinite(float(color_low)) or color_high <= color_low:
+                color_low, color_high = float(np.nanmin(finite_observed)), float(np.nanmax(finite_observed))
+            residual_limit = (
+                float(np.nanpercentile(np.abs(finite_residual), 98))
+                if len(finite_residual)
+                else 1e-3
+            )
+            if not math.isfinite(residual_limit) or residual_limit <= 0:
+                residual_limit = 1e-3
+            extent = (
+                columns[0] - 0.5,
+                columns[-1] + 0.5,
+                rows[0] - 0.5,
+                rows[-1] + 0.5,
+            )
+            figure, axes = plt.subplots(2, 3, figsize=(13.8, 8.2))
+            for axis, array, title in (
+                (axes[0, 0], 1000.0 * observed, "Измеренная карта"),
+                (axes[0, 1], 1000.0 * plane, "Пространственная плоскость"),
+            ):
+                image = axis.imshow(
+                    array,
+                    origin="lower",
+                    aspect=_matrix_aspect(settings),
+                    interpolation="nearest",
+                    extent=extent,
+                    cmap="viridis",
+                    vmin=1000.0 * color_low,
+                    vmax=1000.0 * color_high,
+                )
+                figure.colorbar(image, ax=axis, pad=0.02, label="Effective baseline, mV")
+                axis.set_title(title)
+                axis.set_xlabel("Physical column")
+                axis.set_ylabel("Physical row")
+            residual_image = axes[0, 2].imshow(
+                1000.0 * residual,
+                origin="lower",
+                aspect=_matrix_aspect(settings),
+                interpolation="nearest",
+                extent=extent,
+                cmap="coolwarm",
+                vmin=-1000.0 * residual_limit,
+                vmax=1000.0 * residual_limit,
+            )
+            figure.colorbar(
+                residual_image,
+                ax=axes[0, 2],
+                pad=0.02,
+                label="Detrended residual, mV",
+            )
+            axes[0, 2].set_title("Остаток после удаления градиента")
+            axes[0, 2].set_xlabel("Physical column")
+            axes[0, 2].set_ylabel("Physical row")
+
+            for coordinate, axis, label in (
+                ("row", axes[1, 0], "Physical row"),
+                ("column", axes[1, 1], "Physical column"),
+            ):
+                profile = (
+                    data.groupby(coordinate)
+                    .agg(
+                        median=("effective_baseline_v", "median"),
+                        q10=("effective_baseline_v", lambda value: value.quantile(0.10)),
+                        q90=("effective_baseline_v", lambda value: value.quantile(0.90)),
+                        plane=("spatial_plane_v", "median"),
+                    )
+                    .reset_index()
+                    .sort_values(coordinate)
+                )
+                coordinate_values = profile[coordinate].to_numpy(dtype=float)
+                axis.fill_between(
+                    coordinate_values,
+                    1000.0 * profile["q10"].to_numpy(dtype=float),
+                    1000.0 * profile["q90"].to_numpy(dtype=float),
+                    color="#4e79a7",
+                    alpha=0.18,
+                    label="10-90% pixels",
+                )
+                axis.plot(
+                    coordinate_values,
+                    1000.0 * profile["median"].to_numpy(dtype=float),
+                    marker="o",
+                    markersize=3,
+                    color="#4e79a7",
+                    label="row/column median",
+                )
+                axis.plot(
+                    coordinate_values,
+                    1000.0 * profile["plane"].to_numpy(dtype=float),
+                    color="#e15759",
+                    linewidth=1.6,
+                    label="plane model",
+                )
+                axis.set_xlabel(label)
+                axis.set_ylabel("Effective baseline, mV")
+                axis.legend()
+
+            axes[1, 2].hist(
+                1000.0 * finite_residual,
+                bins="auto",
+                color="#59a14f",
+                edgecolor="white",
+            )
+            axes[1, 2].axvline(0.0, color="black", linestyle="--", linewidth=1.0)
+            axes[1, 2].set_xlabel("Detrended residual, mV")
+            axes[1, 2].set_ylabel("Pixel count")
+            axes[1, 2].set_title("Локальная неоднородность")
+
+            source_kind = str(summary_row.get("source_kind", "unknown"))
+            source_stage = str(summary_row.get("source_stage", "unknown"))
+            pattern = str(summary_row.get("injection_pattern", "none"))
+            clock = _number(summary_row.get("measurement_fclk_mhz"))
+            step = _number(summary_row.get("injection_voltage_step_v"))
+            details = [source_stage]
+            if pattern != "none":
+                details.append(f"pattern {pattern}")
+            if math.isfinite(clock):
+                details.append(f"FCLK {clock:g} MHz")
+            if math.isfinite(step):
+                details.append(f"step {1000.0 * step:.3f} mV")
+            row_shift_mv = 1000.0 * _number(
+                summary_row.get("row_index_min_to_max_shift_v")
+            )
+            column_shift_mv = 1000.0 * _number(
+                summary_row.get("column_index_min_to_max_shift_v")
+            )
+            figure.suptitle(
+                "Spatial effective-baseline analysis: "
+                + ", ".join(details)
+                + f"\nrow min->max {row_shift_mv:+.3f} mV, "
+                + f"column min->max {column_shift_mv:+.3f} mV, "
+                + f"R2={_number(summary_row.get('plane_fit_r2')):.3f}"
+            )
+            figure.tight_layout(rect=(0, 0, 1, 0.93))
+            stem = "spatial_baseline_" + "_".join(
+                (
+                    _safe_stem(source_kind),
+                    _safe_stem(source_stage)[:70],
+                    _safe_stem(pattern),
+                    f"fclk_{clock:g}" if math.isfinite(clock) else "fclk_none",
+                )
+            )
             outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
 
     if not scurve_results.empty:
@@ -2290,7 +2619,7 @@ def generate_diagnostic_plots(
             image_delta = axes[0, 0].imshow(
                 delta_array,
                 origin="lower",
-                aspect="auto",
+                aspect=_matrix_aspect(settings),
                 interpolation="nearest",
                 extent=(columns[0] - 0.5, columns[-1] + 0.5, rows[0] - 0.5, rows[-1] + 0.5),
                 cmap="coolwarm",
@@ -2301,7 +2630,7 @@ def generate_diagnostic_plots(
             image_sigma = axes[0, 1].imshow(
                 sigma_array,
                 origin="lower",
-                aspect="auto",
+                aspect=_matrix_aspect(settings),
                 interpolation="nearest",
                 extent=(sigma_columns[0] - 0.5, sigma_columns[-1] + 0.5, sigma_rows[0] - 0.5, sigma_rows[-1] + 0.5),
                 cmap="coolwarm",

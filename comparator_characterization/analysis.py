@@ -2349,12 +2349,50 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
         r2 = 1.0 - residual / variance if variance > 0 else float("nan")
         charge = points["injection_charge_electrons"].to_numpy(dtype=float)
         gain_mv_per_ke = float("nan")
+        maximum_linear_charge = float("nan")
+        maximum_linear_step = float("nan")
+        linear_point_count = 0
         if np.all(np.isfinite(charge)) and len(np.unique(charge)) >= 3:
             charge_design = np.column_stack((charge, np.ones(len(charge))))
             charge_parameters, _, _, _ = np.linalg.lstsq(
                 charge_design, y, rcond=None
             )
             gain_mv_per_ke = float(charge_parameters[0]) * 1e6
+            # Report the largest measured prefix that remains consistent with
+            # a straight V50(Q) response. This is a threshold-scan diagnostic,
+            # not a direct observation of CSA output saturation.
+            for stop in range(3, len(points) + 1):
+                prefix_charge = charge[:stop]
+                prefix_y = y[:stop]
+                prefix_design = np.column_stack(
+                    (prefix_charge, np.ones(len(prefix_charge)))
+                )
+                prefix_parameters, _, _, _ = np.linalg.lstsq(
+                    prefix_design, prefix_y, rcond=None
+                )
+                prefix_prediction = prefix_design @ prefix_parameters
+                span = float(np.ptp(prefix_y))
+                residual_limit = max(0.002, 0.03 * span)
+                variance_prefix = float(
+                    np.sum((prefix_y - np.mean(prefix_y)) ** 2)
+                )
+                residual_prefix = float(
+                    np.sum((prefix_y - prefix_prediction) ** 2)
+                )
+                prefix_r2 = (
+                    1.0 - residual_prefix / variance_prefix
+                    if variance_prefix > 0
+                    else float("nan")
+                )
+                if (
+                    math.isfinite(prefix_r2)
+                    and prefix_r2 >= 0.98
+                    and float(np.max(np.abs(prefix_y - prefix_prediction)))
+                    <= residual_limit
+                ):
+                    maximum_linear_charge = float(prefix_charge[-1])
+                    maximum_linear_step = float(x[stop - 1])
+                    linear_point_count = int(stop)
         rows.append(
             {
                 "measurement_fclk_mhz": measurement_fclk_mhz,
@@ -2367,6 +2405,13 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
                 "nominal_gain_mv_per_ke": gain_mv_per_ke,
                 "fit_r2": r2,
                 "fit_rmse_v": float(np.sqrt(np.mean((y - predicted) ** 2))),
+                "maximum_tested_linear_charge_electrons": maximum_linear_charge,
+                "maximum_tested_linear_injection_step_v": maximum_linear_step,
+                "linear_prefix_point_count": linear_point_count,
+                "linearity_definition": (
+                    "largest_measured_low_to_high_charge_prefix_with_R2_ge_0.98_"
+                    "and_max_residual_le_max_2mV_or_3percent_span"
+                ),
                 "charge_axis_status": (
                     "nominal_from_Cinj_and_REF_LUT"
                     if math.isfinite(gain_mv_per_ke)
@@ -2375,6 +2420,476 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def fit_spatially_compensated_scurve_gain_results(
+    scurve_results: pd.DataFrame,
+    spatial_baseline_pixel_metrics: pd.DataFrame,
+    raw_gain_results: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Remove a per-amplitude spatial plane, then refit diagnostic gain.
+
+    A single static baseline subtraction cannot change the slope of V50(Q) when
+    the regression contains an intercept. Therefore the plane is estimated and
+    centered independently for every measured injected amplitude. This can
+    suppress a baseline/IR-drop-like gradient, but it can also remove a real
+    spatial gain gradient. Raw gain remains the primary result.
+    """
+
+    empty = pd.DataFrame()
+    if scurve_results.empty or spatial_baseline_pixel_metrics.empty:
+        return empty, empty, empty
+    plane = spatial_baseline_pixel_metrics[
+        spatial_baseline_pixel_metrics["source_kind"].astype(str)
+        == "scurve_v50_at_injected_step"
+    ].copy()
+    if plane.empty:
+        return empty, empty, empty
+    for column in (
+        "measurement_fclk_mhz",
+        "injection_voltage_step_v",
+        "column",
+        "row",
+        "spatial_plane_v",
+    ):
+        plane[column] = pd.to_numeric(plane[column], errors="coerce")
+    group_keys = [
+        "source_stage",
+        "measurement_fclk_mhz",
+        "injection_pattern",
+        "injection_voltage_step_v",
+    ]
+    plane["spatial_plane_center_v"] = plane.groupby(
+        group_keys, dropna=False
+    )["spatial_plane_v"].transform("median")
+    plane["spatial_plane_offset_v"] = (
+        plane["spatial_plane_v"] - plane["spatial_plane_center_v"]
+    )
+    merge_columns = group_keys + [
+        "column",
+        "row",
+        "spatial_plane_v",
+        "spatial_plane_center_v",
+        "spatial_plane_offset_v",
+        "fit_inlier",
+    ]
+    corrected = scurve_results.copy()
+    corrected["measurement_fclk_mhz"] = pd.to_numeric(
+        corrected.get("measurement_fclk_mhz", np.nan), errors="coerce"
+    )
+    corrected["injection_voltage_step_v"] = pd.to_numeric(
+        corrected.get("injection_voltage_step_v", np.nan), errors="coerce"
+    )
+    corrected = corrected.merge(
+        plane[merge_columns].rename(columns={"source_stage": "stage"}),
+        on=[
+            "stage",
+            "measurement_fclk_mhz",
+            "injection_pattern",
+            "injection_voltage_step_v",
+            "column",
+            "row",
+        ],
+        how="left",
+        validate="many_to_one",
+    )
+    corrected["v50_raw_v"] = pd.to_numeric(corrected["v50_v"], errors="coerce")
+    corrected["v50_spatially_compensated_v"] = (
+        corrected["v50_raw_v"]
+        - pd.to_numeric(corrected["spatial_plane_offset_v"], errors="coerce")
+    )
+    usable = corrected["v50_spatially_compensated_v"].notna()
+    corrected.loc[usable, "v50_v"] = corrected.loc[
+        usable, "v50_spatially_compensated_v"
+    ]
+    corrected["gain_compensation_status"] = np.where(
+        usable,
+        "diagnostic_per_amplitude_spatial_plane_removed",
+        "no_matching_spatial_plane_raw_v50_retained",
+    )
+    compensated_gain = fit_scurve_gain_results(corrected)
+    if not compensated_gain.empty:
+        compensated_gain["gain_result_kind"] = (
+            "diagnostic_spatially_compensated_per_amplitude_plane"
+        )
+    raw_gain = (
+        raw_gain_results.copy()
+        if raw_gain_results is not None and not raw_gain_results.empty
+        else fit_scurve_gain_results(scurve_results)
+    )
+    if raw_gain.empty or compensated_gain.empty:
+        comparison = empty
+    else:
+        keys = ["measurement_fclk_mhz", "injection_pattern", "column", "row"]
+        raw_columns = keys + [
+            "nominal_gain_mv_per_ke",
+            "fit_r2",
+            "fit_rmse_v",
+            "maximum_tested_linear_charge_electrons",
+        ]
+        comp_columns = list(raw_columns)
+        comparison = raw_gain[raw_columns].merge(
+            compensated_gain[comp_columns],
+            on=keys,
+            how="outer",
+            suffixes=("_raw", "_compensated"),
+            validate="one_to_one",
+        )
+        comparison["gain_delta_mv_per_ke"] = (
+            comparison["nominal_gain_mv_per_ke_compensated"]
+            - comparison["nominal_gain_mv_per_ke_raw"]
+        )
+        comparison["gain_compensation_interpretation"] = (
+            "diagnostic_only_may_remove_true_spatial_gain_gradient"
+        )
+    point_columns = [
+        column
+        for column in (
+            "stage",
+            "measurement_fclk_mhz",
+            "injection_pattern",
+            "injection_voltage_step_v",
+            "injection_charge_electrons",
+            "column",
+            "row",
+            "v50_raw_v",
+            "spatial_plane_v",
+            "spatial_plane_center_v",
+            "spatial_plane_offset_v",
+            "v50_spatially_compensated_v",
+            "fit_inlier",
+            "gain_compensation_status",
+        )
+        if column in corrected
+    ]
+    return compensated_gain, comparison, corrected[point_columns].copy()
+
+
+_SPATIAL_BASELINE_PIXEL_COLUMNS = [
+    "analysis_group",
+    "source_kind",
+    "source_stage",
+    "measurement_fclk_mhz",
+    "injection_pattern",
+    "injection_voltage_step_v",
+    "column",
+    "row",
+    "effective_baseline_v",
+    "spatial_plane_v",
+    "detrended_residual_v",
+    "fit_inlier",
+    "source_fit_quality",
+    "interpretation",
+]
+
+_SPATIAL_BASELINE_SUMMARY_COLUMNS = [
+    "analysis_group",
+    "source_kind",
+    "source_stage",
+    "measurement_fclk_mhz",
+    "injection_pattern",
+    "injection_voltage_step_v",
+    "pixel_count",
+    "fit_inlier_count",
+    "fit_inlier_fraction",
+    "effective_baseline_median_v",
+    "effective_baseline_std_v",
+    "effective_baseline_mad_v",
+    "plane_center_v",
+    "row_slope_v_per_pixel",
+    "row_slope_uncertainty_v_per_pixel",
+    "row_index_min_to_max_shift_v",
+    "row_shift_uncertainty_v",
+    "column_slope_v_per_pixel",
+    "column_slope_uncertainty_v_per_pixel",
+    "column_index_min_to_max_shift_v",
+    "column_shift_uncertainty_v",
+    "plane_peak_to_peak_v",
+    "detrended_residual_std_v",
+    "detrended_residual_mad_v",
+    "plane_fit_r2",
+    "row_profile_rank_correlation",
+    "column_profile_rank_correlation",
+    "maximum_slope_significance",
+    "gradient_to_residual_mad_ratio",
+    "dominant_axis",
+    "spatial_gradient_status",
+    "interpretation",
+]
+
+
+def _rank_correlation(values: pd.DataFrame, coordinate: str) -> float:
+    """Spearman-like rank correlation without an optional scipy dependency."""
+
+    if values.empty:
+        return float("nan")
+    profile = (
+        values.groupby(coordinate, as_index=False)["effective_baseline_v"]
+        .median()
+        .dropna()
+    )
+    if len(profile) < 3:
+        return float("nan")
+    x_rank = profile[coordinate].rank(method="average")
+    y_rank = profile["effective_baseline_v"].rank(method="average")
+    if x_rank.nunique() < 2 or y_rank.nunique() < 2:
+        return float("nan")
+    return float(x_rank.corr(y_rank))
+
+
+def _fit_spatial_baseline_group(group: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]] | None:
+    """Robustly decompose a baseline-like map into a plane and local residuals."""
+
+    data = group.copy()
+    for column in ("column", "row", "effective_baseline_v"):
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.dropna(subset=["column", "row", "effective_baseline_v"])
+    data = data.drop_duplicates(subset=["column", "row"], keep="first")
+    if len(data) < 6 or data["row"].nunique() < 2 or data["column"].nunique() < 2:
+        return None
+
+    x_center = float(data["column"].mean())
+    y_center = float(data["row"].mean())
+    design = np.column_stack(
+        (
+            np.ones(len(data)),
+            data["column"].to_numpy(dtype=float) - x_center,
+            data["row"].to_numpy(dtype=float) - y_center,
+        )
+    )
+    observed = data["effective_baseline_v"].to_numpy(dtype=float)
+    inlier = np.ones(len(data), dtype=bool)
+    parameters = np.linalg.lstsq(design, observed, rcond=None)[0]
+    for _ in range(2):
+        residual = observed - design @ parameters
+        center = float(np.median(residual[inlier]))
+        mad = float(np.median(np.abs(residual[inlier] - center)))
+        robust_sigma = 1.4826 * mad
+        if not math.isfinite(robust_sigma) or robust_sigma <= 0:
+            break
+        candidate = np.abs(residual - center) <= 4.0 * robust_sigma
+        if int(candidate.sum()) < 6 or np.array_equal(candidate, inlier):
+            inlier = candidate if int(candidate.sum()) >= 6 else inlier
+            break
+        inlier = candidate
+        parameters = np.linalg.lstsq(design[inlier], observed[inlier], rcond=None)[0]
+
+    parameters = np.linalg.lstsq(design[inlier], observed[inlier], rcond=None)[0]
+    predicted = design @ parameters
+    residual = observed - predicted
+    inlier_residual = residual[inlier]
+    variance = float(np.sum((observed[inlier] - np.mean(observed[inlier])) ** 2))
+    residual_sum = float(np.sum(inlier_residual**2))
+    r2 = 1.0 - residual_sum / variance if variance > 0 else float("nan")
+    degrees_of_freedom = int(inlier.sum()) - design.shape[1]
+    covariance = np.full((3, 3), np.nan, dtype=float)
+    if degrees_of_freedom > 0:
+        residual_variance = residual_sum / degrees_of_freedom
+        covariance = residual_variance * np.linalg.pinv(design[inlier].T @ design[inlier])
+    uncertainties = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+
+    column_min = float(data["column"].min())
+    column_max = float(data["column"].max())
+    row_min = float(data["row"].min())
+    row_max = float(data["row"].max())
+    column_span = column_max - column_min
+    row_span = row_max - row_min
+    column_shift = float(parameters[1] * column_span)
+    row_shift = float(parameters[2] * row_span)
+    corners = np.asarray(
+        [
+            parameters[0] + parameters[1] * (column - x_center) + parameters[2] * (row - y_center)
+            for column in (column_min, column_max)
+            for row in (row_min, row_max)
+        ],
+        dtype=float,
+    )
+    plane_span = float(np.ptp(corners))
+    residual_mad = float(np.median(np.abs(inlier_residual - np.median(inlier_residual))))
+    residual_std = (
+        float(np.std(inlier_residual, ddof=1)) if len(inlier_residual) > 1 else float("nan")
+    )
+    significance_values = []
+    for parameter, uncertainty in ((parameters[1], uncertainties[1]), (parameters[2], uncertainties[2])):
+        if math.isfinite(float(uncertainty)) and float(uncertainty) > 0:
+            significance_values.append(abs(float(parameter) / float(uncertainty)))
+    maximum_significance = max(significance_values, default=float("nan"))
+    robust_residual_sigma = 1.4826 * residual_mad
+    gradient_ratio = (
+        plane_span / robust_residual_sigma
+        if math.isfinite(robust_residual_sigma) and robust_residual_sigma > 0
+        else float("nan")
+    )
+    row_magnitude = abs(row_shift)
+    column_magnitude = abs(column_shift)
+    if row_magnitude > 1.5 * column_magnitude:
+        dominant_axis = "row"
+    elif column_magnitude > 1.5 * row_magnitude:
+        dominant_axis = "column"
+    else:
+        dominant_axis = "mixed"
+    if math.isfinite(maximum_significance) and maximum_significance >= 5.0 and r2 >= 0.05:
+        gradient_status = "resolved_spatial_gradient"
+    elif math.isfinite(maximum_significance) and maximum_significance >= 3.0:
+        gradient_status = "candidate_spatial_gradient"
+    else:
+        gradient_status = "not_resolved"
+
+    data["spatial_plane_v"] = predicted
+    data["detrended_residual_v"] = residual
+    data["fit_inlier"] = inlier
+    metadata = data.iloc[0]
+    interpretation = str(metadata["interpretation"])
+    summary = {
+        "analysis_group": metadata["analysis_group"],
+        "source_kind": metadata["source_kind"],
+        "source_stage": metadata["source_stage"],
+        "measurement_fclk_mhz": metadata["measurement_fclk_mhz"],
+        "injection_pattern": metadata["injection_pattern"],
+        "injection_voltage_step_v": metadata["injection_voltage_step_v"],
+        "pixel_count": int(len(data)),
+        "fit_inlier_count": int(inlier.sum()),
+        "fit_inlier_fraction": float(inlier.mean()),
+        "effective_baseline_median_v": float(np.median(observed)),
+        "effective_baseline_std_v": float(np.std(observed, ddof=1)),
+        "effective_baseline_mad_v": float(np.median(np.abs(observed - np.median(observed)))),
+        "plane_center_v": float(parameters[0]),
+        "row_slope_v_per_pixel": float(parameters[2]),
+        "row_slope_uncertainty_v_per_pixel": float(uncertainties[2]),
+        "row_index_min_to_max_shift_v": row_shift,
+        "row_shift_uncertainty_v": float(uncertainties[2] * row_span),
+        "column_slope_v_per_pixel": float(parameters[1]),
+        "column_slope_uncertainty_v_per_pixel": float(uncertainties[1]),
+        "column_index_min_to_max_shift_v": column_shift,
+        "column_shift_uncertainty_v": float(uncertainties[1] * column_span),
+        "plane_peak_to_peak_v": plane_span,
+        "detrended_residual_std_v": residual_std,
+        "detrended_residual_mad_v": residual_mad,
+        "plane_fit_r2": r2,
+        "row_profile_rank_correlation": _rank_correlation(data, "row"),
+        "column_profile_rank_correlation": _rank_correlation(data, "column"),
+        "maximum_slope_significance": maximum_significance,
+        "gradient_to_residual_mad_ratio": gradient_ratio,
+        "dominant_axis": dominant_axis,
+        "spatial_gradient_status": gradient_status,
+        "interpretation": interpretation,
+    }
+    return data[_SPATIAL_BASELINE_PIXEL_COLUMNS], summary
+
+
+def analyze_spatial_baseline(
+    noise_fits: pd.DataFrame,
+    scurve_results: pd.DataFrame,
+    scurve_gain_results: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Estimate spatial baseline-like gradients without claiming their circuit cause.
+
+    Noise centers are effective discriminator baselines and include local comparator
+    offset/trim. S-curve V50 at one charge also includes gain. A zero-charge
+    intercept from at least three amplitudes is the cleanest available estimator,
+    but remains an extrapolation of the measured V50(Q) response.
+    """
+
+    candidates: list[pd.DataFrame] = []
+    if not noise_fits.empty and "center_selected_v" in noise_fits:
+        noise = noise_fits.copy()
+        noise["effective_baseline_v"] = pd.to_numeric(
+            noise["center_selected_v"], errors="coerce"
+        )
+        noise["source_kind"] = "noise_effective_threshold"
+        noise["source_stage"] = noise.get("stage", "noise")
+        noise["measurement_fclk_mhz"] = np.nan
+        noise["injection_pattern"] = "none"
+        noise["injection_voltage_step_v"] = np.nan
+        noise["source_fit_quality"] = noise.get("fit_status", "unknown")
+        noise["interpretation"] = (
+            "Noise-center: effective discriminator baseline including comparator offset and trim"
+        )
+        candidates.append(noise)
+
+    if not scurve_results.empty and "v50_v" in scurve_results:
+        scurve = scurve_results[
+            scurve_results.get("fit_status", pd.Series(index=scurve_results.index, dtype=str))
+            .astype(str)
+            .isin(("ok", "poor_quality"))
+        ].copy()
+        if not scurve.empty:
+            scurve["effective_baseline_v"] = pd.to_numeric(scurve["v50_v"], errors="coerce")
+            scurve["source_kind"] = "scurve_v50_at_injected_step"
+            scurve["source_stage"] = scurve.get("stage", "scurve")
+            scurve["measurement_fclk_mhz"] = pd.to_numeric(
+                scurve.get("measurement_fclk_mhz", np.nan), errors="coerce"
+            )
+            scurve["injection_pattern"] = scurve.get("injection_pattern", "unknown")
+            scurve["injection_voltage_step_v"] = pd.to_numeric(
+                scurve.get("injection_voltage_step_v", np.nan), errors="coerce"
+            )
+            scurve["source_fit_quality"] = scurve.get("fit_status", "unknown")
+            scurve["interpretation"] = (
+                "Single-charge V50: effective threshold including baseline, gain and injected charge"
+            )
+            candidates.append(scurve)
+
+    if not scurve_gain_results.empty and "v50_intercept_v" in scurve_gain_results:
+        intercept = scurve_gain_results.copy()
+        intercept["fit_r2_numeric"] = pd.to_numeric(intercept.get("fit_r2"), errors="coerce")
+        intercept["point_count_numeric"] = pd.to_numeric(
+            intercept.get("amplitude_point_count"), errors="coerce"
+        )
+        intercept = intercept[
+            (intercept["fit_r2_numeric"] >= 0.8)
+            & (intercept["point_count_numeric"] >= 3)
+        ].copy()
+        if not intercept.empty:
+            intercept["effective_baseline_v"] = pd.to_numeric(
+                intercept["v50_intercept_v"], errors="coerce"
+            )
+            intercept["source_kind"] = "scurve_zero_charge_intercept"
+            intercept["source_stage"] = "v50_vs_charge_intercept"
+            intercept["measurement_fclk_mhz"] = pd.to_numeric(
+                intercept.get("measurement_fclk_mhz", np.nan), errors="coerce"
+            )
+            intercept["injection_pattern"] = intercept.get("injection_pattern", "unknown")
+            intercept["injection_voltage_step_v"] = np.nan
+            intercept["source_fit_quality"] = intercept["fit_r2_numeric"].map(
+                lambda value: f"R2={value:.6g}"
+            )
+            intercept["interpretation"] = (
+                "Zero-charge intercept of V50 versus calibrated REF step; extrapolated baseline estimator"
+            )
+            candidates.append(intercept)
+
+    if not candidates:
+        return (
+            pd.DataFrame(columns=_SPATIAL_BASELINE_PIXEL_COLUMNS),
+            pd.DataFrame(columns=_SPATIAL_BASELINE_SUMMARY_COLUMNS),
+        )
+
+    source = pd.concat(candidates, ignore_index=True, sort=False)
+    source["analysis_group"] = (
+        source["source_kind"].astype(str)
+        + "__"
+        + source["source_stage"].astype(str)
+        + "__fclk_"
+        + source["measurement_fclk_mhz"].fillna("none").astype(str)
+        + "__pattern_"
+        + source["injection_pattern"].fillna("none").astype(str)
+    )
+    pixel_tables: list[pd.DataFrame] = []
+    summaries: list[dict[str, Any]] = []
+    for _, group in source.groupby("analysis_group", sort=True, dropna=False):
+        result = _fit_spatial_baseline_group(group)
+        if result is None:
+            continue
+        pixels, summary = result
+        pixel_tables.append(pixels)
+        summaries.append(summary)
+    return (
+        pd.concat(pixel_tables, ignore_index=True)
+        if pixel_tables
+        else pd.DataFrame(columns=_SPATIAL_BASELINE_PIXEL_COLUMNS),
+        pd.DataFrame(summaries, columns=_SPATIAL_BASELINE_SUMMARY_COLUMNS),
+    )
 
 
 def analyze_saved_experiment(
@@ -2760,6 +3275,54 @@ def analyze_saved_experiment(
             analysis_dir / "measurement_clock_noise_summary.csv"
         )
 
+    spatial_baseline_pixels, spatial_baseline_summary = analyze_spatial_baseline(
+        noise_fits,
+        scurve_results,
+        scurve_gain_results,
+    )
+    store.write_table(
+        analysis_dir / "spatial_baseline_pixel_metrics.csv",
+        spatial_baseline_pixels,
+    )
+    store.write_table(
+        analysis_dir / "spatial_baseline_summary.csv",
+        spatial_baseline_summary,
+    )
+    outputs["spatial_baseline_pixel_metrics"] = (
+        analysis_dir / "spatial_baseline_pixel_metrics.csv"
+    )
+    outputs["spatial_baseline_summary"] = (
+        analysis_dir / "spatial_baseline_summary.csv"
+    )
+    (
+        scurve_gain_compensated,
+        scurve_gain_comparison,
+        scurve_v50_compensated_points,
+    ) = fit_spatially_compensated_scurve_gain_results(
+        scurve_results,
+        spatial_baseline_pixels,
+        scurve_gain_results,
+    )
+    for key, filename, table in (
+        (
+            "scurve_pixel_gain_spatially_compensated",
+            "scurve_pixel_gain_spatially_compensated.csv",
+            scurve_gain_compensated,
+        ),
+        (
+            "scurve_gain_compensation_comparison",
+            "scurve_gain_compensation_comparison.csv",
+            scurve_gain_comparison,
+        ),
+        (
+            "scurve_v50_spatially_compensated_points",
+            "scurve_v50_spatially_compensated_points.csv",
+            scurve_v50_compensated_points,
+        ),
+    ):
+        store.write_table(analysis_dir / filename, table)
+        outputs[key] = analysis_dir / filename
+
     if generate_plots:
         from .plots import generate_diagnostic_plots
 
@@ -2777,6 +3340,10 @@ def analyze_saved_experiment(
             crosstalk_summary=crosstalk_summary,
             measurement_clock_pixel_metrics=measurement_clock_pixels,
             measurement_clock_summary=measurement_clock_summary,
+            spatial_baseline_pixel_metrics=spatial_baseline_pixels,
+            spatial_baseline_summary=spatial_baseline_summary,
+            scurve_gain_compensated=scurve_gain_compensated,
+            scurve_gain_comparison=scurve_gain_comparison,
             target_voltage=selected_target,
             settings=selected_settings,
         )
@@ -2802,6 +3369,9 @@ def analyze_saved_experiment(
         scurve_transition_precision=scurve_transition_precision,
         crosstalk_summary=crosstalk_summary,
         measurement_clock_summary=measurement_clock_summary,
+        spatial_baseline_summary=spatial_baseline_summary,
+        scurve_gain_compensated=scurve_gain_compensated,
+        scurve_gain_comparison=scurve_gain_comparison,
         target_voltage=selected_target,
     )
 
@@ -2868,10 +3438,15 @@ def analyze_saved_noise_statistics(
     fits = fit_noise_statistics(statistics, settings=selected_settings)
     trim_data = uniform_trim_characterization(fits)
     trim_summary = summarize_uniform_trim_characterization(trim_data)
+    spatial_baseline_pixels, spatial_baseline_summary = analyze_spatial_baseline(
+        fits, pd.DataFrame(), pd.DataFrame()
+    )
     outputs: dict[str, Any] = {"analysis_directory": directory}
     for stem, table in (
         ("noise_statistics", statistics), ("noise_fit_results", fits),
         ("uniform_trim_characterization", trim_data), ("uniform_trim_summary", trim_summary),
+        ("spatial_baseline_pixel_metrics", spatial_baseline_pixels),
+        ("spatial_baseline_summary", spatial_baseline_summary),
     ):
         outputs[stem] = atomic_write_table(directory / f"{stem}.csv", table)
     outputs.update(save_noise_recommendations(
@@ -2905,6 +3480,8 @@ def analyze_saved_noise_statistics(
             crosstalk_pixel_metrics=pd.DataFrame(), crosstalk_summary=pd.DataFrame(),
             measurement_clock_pixel_metrics=pd.DataFrame(),
             measurement_clock_summary=pd.DataFrame(),
+            spatial_baseline_pixel_metrics=spatial_baseline_pixels,
+            spatial_baseline_summary=spatial_baseline_summary,
             target_voltage=target_voltage, settings=selected_settings,
         )
         outputs["plots"].update(generate_recommendation_plots(directory, selected_settings))
@@ -2933,6 +3510,7 @@ def analyze_saved_noise_statistics(
         scurve_transition_precision=pd.DataFrame(),
         crosstalk_summary=pd.DataFrame(),
         measurement_clock_summary=pd.DataFrame(),
+        spatial_baseline_summary=spatial_baseline_summary,
         target_voltage=target_voltage,
     )
     atomic_write_json(directory / "analysis_manifest.json", {
