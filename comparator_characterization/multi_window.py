@@ -20,7 +20,7 @@ from .calibration import (
     ThresholdDacCalibration,
     load_reference_dac_calibrations,
     load_threshold_dac_calibrations,
-    select_reference_dac_pairs,
+    plan_reference_dac_pairs,
 )
 from .hardware import (
     KeysightBurstSettings,
@@ -39,6 +39,7 @@ from .models import (
     resolve_pixels,
 )
 from .pixel_masks import BadPixelMapInput, normalize_bad_pixel_map
+from .plot_language import localize_figure
 from .storage import (
     ExperimentStore,
     atomic_write_json,
@@ -205,6 +206,7 @@ def _save_figure(
     stem: str,
     settings: AnalysisSettings,
 ) -> list[Path]:
+    localize_figure(figure, settings.plot_language, settings.square_physical_pixels)
     directory.mkdir(parents=True, exist_ok=True)
     paths = [directory / f"{stem}.png"]
     figure.savefig(paths[0], dpi=settings.plot_dpi, bbox_inches="tight")
@@ -269,6 +271,13 @@ def _choose_one_condition(frame: pd.DataFrame) -> pd.DataFrame:
     return selected
 
 
+def _read_analysis_table(path):
+    try:
+        return pd.read_csv(path) if Path(path).exists() else pd.DataFrame()
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
 def _extract_window_metrics(
     window: str,
     experiment: Path,
@@ -277,12 +286,12 @@ def _extract_window_metrics(
     good_fit_r2: float,
 ) -> pd.DataFrame:
     gain = _choose_one_condition(
-        pd.read_csv(analysis / "scurve_pixel_gain_results.csv")
+        _read_analysis_table(analysis / "scurve_pixel_gain_results.csv")
         if (analysis / "scurve_pixel_gain_results.csv").exists()
         else pd.DataFrame()
     )
     compensated = _choose_one_condition(
-        pd.read_csv(analysis / "scurve_pixel_gain_spatially_compensated.csv")
+        _read_analysis_table(analysis / "scurve_pixel_gain_spatially_compensated.csv")
         if (analysis / "scurve_pixel_gain_spatially_compensated.csv").exists()
         else pd.DataFrame()
     )
@@ -413,7 +422,9 @@ def _combine_window_metrics(metrics: Mapping[str, pd.DataFrame], settings: AllWi
     complete = z.dropna()
     loading_rows: list[dict[str, Any]] = []
     if len(complete) >= 3:
-        standardized = complete.to_numpy(dtype=float)
+        # pandas/NumPy may expose a read-only view. PCA centering is local and
+        # must never attempt to mutate the DataFrame-backed buffer in place.
+        standardized = complete.to_numpy(dtype=float, copy=True)
         standardized -= standardized.mean(axis=0, keepdims=True)
         _, singular, vt = np.linalg.svd(standardized, full_matrices=False)
         variance = singular ** 2
@@ -627,27 +638,57 @@ def _plot_multi_window(
     else:
         plt.close(figure)
 
-    if all(f"trim_fit_{window}" in pixels for window in _WINDOWS):
+    for method in ("fit", "centroid", "maximum"):
+        if not all(f"trim_{method}_{window}" in pixels for window in _WINDOWS):
+            continue
         figure, axes = plt.subplots(1, 3, figsize=(12.7, 4.0))
         image = None
         for axis, window in zip(axes, _WINDOWS):
-            item = _matrix(pixels, f"trim_fit_{window}")
+            item = _matrix(pixels, f"trim_{method}_{window}")
             if item is None:
                 axis.set_axis_off()
                 continue
             image = axis.imshow(
-                item[0], origin="lower", aspect=_aspect(settings), interpolation="nearest",
-                extent=extent, cmap="viridis", vmin=0, vmax=31,
+                item[0], origin="lower", aspect=_aspect(settings),
+                interpolation="nearest", extent=extent, cmap="viridis",
+                vmin=0, vmax=31,
             )
-            axis.set_title(f"{window}: fit trim")
+            axis.set_title(f"{window}: {method} trim")
             axis.set_xlabel("Physical column")
             axis.set_ylabel("Physical row")
         if image is not None:
             figure.colorbar(image, ax=list(axes), pad=0.02, label="Trim code")
-        figure.suptitle("Recommended comparator trims in the same physical pixels")
-        outputs["three_window_trim_maps_fit"] = _save_figure(
-            figure, directory, "three_window_trim_maps_fit", settings
+        figure.suptitle(
+            f"Recommended comparator trims in the same physical pixels, {method}"
         )
+        stem = f"three_window_trim_maps_{method}"
+        outputs[stem] = _save_figure(figure, directory, stem, settings)
+
+        figure, axis = plt.subplots(figsize=(7.2, 4.4))
+        plotted_trim = False
+        bins = np.arange(-0.5, 32.5, 1.0)
+        for window in _WINDOWS:
+            values = pd.to_numeric(
+                pixels[f"trim_{method}_{window}"], errors="coerce"
+            ).dropna()
+            if values.empty:
+                continue
+            axis.hist(
+                values, bins=bins, histtype="step", linewidth=1.5,
+                label=window,
+            )
+            plotted_trim = True
+        if plotted_trim:
+            axis.set_xlabel("Selected local trim code")
+            axis.set_ylabel("Pixel count")
+            axis.set_title(f"AB/BC/CD trim distributions, {method}")
+            axis.legend()
+            distribution_stem = f"three_window_trim_distributions_{method}"
+            outputs[distribution_stem] = _save_figure(
+                figure, directory, distribution_stem, settings
+            )
+        else:
+            plt.close(figure)
 
     class_codes = {
         "within_population": 0,
@@ -1331,6 +1372,9 @@ def analyze_all_windows(
         if generate_plots
         else {}
     )
+    if generate_plots:
+        from .pixel_comparison_plots import plot_window_pixels
+        plots.update(plot_window_pixels(analysis_paths, directory=analysis / "plots/pixels", settings=selected))
     report = _multi_window_report(
         analysis, pixels, correlations, pca, joint_pixels, joint_summary,
         window_paths,
@@ -1369,8 +1413,8 @@ def _baseline_and_high_anchor(
         analysis = Path(window_results[window].analysis_path)
         gain_path = analysis / "scurve_pixel_gain_results.csv"
         scurve_path = analysis / "scurve_results.csv"
-        gain = _choose_one_condition(pd.read_csv(gain_path)) if gain_path.exists() else pd.DataFrame()
-        scurve = _choose_one_condition(pd.read_csv(scurve_path)) if scurve_path.exists() else pd.DataFrame()
+        gain = _choose_one_condition(_read_analysis_table(gain_path)) if gain_path.exists() else pd.DataFrame()
+        scurve = _choose_one_condition(_read_analysis_table(scurve_path)) if scurve_path.exists() else pd.DataFrame()
         baseline = float("nan")
         if not gain.empty:
             good = gain[
@@ -1509,11 +1553,6 @@ def _acquire_joint_ref_sweep(
     required = {"DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D"}
     if required - set(calibrations):
         raise ValueError("final ALL REF sweep requires all four threshold DAC LUTs")
-    low, high, anchors = _baseline_and_high_anchor(
-        window_results,
-        good_fit_r2=all_settings.good_fit_r2,
-    )
-    threshold_codes, threshold_records = _select_fixed_thresholds(calibrations, low, high)
     desired = np.linspace(
         float(min(injection_voltage_steps_v)),
         float(max(injection_voltage_steps_v)),
@@ -1522,13 +1561,37 @@ def _acquire_joint_ref_sweep(
     reference = load_reference_dac_calibrations(
         reference_calibration_files, voltage_unit=reference_calibration_voltage_unit
     )
-    selections = select_reference_dac_pairs(
-        reference["DAC_TST_REF1"], reference["DAC_TST_REF2"], desired,
+    reference_plan = plan_reference_dac_pairs(
+        reference["DAC_TST_REF1"], reference["DAC_TST_REF2"], np.unique(desired),
         minimum_reference_code=settings.scurve.minimum_reference_code,
         maximum_reference_code=settings.scurve.maximum_reference_code,
         minimum_reference_voltage_v=settings.scurve.minimum_reference_voltage_v,
         maximum_reference_step_error_v=settings.scurve.maximum_reference_step_error_v,
     )
+    availability_path = parent.root / "inputs" / "joint_ref_step_availability.csv"
+    atomic_write_table(
+        availability_path, pd.DataFrame(reference_plan.availability)
+    )
+    selections = reference_plan.selections
+    unavailable = [
+        float(row["requested_voltage_step_v"])
+        for row in reference_plan.availability
+        if not bool(row["realizable"])
+    ]
+    parent.log_status(
+        "ALL final REF preflight: доступны "
+        f"{len(selections)}/{len(reference_plan.availability)} ступенек; "
+        "доступные, мВ: "
+        + ", ".join(
+            f"{1000.0 * selection.requested_voltage_step_v:g}"
+            for selection in selections
+        )
+    )
+    if unavailable:
+        parent.log_status(
+            "ALL final REF preflight: исключены недостижимые ступеньки, мВ: "
+            + ", ".join(f"{1000.0 * value:g}" for value in unavailable)
+        )
     amplitudes = []
     seen_codes = set()
     for selection in selections:
@@ -1539,7 +1602,33 @@ def _acquire_joint_ref_sweep(
         seen_codes.add(key)
         amplitudes.append(amplitude)
     if len(amplitudes) < 2:
-        raise RuntimeError("REF LUT resolution produced fewer than two distinct final steps")
+        parent.update_metadata(
+            joint_ref_sweep={
+                "status": "skipped_insufficient_realizable_ref_steps",
+                "requested_ref_step_count": all_settings.final_ref_step_count,
+                "realizable_ref_step_count": len(amplitudes),
+                "availability_csv": availability_path.relative_to(
+                    parent.root
+                ).as_posix(),
+                "reason": (
+                    "fewer than two distinct REF pairs remain within bounds, "
+                    "tolerance and V_REF1 > V_REF2"
+                ),
+            }
+        )
+        parent.log_status(
+            "ALL final REF sweep пропущен: доступно меньше двух различных "
+            "ступенек. Анализ отдельных окон продолжен."
+        )
+        return
+    try:
+        low, high, anchors = _baseline_and_high_anchor(
+            window_results, good_fit_r2=all_settings.good_fit_r2)
+    except RuntimeError as error:
+        parent.update_metadata(joint_ref_sweep={"status": "skipped_missing_valid_anchors", "reason": str(error)})
+        parent.log_status(f"ALL final REF sweep пропущен: {error}")
+        return
+    threshold_codes, threshold_records = _select_fixed_thresholds(calibrations, low, high)
     requested_pixels = resolve_pixels(pixels, OWNED_COLUMNS)
     bad = normalize_bad_pixel_map(bad_pixel_map)
     selected_pixels = tuple(pixel for pixel in requested_pixels if pixel not in bad)
@@ -1579,6 +1668,9 @@ def _acquire_joint_ref_sweep(
         "threshold_spacing": "equal_physical_voltage_intervals",
         "DAC_CMP_A_policy": "explicit_code_1023_with_physical_order_validation",
         "requested_ref_step_count": all_settings.final_ref_step_count,
+        "realizable_requested_ref_step_count": len(selections),
+        "unavailable_requested_ref_steps_v": unavailable,
+        "availability_csv": availability_path.relative_to(parent.root).as_posix(),
         "distinct_ref_step_count": len(amplitudes),
         "repeats_per_charge": all_settings.final_ref_repeats,
         "paired_background": True,
@@ -1596,7 +1688,9 @@ def _acquire_joint_ref_sweep(
         for group in groups:
             backend.program_scurve_pixel_configuration(
                 selected_pixels, gain_map=normalized_gain,
-                active_injection_pixels=group.active_pixels, commit=True,
+                active_injection_pixels=group.active_pixels,
+                tile_mode=settings.scurve.tile_mode,
+                commit=True,
             )
             active = set(group.active_pixels) - set(bad)
             for amplitude_index, amplitude in enumerate(amplitudes):
@@ -1706,6 +1800,74 @@ def characterize_all_windows(
     window_results: dict[str, CharacterizationResult] = {}
     records = _window_records(parent)
     completed: list[str] = []
+    if (
+        run_scurve
+        and selected_all.final_ref_sweep_enabled
+        and kwargs.get("reference_calibration_files") is not None
+        and kwargs.get("injection_voltage_steps_v") is not None
+    ):
+        requested_steps = tuple(
+            float(value) for value in kwargs["injection_voltage_steps_v"]
+        )
+        desired = np.linspace(
+            min(requested_steps),
+            max(requested_steps),
+            selected_all.final_ref_step_count,
+        )
+        reference = load_reference_dac_calibrations(
+            kwargs["reference_calibration_files"],
+            voltage_unit=kwargs.get("reference_calibration_voltage_unit", "auto"),
+        )
+        preflight_plan = plan_reference_dac_pairs(
+            reference["DAC_TST_REF1"],
+            reference["DAC_TST_REF2"],
+            np.unique(desired),
+            minimum_reference_code=settings.scurve.minimum_reference_code,
+            maximum_reference_code=settings.scurve.maximum_reference_code,
+            minimum_reference_voltage_v=settings.scurve.minimum_reference_voltage_v,
+            maximum_reference_step_error_v=(
+                settings.scurve.maximum_reference_step_error_v
+            ),
+        )
+        preflight_path = (
+            parent.root / "inputs" / "joint_ref_step_availability_preflight.csv"
+        )
+        atomic_write_table(
+            preflight_path, pd.DataFrame(preflight_plan.availability)
+        )
+        preflight_unavailable = [
+            float(row["requested_voltage_step_v"])
+            for row in preflight_plan.availability
+            if not bool(row["realizable"])
+        ]
+        parent.update_metadata(
+            joint_ref_preflight={
+                "requested_count": len(preflight_plan.availability),
+                "realizable_count": len(preflight_plan.selections),
+                "unavailable_count": len(preflight_unavailable),
+                "availability_csv": preflight_path.relative_to(
+                    parent.root
+                ).as_posix(),
+                "selected_ref1_code": preflight_plan.selected_ref1_code,
+                "selected_ref1_voltage_v": (
+                    preflight_plan.selected_ref1_voltage_v
+                ),
+            }
+        )
+        parent.log_status(
+            "ALL REF preflight до измерений: доступны "
+            f"{len(preflight_plan.selections)}/{len(preflight_plan.availability)} "
+            "ступенек финального sweep"
+        )
+        parent.log_status("ALL REF preflight: доступные ступеньки, мВ: " + ", ".join(
+            f"{1000.0 * item.requested_voltage_step_v:g}" for item in preflight_plan.selections))
+        if preflight_unavailable:
+            parent.log_status(
+                "ALL REF preflight: недостижимые ступеньки будут исключены, мВ: "
+                + ", ".join(
+                    f"{1000.0 * value:g}" for value in preflight_unavailable
+                )
+            )
     try:
         for window in _WINDOWS:
             record = records.get(window)
@@ -1730,7 +1892,18 @@ def characterize_all_windows(
                     parent.log_status(
                         f"ALL: найден незавершенный эксперимент окна {window}: {child_resume}"
                     )
-            if run_noise:
+            same_noise_and_scurve_exposure = bool(
+                run_scurve
+                and settings.noise.shutter_duration_s is not None
+                and settings.scurve.shutter_duration_s is not None
+                and math.isclose(
+                    float(settings.noise.shutter_duration_s),
+                    float(settings.scurve.shutter_duration_s),
+                    rel_tol=1e-9,
+                    abs_tol=1e-12,
+                )
+            )
+            if run_noise and not same_noise_and_scurve_exposure:
                 change = AllWindowExposureChange(
                     parent_experiment_path=parent.root,
                     next_window=window,
@@ -1743,6 +1916,11 @@ def characterize_all_windows(
                 )
                 (before_window or interactive_all_window_noise_pause)(change)
                 parent.update_metadata(status="in_progress")
+            elif run_noise:
+                parent.log_status(
+                    f"ALL: окно {window}, noise и S-curve используют одинаковую "
+                    "экспозицию; ручное подтверждение не требуется"
+                )
             child_kwargs = dict(kwargs)
             child_kwargs["window"] = window
             child_kwargs["results_root"] = parent.root / "windows"
@@ -1761,7 +1939,15 @@ def characterize_all_windows(
             }
             parent.update_metadata(window_runs=records)
             parent.log_status(f"ALL: окно {window} завершено ({len(completed)}/3)")
-        if run_scurve and selected_all.final_ref_sweep_enabled:
+        joint_already_complete = (
+            parent.metadata.get("joint_ref_sweep", {}).get("status") == "complete"
+        )
+        if run_scurve and selected_all.final_ref_sweep_enabled and joint_already_complete:
+            parent.log_status(
+                "ALL: финальный REF sweep уже полностью сохранен, повторная "
+                "аппаратная съемка пропущена"
+            )
+        elif run_scurve and selected_all.final_ref_sweep_enabled:
             joint_executor = kwargs.get("shot_executor")
             if joint_executor is None and kwargs.get("keysight_generator") is not None:
                 joint_executor = KeysightBurstShotExecutor(

@@ -1298,6 +1298,7 @@ class MGPDMeasurementBackend:
         *,
         gain_map: Mapping[tuple[int, int], int],
         active_injection_pixels: Sequence[tuple[int, int]],
+        tile_mode: str = "tile_measurement",
         commit: bool = True,
     ) -> list[dict[str, Any]]:
         """Apply GAIN and documented test fields while preserving all trims."""
@@ -1309,6 +1310,11 @@ class MGPDMeasurementBackend:
             raise ValueError(
                 f"active injection pixel Col={coordinate[0]} Row={coordinate[1]} "
                 "is outside the selected pixel set"
+            )
+        normalized_tile_mode = str(tile_mode).strip().lower()
+        if normalized_tile_mode not in {"tile_measurement", "tile_crosstalk"}:
+            raise ValueError(
+                "tile_mode must be tile_measurement or tile_crosstalk"
             )
         active = set(active_injection_pixels) - set(self.bad_pixels)
         staged: dict[tuple[int, int], int] = {}
@@ -1323,11 +1329,15 @@ class MGPDMeasurementBackend:
             if not 0 <= gain <= 31:
                 raise ValueError(f"GAIN at Col={column} Row={row} is outside 0..31")
             fields = PIXEL_CODEC.unpack(self._current_pixel_configs[coordinate])
+            count_enabled = (
+                coordinate in active
+                or normalized_tile_mode == "tile_crosstalk"
+            ) and coordinate not in self.bad_pixels
             fields.update(
                 {
                     "PX_GAIN": gain,
                     "PX_SHT": 2,
-                    "PX_MASK": int(coordinate not in self.bad_pixels),
+                    "PX_MASK": int(count_enabled),
                     "PX_SH_EN": 0,
                     "PX_TST_EN": int(coordinate in active),
                     "PX_BUF_NEN": 1,
@@ -1340,6 +1350,10 @@ class MGPDMeasurementBackend:
                     "column": column,
                     "row": row,
                     "active_injection_pixel": coordinate in active,
+                    "tile_mode": normalized_tile_mode,
+                    "inactive_pixel_count_enabled": bool(
+                        coordinate not in active and count_enabled
+                    ),
                     "raw_pixel_config_hex": f"0x{raw:08X}",
                     **fields,
                 }

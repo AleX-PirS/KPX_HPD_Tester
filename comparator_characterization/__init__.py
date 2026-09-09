@@ -13,11 +13,13 @@ from .analysis import (
 )
 from .calibration import (
     ReferenceDacCalibration,
+    ReferencePairPlan,
     ReferencePairSelection,
     ThresholdDacCalibration,
     load_reference_dac_calibrations,
     load_threshold_dac_calibrations,
     select_reference_dac_pairs,
+    plan_reference_dac_pairs,
 )
 from .hardware import (
     CallableShotExecutor,
@@ -100,6 +102,7 @@ __all__ = [
     "MGPDMeasurementBackend",
     "NoiseScanSettings",
     "ReferenceDacCalibration",
+    "ReferencePairPlan",
     "ReferencePairSelection",
     "ReferenceStepVerificationError",
     "ReferenceStepVerificationResult",
@@ -133,5 +136,6 @@ __all__ = [
     "resolve_gain_map",
     "normalize_bad_pixel_map",
     "select_reference_dac_pairs",
+    "plan_reference_dac_pairs",
     "verify_reference_steps",
 ]

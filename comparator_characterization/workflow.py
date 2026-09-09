@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict, dataclass
 import json
+import logging
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -27,7 +29,7 @@ from .calibration import (
     ThresholdDacCalibration,
     load_reference_dac_calibrations,
     load_threshold_dac_calibrations,
-    select_reference_dac_pairs,
+    plan_reference_dac_pairs,
 )
 from .hardware import (
     KeysightBurstGenerator,
@@ -70,6 +72,9 @@ from .models import (
 from .storage import ExperimentStore, file_sha256, utc_now_text
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class CharacterizationResult:
     experiment_path: Path
@@ -110,6 +115,14 @@ def interactive_exposure_pause(change: ManualExposureChange) -> None:
             "требуется подтверждение ручной смены экспозиции УПО; для "
             "неинтерактивного запуска передайте callback before_scurve"
         ) from error
+
+
+def _same_exposure(first: float | None, second: float | None) -> bool:
+    """True only when both recorded UPO exposure values are effectively equal."""
+
+    if first is None or second is None:
+        return False
+    return math.isclose(float(first), float(second), rel_tol=1e-9, abs_tol=1e-12)
 
 
 def _project_revision(project_root: Path) -> dict[str, Any]:
@@ -164,6 +177,12 @@ _RESUME_DEFAULT_MIGRATION_PATHS: tuple[tuple[str, ...], ...] = (
     ("noise", "empty_matrix_repeats_to_skip_remaining"),
     ("scurve", "coarse_baseline_noise_consecutive_codes"),
     ("scurve", "reference_common_mode_step_error_slack_v"),
+    ("scurve", "sparse_background_interval_codes"),
+    ("scurve", "transition_repeat_low_fraction"),
+    ("scurve", "transition_repeat_high_fraction"),
+    ("scurve", "weak_signal_dense_scan_below_v"),
+    ("scurve", "signal_detection_fraction_of_n"),
+    ("scurve", "signal_detection_pixel_fraction"),
     ("analysis", "infer_upo_pwm_plateau_denominator"),
     ("analysis", "scurve_plateau_min_codes"),
     ("analysis", "scurve_fit_core_low_fraction"),
@@ -177,7 +196,76 @@ _RESUME_DEFAULT_MIGRATION_PATHS: tuple[tuple[str, ...], ...] = (
 
 def _backfill_new_resume_defaults(
     stored: dict[str, Any], requested: Mapping[str, Any]
-) -> None:
+) -> tuple[dict[str, Any], ...]:
+    """Interpret fields absent from older metadata without hiding real changes.
+
+    Frameworks through 0.16 only supported paired backgrounds, acquired every
+    configured repeat and left non-injected tile pixels count-enabled.  Those
+    three facts are reconstructed explicitly.  For an ``all`` injection group
+    the tile policy is physically irrelevant, so the requested value is safe.
+    Remaining newly recorded thresholds are copied from the request and still
+    participate in the strict document comparison below.
+    """
+
+    migrations: list[dict[str, Any]] = []
+
+    def assign(path: tuple[str, ...], value: Any, source: str) -> None:
+        cursor: dict[str, Any] = stored
+        for name in path[:-1]:
+            child = cursor.get(name)
+            if child is None:
+                child = {}
+                cursor[name] = child
+            if not isinstance(child, dict):
+                return
+            cursor = child
+        leaf = path[-1]
+        if leaf in cursor:
+            return
+        cursor[leaf] = copy.deepcopy(value)
+        migrations.append(
+            {"path": ".".join(path), "value": copy.deepcopy(value), "source": source}
+        )
+
+    stored_scurve = stored.get("scurve")
+    requested_scurve = requested.get("scurve")
+    if isinstance(stored_scurve, dict) and isinstance(requested_scurve, Mapping):
+        if "background_mode" not in stored_scurve:
+            paired = stored_scurve.get("paired_background")
+            mode = (
+                "paired"
+                if bool(paired)
+                else str(requested_scurve.get("background_mode", "sparse"))
+            )
+            assign(
+                ("scurve", "background_mode"),
+                mode,
+                "legacy paired_background compatibility",
+            )
+        assign(
+            ("scurve", "adaptive_repeats"),
+            False,
+            "legacy full-repeat acquisition compatibility",
+        )
+        legacy_patterns = tuple(
+            str(value).strip().lower()
+            for value in stored_scurve.get("injection_patterns", ())
+        )
+        legacy_tile_mode = (
+            requested_scurve.get("tile_mode", "tile_measurement")
+            if set(legacy_patterns).issubset({"all"})
+            else "tile_crosstalk"
+        )
+        assign(
+            ("scurve", "tile_mode"),
+            legacy_tile_mode,
+            (
+                "tile policy is physically equivalent for pattern all"
+                if set(legacy_patterns).issubset({"all"})
+                else "legacy inactive tile pixels used MASK=1 and TST_EN=0"
+            ),
+        )
+
     for path in _RESUME_DEFAULT_MIGRATION_PATHS:
         stored_cursor: dict[str, Any] = stored
         requested_cursor: Mapping[str, Any] = requested
@@ -196,7 +284,8 @@ def _backfill_new_resume_defaults(
         else:
             leaf = path[-1]
             if leaf not in stored_cursor and leaf in requested_cursor:
-                stored_cursor[leaf] = copy.deepcopy(requested_cursor[leaf])
+                assign(path, requested_cursor[leaf], "field absent from older metadata")
+    return tuple(migrations)
 
 
 def _validate_resume_inputs(
@@ -210,13 +299,13 @@ def _validate_resume_inputs(
     base_configs: Mapping[tuple[int, int], int],
     pixels: Sequence[tuple[int, int]],
     bad_pixels: Sequence[tuple[int, int]] = (),
-) -> None:
+) -> tuple[dict[str, Any], ...]:
     stored_bad_pixels = normalize_bad_pixel_map(store.metadata.get("bad_pixel_mask"))
     if set(stored_bad_pixels) != set(bad_pixels):
         raise ValueError("resume bad_pixel_map differs; start a new physical experiment")
     stored_settings = copy.deepcopy(store.metadata.get("settings", {}))
     requested_settings = settings.to_dict()
-    _backfill_new_resume_defaults(stored_settings, requested_settings)
+    migrations = _backfill_new_resume_defaults(stored_settings, requested_settings)
     # Analysis and plotting settings never alter physical acquisition. They may
     # therefore change between framework versions without blocking a hardware
     # resume; every completed analysis records its own settings separately.
@@ -229,6 +318,23 @@ def _validate_resume_inputs(
         if isinstance(noise_document, dict):
             noise_document.pop("stop_after_consecutive_empty_codes", None)
     if _normalized_document(stored_settings) != _normalized_document(requested_settings):
+        migrated_paths = {str(item["path"]) for item in migrations}
+        legacy_strategy = {
+            "scurve.background_mode",
+            "scurve.adaptive_repeats",
+            "scurve.tile_mode",
+        } & migrated_paths
+        if legacy_strategy:
+            expected = stored_settings.get("scurve", {})
+            raise ValueError(
+                "resume старой S-кривой требует сохранить ее стратегию: "
+                f"SCURVE_BACKGROUND_MODE={expected.get('background_mode')!r}, "
+                f"SCURVE_ADAPTIVE_REPEATS={expected.get('adaptive_repeats')!r}, "
+                f"SCURVE_TILE_MODE={expected.get('tile_mode')!r}. "
+                "Измените эти три значения в characterization_config.py либо "
+                "начните новый физический эксперимент; старые данные доступны "
+                "для offline-анализа."
+            )
         raise ValueError(
             "resume settings differ from metadata; re-analyze offline for analysis-only changes "
             "or start a new physical experiment"
@@ -285,6 +391,7 @@ def _validate_resume_inputs(
                 f"resume base pixel configuration differs at Col={coordinate[0]} "
                 f"Row={coordinate[1]}"
             )
+    return migrations
 
 
 def _save_calibrations(
@@ -431,6 +538,101 @@ def _load_and_freeze_noise_reference(
         }
     )
     return statistics, trim_map
+
+
+def _window_trim_reference_path(
+    reference_path: str | Path,
+    spec_name: str,
+) -> Path:
+    """Resolve either a single-window experiment or its child in an ALL run."""
+
+    reference = ExperimentStore(reference_path)
+    reference_window = str(reference.metadata.get("window", "")).upper()
+    if reference_window == spec_name:
+        return reference.root
+    if reference_window != "ALL":
+        raise ValueError("trim-reference window does not match the requested window")
+    record = reference.metadata.get("window_runs", {}).get(spec_name)
+    if not isinstance(record, Mapping) or not record.get("experiment_path"):
+        raise ValueError(
+            f"trim-reference ALL experiment has no child window {spec_name}"
+        )
+    child = Path(str(record["experiment_path"]))
+    if not child.is_absolute():
+        child = reference.root / child
+    child_store = ExperimentStore(child)
+    if str(child_store.metadata.get("window", "")).upper() != spec_name:
+        raise ValueError("resolved trim-reference child has the wrong window")
+    return child_store.root
+
+
+def _read_trim_reference(reference_path, window, pixels):
+    source = ExperimentStore(_window_trim_reference_path(reference_path, window))
+    relative = source.metadata.get("final_trim_map")
+    if not relative:
+        raise ValueError("trim reference has no final_trim_map")
+    path = source.root / relative
+    frame = pd.read_csv(path)
+    column = "trim_code" if "trim_code" in frame else "selected_trim_code"
+    required = ["column", "row", column]
+    if not set(required).issubset(frame):
+        raise ValueError("trim map must contain column, row and trim_code")
+    numeric = frame[required].apply(pd.to_numeric, errors="coerce")
+    if not np.isfinite(numeric).all().all() or not np.equal(numeric, np.floor(numeric)).all().all():
+        raise ValueError("trim coordinates and codes must be finite integers")
+    if numeric.duplicated(["column", "row"]).any() or not numeric[column].between(0,31).all():
+        raise ValueError("trim map contains duplicate pixels or codes outside 0..31")
+    mapping = {(int(row["column"]),int(row["row"])):int(row[column]) for _,row in numeric.iterrows()}
+    if set(pixels)-set(mapping):
+        raise ValueError("trim map does not cover every requested pixel")
+    return source, path, {p:mapping[p] for p in pixels}
+
+
+def _load_and_freeze_trim_reference(
+    reference_path: str | Path,
+    *,
+    destination_store: ExperimentStore,
+    spec_name: str,
+    threshold_dac: str,
+    calibration: ThresholdDacCalibration,
+    pixels: Sequence[tuple[int, int]],
+) -> dict[tuple[int, int], int]:
+    """Copy only a final trim map, never noise counts or noise statistics."""
+
+    resolved = _window_trim_reference_path(reference_path, spec_name)
+    reference = ExperimentStore(resolved)
+    _, _, trim_map = _read_trim_reference(resolved, spec_name, pixels)
+    current_digest = calibration.to_metadata()["curve_sha256"]
+    directory = destination_store.root / "inputs" / "trim_reference"
+    table_path = directory / "final_trim_map.csv"
+    destination_store.write_table(
+        table_path,
+        pd.DataFrame(
+            [
+                {"column": column, "row": row, "trim_code": trim}
+                for (column, row), trim in trim_map.items()
+            ]
+        ),
+    )
+    metadata_copy = destination_store.copy_input_file(
+        reference.metadata_path, "inputs/trim_reference"
+    )
+    destination_store.update_metadata(
+        trim_reference={
+            "source_experiment_path": str(reference.root),
+            "source_experiment_id": reference.metadata.get("experiment_id"),
+            "source_window": spec_name,
+            "source_metadata_copy": metadata_copy["experiment_copy"],
+            "source_metadata_sha256": metadata_copy["sha256"],
+            "final_trim_map_copy": table_path.relative_to(
+                destination_store.root
+            ).as_posix(),
+            "threshold_dac_curve_sha256": current_digest,
+            "noise_counts_imported": False,
+            "noise_statistics_imported": False,
+        }
+    )
+    return trim_map
 
 
 def _verification_codes(
@@ -683,7 +885,8 @@ def _scurve_transition_brackets(
         for index in range(len(codes) - 1):
             left_code = int(codes[index])
             right_code = int(codes[index + 1])
-            # Do not bridge a DAC code whose paired background was rejected.
+            # Do not bridge a DAC code whose measured or sparse-linked
+            # control background was rejected.
             if code_rank.get(right_code, -2) - code_rank.get(left_code, -1) != 1:
                 continue
             left_value = float(values[index])
@@ -734,6 +937,140 @@ def _fine_codes_from_brackets(
         "fine_bands": bands,
         "scan_direction": "descending" if settings.scan_descending else "ascending",
     }
+
+
+def _augment_scurve_fine_codes(
+    fine_codes: Sequence[int],
+    diagnostics: Mapping[str, Any],
+    *,
+    store: ExperimentStore,
+    stage: str,
+    pulse_amplitude: Any,
+    calibration: ThresholdDacCalibration,
+    settings: ScurveSettings,
+) -> tuple[tuple[int, ...], dict[str, Any]]:
+    """Add step-1 coverage for the full noise lobe and weak-signal branch."""
+
+    fine_set = {int(code) for code in fine_codes}
+    events = [
+        event
+        for event in store.metadata.get("scurve_baseline_stop_events", [])
+        if event.get("stage") == stage
+        and (
+            event.get("scan_phase") == "coarse"
+            or str(event.get("scan_phase", "")).startswith("expand_")
+        )
+    ]
+    noise_bands: list[dict[str, int]] = []
+    for event in events:
+        values = [
+            event.get("first_noise_code"),
+            event.get("last_noise_code"),
+            event.get("stop_code"),
+        ]
+        codes = [int(value) for value in values if value is not None]
+        if not codes:
+            continue
+        lower = max(calibration.min_code, min(codes) - settings.fine_margin_codes)
+        upper = min(calibration.max_code, max(codes) + settings.fine_margin_codes)
+        fine_set.update(range(lower, upper + 1, settings.fine_step))
+        noise_bands.append({"start": lower, "stop": upper})
+
+    step_v = float("nan")
+    if isinstance(pulse_amplitude, Mapping):
+        for key in ("voltage_step_v", "requested_voltage_step_v"):
+            try:
+                value = float(pulse_amplitude.get(key, float("nan")))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                step_v = value
+                break
+    weak_dense_band: dict[str, int] | None = None
+    if math.isfinite(step_v) and step_v < settings.weak_signal_dense_scan_below_v:
+        raw = store.load_raw("scurve", stages=(stage,))
+        if not raw.empty:
+            signal = raw[
+                (raw["acquisition_type"].astype(str) == "signal")
+                & raw["active_injection_pixel"].astype(str).str.lower().isin(
+                    ("true", "1")
+                )
+                & raw["measurement_valid"].astype(str).str.lower().isin(
+                    ("true", "1")
+                )
+            ].copy()
+            signal["selected_count_numeric"] = pd.to_numeric(
+                signal["selected_count"], errors="coerce"
+            )
+            signal = signal[signal["selected_count_numeric"].notna()]
+            if not signal.empty:
+                threshold = max(
+                    1.0,
+                    settings.n_injections * settings.signal_detection_fraction_of_n,
+                )
+                fractions = signal.groupby("threshold_dac_code")[
+                    "selected_count_numeric"
+                ].apply(lambda values: float(np.mean(values >= threshold)))
+                detected = [
+                    int(code)
+                    for code, fraction in fractions.items()
+                    if fraction >= settings.signal_detection_pixel_fraction
+                ]
+                if detected:
+                    first_signal = (
+                        max(detected) if settings.scan_descending else min(detected)
+                    )
+                    event_codes = [
+                        int(event["stop_code"])
+                        for event in events
+                        if event.get("stop_code") is not None
+                    ]
+                    branch_end = (
+                        min(event_codes)
+                        if settings.scan_descending and event_codes
+                        else max(event_codes)
+                        if event_codes
+                        else min(detected)
+                        if settings.scan_descending
+                        else max(detected)
+                    )
+                    lower = max(
+                        calibration.min_code,
+                        min(first_signal, branch_end) - settings.fine_margin_codes,
+                    )
+                    upper = min(
+                        calibration.max_code,
+                        max(first_signal, branch_end) + settings.fine_margin_codes,
+                    )
+                    fine_set.update(range(lower, upper + 1, settings.fine_step))
+                    weak_dense_band = {"start": lower, "stop": upper}
+
+    ordered = tuple(sorted(fine_set, reverse=settings.scan_descending))
+    ascending = sorted(fine_set)
+    bands: list[dict[str, int]] = []
+    if ascending:
+        start = previous = ascending[0]
+        for code in ascending[1:]:
+            if code - previous > settings.fine_step:
+                bands.append({"start": start, "stop": previous})
+                start = code
+            previous = code
+        bands.append({"start": start, "stop": previous})
+    result = dict(diagnostics)
+    result.update(
+        {
+            "method": str(result.get("method", ""))
+            + "_plus_full_noise_lobe_and_weak_signal_dense_branch",
+            "fine_code_count": len(ordered),
+            "fine_bands": bands,
+            "noise_lobe_fine_bands": noise_bands,
+            "weak_signal_threshold_v": settings.weak_signal_dense_scan_below_v,
+            "actual_or_requested_step_v": step_v,
+            "weak_signal_dense_band": weak_dense_band,
+            "fine_noise_lobe_step": settings.fine_step,
+        }
+    )
+    return ordered, result
 
 
 def _preflight_scan_coverage(
@@ -788,6 +1125,7 @@ def characterize_comparator(
     keysight_generator: KeysightBurstGenerator | None = None,
     keysight_burst_settings: KeysightBurstSettings | None = None,
     noise_reference_experiment: str | Path | None = None,
+    trim_reference_experiment: str | Path | None = None,
     use_reference_trim_map: bool = True,
     before_scurve: Callable[[ManualExposureChange], None] | None = None,
     resume_experiment: str | Path | None = None,
@@ -814,6 +1152,14 @@ def characterize_comparator(
     makes the same selected steps run through AMUX ``TST_SIG`` and an
     oscilloscope before any noise or S-curve acquisition.
     """
+
+    if (
+        noise_reference_experiment is not None
+        and trim_reference_experiment is not None
+    ):
+        raise ValueError(
+            "use either noise_reference_experiment or trim_reference_experiment, not both"
+        )
 
     def validate_fclk(value: int, name: str) -> int:
         if not isinstance(value, int) or isinstance(value, bool):
@@ -899,6 +1245,7 @@ def characterize_comparator(
         selected_settings.scurve.n_injections = n_injections
     reference_calibrations: dict[str, ReferenceDacCalibration] = {}
     reference_pair_selections: tuple[Any, ...] = ()
+    reference_pair_availability: tuple[dict[str, Any], ...] = ()
     if injection_voltage_steps_v is not None:
         if not (run_scurve or reference_verification_enabled):
             raise ValueError(
@@ -918,7 +1265,7 @@ def characterize_comparator(
             reference_calibration_files,
             voltage_unit=reference_calibration_voltage_unit,
         )
-        reference_pair_selections = select_reference_dac_pairs(
+        reference_plan = plan_reference_dac_pairs(
             reference_calibrations["DAC_TST_REF1"],
             reference_calibrations["DAC_TST_REF2"],
             injection_voltage_steps_v,
@@ -941,6 +1288,34 @@ def characterize_comparator(
                 selected_settings.scurve.maximum_reference_step_error_v
             ),
         )
+        reference_pair_selections = reference_plan.selections
+        reference_pair_availability = reference_plan.availability
+        if not reference_pair_selections:
+            run_scurve = False
+            reference_verification_enabled = False
+            logger.warning("Реализуемых REF-ступенек нет: S-кривые пропущены, шумовые этапы продолжаются")
+        available_steps = [
+            float(item.requested_voltage_step_v)
+            for item in reference_pair_selections
+        ]
+        unavailable_steps = [
+            float(item["requested_voltage_step_v"])
+            for item in reference_pair_availability
+            if not bool(item["realizable"])
+        ]
+        logger.info(
+            "REF preflight: доступны %d/%d ступенек, фиксированный REF1=%s "
+            "(%s В). Доступны, мВ: %s",
+            len(available_steps), len(reference_pair_availability),
+            reference_plan.selected_ref1_code,
+            reference_plan.selected_ref1_voltage_v,
+            ", ".join(f"{1000.0 * value:g}" for value in available_steps),
+        )
+        if unavailable_steps:
+            logger.warning(
+                "REF preflight: эти ступеньки исключены, мВ: %s",
+                ", ".join(f"{1000.0 * value:g}" for value in unavailable_steps),
+            )
         selected_settings.scurve.pulse_amplitudes = tuple(
             selection.to_pulse_amplitude()
             for selection in reference_pair_selections
@@ -1092,6 +1467,8 @@ def characterize_comparator(
             "curve_sha256"
         ]:
             raise ValueError("noise-reference threshold-DAC calibration curve differs")
+    if trim_reference_experiment is not None:
+        _read_trim_reference(trim_reference_experiment, spec.name, selected_pixels)
 
     if resume_experiment is not None:
         store = ExperimentStore(resume_experiment)
@@ -1156,7 +1533,7 @@ def characterize_comparator(
         }
         if stored_pixels != set(selected_pixels):
             raise ValueError("resume experiment pixel selection does not match")
-        _validate_resume_inputs(
+        resume_migrations = _validate_resume_inputs(
             store,
             settings=selected_settings,
             counter_key=counter_key,
@@ -1181,7 +1558,26 @@ def characterize_comparator(
                     raise ValueError(
                         f"resume GAIN map differs at Col={coordinate[0]} Row={coordinate[1]}"
                     )
-        store.update_metadata(status="in_progress", resumed_utc=utc_now_text())
+        resume_update: dict[str, Any] = {
+            "status": "in_progress",
+            "resumed_utc": utc_now_text(),
+        }
+        if resume_migrations:
+            history = list(store.metadata.get("resume_metadata_migrations", []))
+            migration_record = {
+                "source_framework_version": store.metadata.get(
+                    "comparator_characterization_version"
+                ),
+                "interpreted_by_framework_version": FRAMEWORK_VERSION,
+                "fields": list(resume_migrations),
+            }
+            signature = _normalized_document(migration_record)
+            if not any(
+                _normalized_document(item) == signature for item in history
+            ):
+                history.append(migration_record)
+            resume_update["resume_metadata_migrations"] = history
+        store.update_metadata(**resume_update)
     else:
         metadata = {
             "comparator_characterization_version": FRAMEWORK_VERSION,
@@ -1215,6 +1611,11 @@ def characterize_comparator(
                 "noise_reference_experiment": (
                     str(Path(noise_reference_experiment).resolve())
                     if noise_reference_experiment is not None
+                    else None
+                ),
+                "trim_reference_experiment": (
+                    str(Path(trim_reference_experiment).resolve())
+                    if trim_reference_experiment is not None
                     else None
                 ),
                 "use_reference_trim_map": use_reference_trim_map,
@@ -1299,10 +1700,16 @@ def characterize_comparator(
                     "PX_TST_EN": "1 for current active group, 0 otherwise",
                     "PX_SH_EN": 0,
                     "PX_BUF_NEN": 1,
-                    "PX_MASK": "1 for selected good pixels; 0 for permanent bad pixels",
+                    "PX_MASK": (
+                        "tile_measurement: 1 only for current active group; "
+                        "tile_crosstalk: 1 for all selected good pixels; "
+                        "always 0 for permanent bad pixels"
+                    ),
                     "PX_SHT": 2,
                     "PX_GAIN": "per-pixel gain_map",
                 },
+                "tile_mode": selected_settings.scurve.tile_mode,
+                "scurve_background_mode": selected_settings.scurve.background_mode,
                 "injection_capacitance_f": selected_settings.scurve.injection_capacitance_f,
                 "injection_capacitance_relative_uncertainty": (
                     selected_settings.scurve.injection_capacitance_relative_uncertainty
@@ -1315,8 +1722,17 @@ def characterize_comparator(
                         else "manual_or_external_pulse_amplitudes"
                     ),
                     "requested_voltage_steps_v": [
+                        float(item["requested_voltage_step_v"])
+                        for item in reference_pair_availability
+                    ],
+                    "realizable_voltage_steps_v": [
                         selection.requested_voltage_step_v
                         for selection in reference_pair_selections
+                    ],
+                    "unavailable_voltage_steps_v": [
+                        float(item["requested_voltage_step_v"])
+                        for item in reference_pair_availability
+                        if not bool(item["realizable"])
                     ],
                     "minimum_reference_code": (
                         selected_settings.scurve.minimum_reference_code
@@ -1353,6 +1769,15 @@ def characterize_comparator(
             {"column": c, "row": r} for c, r in selected_pixels
         ]
         store = ExperimentStore.create(results_root, window=spec.name, metadata=metadata)
+
+    if reference_pair_availability:
+        availability_path = store.root / "inputs" / "reference_step_availability.csv"
+        store.write_table(availability_path, pd.DataFrame(reference_pair_availability))
+        store.update_metadata(
+            reference_step_availability_csv=availability_path.relative_to(
+                store.root
+            ).as_posix()
+        )
 
     backend = MGPDMeasurementBackend(
         client,
@@ -1673,6 +2098,22 @@ def characterize_comparator(
         if run_scurve and use_reference_trim_map and reference_trim_map is not None:
             final_trim_map = backend.program_trim_map(
                 spec, selected_pixels, reference_trim_map
+            )
+        if trim_reference_experiment is not None:
+            trim_reference_map = _load_and_freeze_trim_reference(
+                trim_reference_experiment,
+                destination_store=store,
+                spec_name=spec.name,
+                threshold_dac=spec.threshold_dac,
+                calibration=threshold_calibration,
+                pixels=selected_pixels,
+            )
+            final_trim_map = backend.program_trim_map(
+                spec, selected_pixels, trim_reference_map
+            )
+            store.log_status(
+                "Применена trim-карта из отдельного reference; старые noise "
+                "counts и статистика не использованы"
             )
 
         if run_equalization:
@@ -2057,7 +2498,8 @@ def characterize_comparator(
                     )
                 store.log_status(
                     "S-curve запущена без noise reference: границы и fit "
-                    "используют только парные background acquisitions"
+                    "используют собственные control-background acquisitions "
+                    f"режима {selected_settings.scurve.background_mode}"
                 )
             assert normalized_gain_map is not None
             assert selected_settings.scurve.shutter_duration_s is not None
@@ -2078,64 +2520,23 @@ def characterize_comparator(
             )
             if not coarse_codes:
                 raise RuntimeError("automatic S-curve coarse range is empty")
-            store.update_metadata(
-                scurve_scan_strategy={
-                    "physical_target": (
-                        "positive pulse from the falling CTRL edge above baseline"
-                    ),
-                    "opposite_polarity_rising_edge_branch_excluded": bool(
-                        selected_settings.scurve.scan_descending
-                    ),
-                    "scan_direction": (
-                        "descending"
-                        if selected_settings.scurve.scan_descending
-                        else "ascending"
-                    ),
-                    "coarse_high_code": max(coarse_codes),
-                    "coarse_low_safety_limit_code": min(coarse_codes),
-                    "coarse_step": selected_settings.scurve.coarse_step,
-                    "fine_step": selected_settings.scurve.fine_step,
-                    "runtime_baseline_stop_enabled": (
-                        selected_settings.scurve.baseline_noise_stop_enabled
-                    ),
-                    "baseline_stop_count_threshold": (
-                        "background_count > n_injections * count_multiplier"
-                    ),
-                    "baseline_noise_count_multiplier": (
-                        selected_settings.scurve.baseline_noise_count_multiplier
-                    ),
-                    "baseline_noise_pixel_fraction": (
-                        selected_settings.scurve.baseline_noise_pixel_fraction
-                    ),
-                    "coarse_retained_noise_codes": (
-                        selected_settings.scurve.coarse_baseline_noise_consecutive_codes
-                    ),
-                    "fine_retained_consecutive_noise_codes": (
-                        selected_settings.scurve.baseline_noise_consecutive_codes
-                    ),
-                    "predicted_safe_code_minimum_from_noise_reference": (
-                        min(predicted_safe_codes) if predicted_safe_codes else None
-                    ),
-                    "predicted_safe_code_maximum_from_noise_reference": (
-                        max(predicted_safe_codes) if predicted_safe_codes else None
-                    ),
-                    "noise_reference_available": not noise_statistics.empty,
-                    "note": (
-                        "noise reference is used for prediction and fit filtering; "
-                        "it does not sparsify the programmable S-curve DAC grid"
-                    ),
-                }
-            )
-            store.log_status(
-                "S-curve threshold scan: "
-                f"DAC {coarse_codes[0]} -> {coarse_codes[-1]}, "
-                f"coarse шаг {selected_settings.scurve.coarse_step}; "
-                f"coarse остановится после "
-                f"{selected_settings.scurve.coarse_baseline_noise_consecutive_codes} "
-                "полностью сохраненной шумовой точки, fine после "
-                f"{selected_settings.scurve.baseline_noise_consecutive_codes} "
-                "соседних точек с шагом 1"
-            )
+            store.update_metadata(scurve_scan_strategy={
+                "algorithm": "adaptive_zero_search_transition_backfill_plateau_and_noise_tail",
+                "scan_direction": "descending" if selected_settings.scurve.scan_descending else "ascending",
+                "code_high": max(coarse_codes), "code_low": min(coarse_codes),
+                "coarse_step": selected_settings.scurve.coarse_step, "fine_step": 1,
+                "noise_reference_available": not noise_statistics.empty,
+                "historical_background_subtraction": False,
+                "background_mode": selected_settings.scurve.background_mode,
+                "tile_mode": selected_settings.scurve.tile_mode,
+                "configured_repeats_near_transition": selected_settings.scurve.repeats,
+                "weak_signal_dense_below_v": selected_settings.scurve.weak_signal_dense_scan_below_v,
+                "stop_rule": "measured_noise_exceeded_N_then_fell_to_N_after_protected_band",
+                "consecutive_tail_codes": selected_settings.scurve.baseline_noise_consecutive_codes,
+            })
+            store.log_status(f"S-curve: DAC {coarse_codes[0]} -> {coarse_codes[-1]}, "
+                f"режим {selected_settings.scurve.background_mode}; переход и шум с шагом 1, "
+                "остановка после спада шумового колокола к N")
 
             if run_noise_scan or run_equalization:
                 change = ManualExposureChange(
@@ -2166,9 +2567,7 @@ def characterize_comparator(
                         else None
                     ),
                 )
-                store.update_metadata(
-                    status="awaiting_manual_scurve_exposure_confirmation",
-                    manual_exposure_change={
+                exposure_change_record = {
                         "noise_shutter_duration_s": change.noise_shutter_duration_s,
                         "scurve_shutter_duration_s": change.scurve_shutter_duration_s,
                         "n_injections": change.n_injections,
@@ -2178,21 +2577,44 @@ def characterize_comparator(
                         ),
                         "upo_pwm_frequency_khz": change.upo_pwm_frequency_khz,
                         "upo_pwm_high_time_ns": change.upo_pwm_high_time_ns,
-                    },
-                )
-                store.log_status(
-                    "Ожидание ручной установки S-curve экспозиции в УПО и подтверждения",
-                    overall_percent_estimate=scurve_progress_start,
-                )
-                (before_scurve or interactive_exposure_pause)(change)
-                store.update_metadata(
-                    status="in_progress",
-                    manual_scurve_exposure_confirmed_utc=utc_now_text(),
-                )
-                store.log_status(
-                    "Изменение экспозиции подтверждено, S-curve продолжена",
-                    overall_percent_estimate=scurve_progress_start,
-                )
+                }
+                if _same_exposure(
+                    change.noise_shutter_duration_s,
+                    change.scurve_shutter_duration_s,
+                ):
+                    store.update_metadata(
+                        manual_exposure_change={
+                            **exposure_change_record,
+                            "confirmation_required": False,
+                            "reason": "noise_and_scurve_exposures_are_equal",
+                        }
+                    )
+                    store.log_status(
+                        "Экспозиции noise и S-curve совпадают, ручное "
+                        "подтверждение не требуется",
+                        overall_percent_estimate=scurve_progress_start,
+                    )
+                else:
+                    store.update_metadata(
+                        status="awaiting_manual_scurve_exposure_confirmation",
+                        manual_exposure_change={
+                            **exposure_change_record,
+                            "confirmation_required": True,
+                        },
+                    )
+                    store.log_status(
+                        "Ожидание ручной установки S-curve экспозиции в УПО и подтверждения",
+                        overall_percent_estimate=scurve_progress_start,
+                    )
+                    (before_scurve or interactive_exposure_pause)(change)
+                    store.update_metadata(
+                        status="in_progress",
+                        manual_scurve_exposure_confirmed_utc=utc_now_text(),
+                    )
+                    store.log_status(
+                        "Изменение экспозиции подтверждено, S-curve продолжена",
+                        overall_percent_estimate=scurve_progress_start,
+                    )
 
             pixel_snapshot = backend.snapshot_pixel_configs(selected_pixels)
             if isinstance(shot_executor, KeysightBurstShotExecutor):
@@ -2239,6 +2661,7 @@ def characterize_comparator(
                         noise_settings=selected_settings.noise,
                         scurve_settings=selected_settings.scurve,
                         measurement_fclk_mhz=active_measurement_fclk_mhz,
+                        noise_statistics=noise_statistics,
                     ))
                 return tuple(runs)
 
@@ -2279,120 +2702,9 @@ def characterize_comparator(
                         f"{len(selected_settings.scurve.pulse_amplitudes)}, "
                         f"режим {pattern}"
                     )
-                    coarse_runs = acquire_groups(
-                        groups,
-                        stage=stage,
-                        phase="coarse",
-                        codes=coarse_codes,
-                        amplitude=amplitude,
-                        amplitude_configuration=amplitude_configuration,
-                        active_measurement_fclk_mhz=active_measurement_fclk_mhz,
-                    )
-                    transition_brackets = _scurve_transition_brackets(
-                        store,
-                        noise_statistics,
-                        selected_settings.scurve.max_background_fraction,
-                        stage=stage,
-                        scurve_settings=selected_settings.scurve,
-                        analysis_settings=selected_settings.analysis,
-                    )
-                    current_upper = max(coarse_codes)
-                    if not transition_brackets:
-                        for round_index in range(
-                            1, selected_settings.scurve.max_expand_rounds + 1
-                        ):
-                            next_upper = min(
-                                threshold_calibration.max_code,
-                                current_upper + selected_settings.scurve.expand_codes,
-                            )
-                            if next_upper <= current_upper:
-                                break
-                            expansion = _ordered_scurve_codes(
-                                threshold_calibration,
-                                selected_settings.scurve,
-                                high_code=next_upper,
-                                low_code=current_upper + 1,
-                                step=selected_settings.scurve.coarse_step,
-                            )
-                            if not expansion:
-                                break
-                            acquire_groups(
-                                groups,
-                                stage=stage,
-                                phase=f"expand_{round_index:02d}",
-                                codes=expansion,
-                                amplitude=amplitude,
-                                amplitude_configuration=amplitude_configuration,
-                                active_measurement_fclk_mhz=(
-                                    active_measurement_fclk_mhz
-                                ),
-                            )
-                            current_upper = next_upper
-                            transition_brackets = _scurve_transition_brackets(
-                                store,
-                                noise_statistics,
-                                selected_settings.scurve.max_background_fraction,
-                                stage=stage,
-                                scurve_settings=selected_settings.scurve,
-                                analysis_settings=selected_settings.analysis,
-                            )
-                            if transition_brackets:
-                                break
-
-                    fine_codes, fine_diagnostics = _fine_codes_from_brackets(
-                        transition_brackets,
-                        threshold_calibration,
-                        selected_settings.scurve,
-                    )
-                    fine_diagnostics.update({
-                        "stage": stage,
-                        "injection_pattern": pattern,
-                        "measurement_fclk_mhz": active_measurement_fclk_mhz,
-                        "coarse_baseline_stop_codes": [
-                            run.baseline_stop_event.get("stop_code")
-                            for run in coarse_runs
-                            if run.baseline_stop_event is not None
-                        ],
-                    })
-                    previous_fine_diagnostics = list(
-                        store.metadata.get("scurve_fine_range_diagnostics", [])
-                    )
-                    previous_fine_diagnostics = [
-                        item
-                        for item in previous_fine_diagnostics
-                        if not (
-                            item.get("stage") == stage
-                            and item.get("injection_pattern") == pattern
-                            and int(item.get("measurement_fclk_mhz", -1))
-                            == active_measurement_fclk_mhz
-                        )
-                    ]
-                    previous_fine_diagnostics.append(fine_diagnostics)
-                    store.update_metadata(
-                        scurve_fine_range_diagnostics=previous_fine_diagnostics
-                    )
-                    if fine_codes:
-                        store.log_status(
-                            f"S-curve {stage}/{pattern}: fine scan, "
-                            f"{len(fine_codes)} кодов с шагом "
-                            f"{selected_settings.scurve.fine_step}, "
-                            f"диапазонов {len(fine_diagnostics['fine_bands'])}"
-                        )
-                        acquire_groups(
-                            groups,
-                            stage=stage,
-                            phase="fine",
-                            codes=fine_codes,
-                            amplitude=amplitude,
-                            amplitude_configuration=amplitude_configuration,
-                            active_measurement_fclk_mhz=active_measurement_fclk_mhz,
-                        )
-                    else:
-                        store.log_status(
-                            f"S-curve {stage}/{pattern}: положительный переход "
-                            "не ограничен соседними coarse-точками; fine scan "
-                            "не выполняется"
-                        )
+                    acquire_groups(groups, stage=stage, phase="adaptive", codes=coarse_codes,
+                        amplitude=amplitude, amplitude_configuration=amplitude_configuration,
+                        active_measurement_fclk_mhz=active_measurement_fclk_mhz)
                     completed_scurve_groups += len(groups)
                     scurve_fraction = completed_scurve_groups / max(
                         total_scurve_groups, 1
@@ -2536,6 +2848,7 @@ def characterize_injection_crosstalk(
         "tile_4x4",
         "tile_8x8",
     )
+    selected_settings.scurve.tile_mode = "tile_crosstalk"
     return characterize_comparator(
         client,
         threshold_calibration_files,
@@ -2557,6 +2870,7 @@ def characterize_measurement_clock_noise(
     *,
     measurement_fclk_values_mhz: Sequence[int],
     injection_pattern: str = "all",
+    trim_reference_experiment: str | Path | None = None,
     settings: CharacterizationSettings | None = None,
     bad_pixel_map: BadPixelMapInput = None,
     **characterization_arguments: Any,
@@ -2564,9 +2878,9 @@ def characterize_measurement_clock_noise(
     """Quick standalone S-curve comparison of measurement FCLK values.
 
     The test deliberately uses exactly one injected REF step and does not need
-    a previously measured noise experiment. Each signal point still has its
-    paired background acquisition, so the threshold-domain width remains a
-    comparable pixel-noise indicator. Tile patterns execute every phase needed
+    a previously measured noise experiment. Background acquisition follows the
+    selected paired/sparse S-curve mode, so the threshold-domain width remains
+    a comparable pixel-noise indicator. Tile patterns execute every phase needed
     to cover all selected pixels, exactly like the normal S-curve workflow.
     """
 
@@ -2581,6 +2895,7 @@ def characterize_measurement_clock_noise(
         "run_scurve",
         "noise_reference_experiment",
         "use_reference_trim_map",
+        "trim_reference_experiment",
         "allow_scurve_without_noise_reference",
         "scurve_measurement_fclk_values_mhz",
         "settings",
@@ -2620,11 +2935,12 @@ def characterize_measurement_clock_noise(
         client,
         threshold_calibration_files,
         settings=selected_settings,
-        run_noise_scan=False,
+        run_noise_scan=True,
         run_equalization=False,
         run_scurve=True,
         noise_reference_experiment=None,
         use_reference_trim_map=False,
+        trim_reference_experiment=trim_reference_experiment,
         allow_scurve_without_noise_reference=True,
         scurve_measurement_fclk_values_mhz=measurement_fclk_values_mhz,
         bad_pixel_map=bad_pixel_map,

@@ -43,6 +43,8 @@ def main() -> None:
     serve_plot_dashboard(
         source,
         port=arguments.port,
+        language=config.PLOT_LANGUAGE,
+        square_physical_pixels=config.PLOT_SQUARE_PHYSICAL_PIXELS,
         open_browser=(
             config.PLOT_DASHBOARD_OPEN_BROWSER and not arguments.no_browser
         ),

@@ -640,7 +640,9 @@ def generate_analysis_report(
             ] if not scurve_efficiency.empty else pd.DataFrame()
             phases = stage_points.get("scan_phase", pd.Series(dtype=str)).astype(str)
             coarse = stage_points[phases == "coarse"]
-            fine = stage_points[phases == "fine"]
+            from .analysis import _dense_scurve_rows
+            fine = _dense_scurve_rows(stage_points)
+            coarse = stage_points[(phases == "coarse") | ((phases == "adaptive") & ~stage_points.index.isin(fine.index))]
             expanded = stage_points[phases.str.startswith("expand")]
             pair_count = (
                 stage_points["pair_id"].nunique()
@@ -666,7 +668,7 @@ def generate_analysis_report(
                 "### Фактически измеренная сетка DAC",
                 "",
                 *_markdown_table(
-                    ["FCLK, МГц", "Step, mV", "Парных acquisitions", "Coarse", "Expand", "Fine"],
+                    ["FCLK, МГц", "Step, mV", "Signal acquisitions", "Coarse", "Expand", "Fine"],
                     grid_rows,
                 ),
             ]
@@ -674,10 +676,11 @@ def generate_analysis_report(
         lines.extend(
             [
                 "",
-                "`Baseline DAC` получен из paired background. В fit включены только "
+                "`Baseline DAC` получен из измеренных control-background точек "
+                "(`paired` или контрольных `sparse`). В fit включены только "
                 "коды не ниже этой границы. Все точки обратной полярности сохранены "
                 "в raw CSV и могут быть показаны на raw-count графиках до локального "
-                "шумового максимума, но исключены из физического V50/sigma fit.",
+                "спада шумового колокола к N, но исключены из физического V50/sigma fit.",
                 "",
                 "`N effective` для UPO PWM является робастной нормировкой по чистому "
                 "плато. Она не заменяет осциллографический или аппаратный счетчик фронтов.",
@@ -931,7 +934,7 @@ def generate_analysis_report(
     file_rows = []
     for filename, label in (
         ("noise_fit_results.csv", "Noise fit по пикселям"),
-        ("scurve_efficiency.csv", "Paired S-curve points"),
+        ("scurve_efficiency.csv", "S-curve signal/control points"),
         ("scurve_results.csv", "V50 и sigma по пикселям"),
         (
             "scurve_pixel_gain_spatially_compensated.csv",

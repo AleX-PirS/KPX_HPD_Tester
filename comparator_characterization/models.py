@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.16.0"
+FRAMEWORK_VERSION = "0.19.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -295,18 +295,37 @@ class ScurveSettings:
     fine_margin_codes: int = 8
     expand_codes: int = 32
     max_expand_rounds: int = 4
-    # A full paired point is retained while approaching the baseline. The
-    # scan stops only after this many consecutive DAC codes have a substantial
-    # fraction of pixels with background counts above N_injections * multiplier.
+    # The scan retains the complete baseline-noise lobe. It stops only after
+    # detecting the lobe and then observing this many points that have returned
+    # to the expected signal-plateau level on its far side.
     baseline_noise_stop_enabled: bool = True
     baseline_noise_count_multiplier: float = 1.0
     baseline_noise_pixel_fraction: float = 0.10
-    # A coarse grid can jump over a narrow noise peak. Retain the first coarse
-    # noise point and hand the boundary to the step-1 fine scan instead of
-    # continuing into the opposite-polarity branch.
+    # Coarse needs one post-lobe return point; fine uses two adjacent step-1
+    # return points. The measured lobe itself is always handed to the fine scan.
     coarse_baseline_noise_consecutive_codes: int = 1
     baseline_noise_consecutive_codes: int = 2
-    paired_background: bool = True
+    # Background acquisition policy. ``paired`` measures background before
+    # every signal repeat. ``sparse`` measures periodic control backgrounds
+    # and uses bracketing checkpoints for eligibility without subtraction.
+    background_mode: str = "sparse"
+    sparse_background_interval_codes: int = 16
+    # Legacy mirror retained in metadata/API compatibility. Validation keeps
+    # it synchronized with ``background_mode``.
+    paired_background: bool = False
+    # Only the first repeat is acquired outside the observed 10-90% signal
+    # transition. Every requested repeat is retained around V50.
+    adaptive_repeats: bool = True
+    transition_repeat_low_fraction: float = 0.10
+    transition_repeat_high_fraction: float = 0.90
+    # For weak injections, step-1 coverage starts with the first reliable
+    # signal response and continues through the measured baseline-noise lobe.
+    weak_signal_dense_scan_below_v: float = 0.025
+    signal_detection_fraction_of_n: float = 0.01
+    signal_detection_pixel_fraction: float = 0.02
+    # Tile measurement masks every pixel outside the active phase. Tile
+    # crosstalk keeps those pixels count-enabled while leaving TST_EN at zero.
+    tile_mode: str = "tile_measurement"
 
     def validate(self) -> None:
         if self.n_injections <= 0:
@@ -389,7 +408,7 @@ class ScurveSettings:
             and self.coarse_high_code < self.coarse_low_code
         ):
             raise ValueError("coarse_high_code must be >= coarse_low_code")
-        if self.coarse_step <= 0 or self.fine_step <= 0:
+        if self.coarse_step <= 0 or self.fine_step != 1:
             raise ValueError("S-curve DAC steps must be positive")
         if self.fine_margin_codes < 0 or self.expand_codes < 1:
             raise ValueError("S-curve margins must be non-negative")
@@ -418,6 +437,44 @@ class ScurveSettings:
             or self.baseline_noise_consecutive_codes < 1
         ):
             raise ValueError("baseline_noise_consecutive_codes must be a positive integer")
+        normalized_background_mode = str(self.background_mode).strip().lower()
+        if normalized_background_mode not in {"paired", "sparse"}:
+            raise ValueError("S-curve background_mode must be paired or sparse")
+        self.background_mode = normalized_background_mode
+        self.paired_background = normalized_background_mode == "paired"
+        if (
+            not isinstance(self.sparse_background_interval_codes, int)
+            or isinstance(self.sparse_background_interval_codes, bool)
+            or self.sparse_background_interval_codes < 1
+        ):
+            raise ValueError(
+                "sparse_background_interval_codes must be a positive integer"
+            )
+        if not isinstance(self.adaptive_repeats, bool):
+            raise TypeError("adaptive_repeats must be bool")
+        if not (
+            0 <= float(self.transition_repeat_low_fraction)
+            < float(self.transition_repeat_high_fraction)
+            <= 1
+        ):
+            raise ValueError(
+                "transition repeat fractions must satisfy 0 <= low < high <= 1"
+            )
+        if (
+            not math.isfinite(float(self.weak_signal_dense_scan_below_v))
+            or float(self.weak_signal_dense_scan_below_v) < 0
+        ):
+            raise ValueError("weak_signal_dense_scan_below_v must be finite and >= 0")
+        if not 0 <= float(self.signal_detection_fraction_of_n) < 1:
+            raise ValueError("signal_detection_fraction_of_n must be in [0, 1)")
+        if not 0 < float(self.signal_detection_pixel_fraction) <= 1:
+            raise ValueError("signal_detection_pixel_fraction must be in (0, 1]")
+        normalized_tile_mode = str(self.tile_mode).strip().lower()
+        if normalized_tile_mode not in {"tile_measurement", "tile_crosstalk"}:
+            raise ValueError(
+                "S-curve tile_mode must be tile_measurement or tile_crosstalk"
+            )
+        self.tile_mode = normalized_tile_mode
 
 
 @dataclass
@@ -439,10 +496,12 @@ class AnalysisSettings:
     # historical project figures. True preserves geometrically square pixel
     # cells and therefore renders the owned half as a 1:2 rectangle.
     square_physical_pixels: bool = False
+    # Language of automatically generated PNG/PDF figures.
+    plot_language: str = "ru"
     # 0 = automatic (up to 8 CPUs); 1 disables process parallelism.
     workers: int = 0
     # Avoid process startup overhead for small collections of independent curves.
-    parallel_min_groups: int = 2048
+    parallel_min_groups: int = 128
     parallel_batch_size: int = 64
     # Separate limits for memory-heavy PNG/PDF rendering and CSV reading.
     plot_workers: int = 0
@@ -558,6 +617,10 @@ class AnalysisSettings:
             raise TypeError("plot_all_trim_heatmaps must be bool")
         if not isinstance(self.square_physical_pixels, bool):
             raise TypeError("square_physical_pixels must be bool")
+        normalized_language = str(self.plot_language).strip().lower()
+        if normalized_language not in {"ru", "en"}:
+            raise ValueError("analysis.plot_language must be ru or en")
+        self.plot_language = normalized_language
 
 
 @dataclass

@@ -791,6 +791,7 @@ def _scurve_noise_boundaries(
     )
     valid = (
         _as_bool(data["background_valid"])
+        & _as_bool(data["active_injection_pixel_bool"])
         & ~_as_bool(data["background_counter_saturated"])
         & data["threshold_dac_code"].notna()
         & data["background_count"].notna()
@@ -914,7 +915,7 @@ def _upo_pwm_plateau_denominators(
             active = group[
                 _as_bool(group["active_injection_pixel_bool"])
                 & _as_bool(group["signal_valid"])
-                & _as_bool(group["background_valid"])
+                & _as_bool(group["background_evaluation_valid"])
                 & ~_as_bool(group["signal_counter_saturated"])
                 & ~_as_bool(group["background_counter_saturated"])
                 & (pd.to_numeric(group["threshold_dac_code"], errors="coerce") >= boundary)
@@ -981,6 +982,36 @@ def _upo_pwm_plateau_denominators(
     return pd.DataFrame(rows, columns=columns)
 
 
+def _sparse_background_evidence(paired: pd.DataFrame) -> pd.DataFrame:
+    """Use current-run bracketing checkpoints for eligibility, never subtraction."""
+    data = paired.copy()
+    data["background_evaluation_count"] = data["background_count"]
+    data["background_evaluation_valid"] = _as_bool(data["background_valid"])
+    data["background_evidence_source"] = np.where(data["background_count"].notna(), "paired_measurement", "missing")
+    identities = ["stage", "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern",
+                  "injection_group_id", "column", "row", "local_trim_code"]
+    for _, group in data.groupby(identities, dropna=False, sort=False):
+        sparse = group["background_mode"].eq("sparse")
+        if not sparse.any():
+            continue
+        valid = _as_bool(group["background_valid"]) & ~_as_bool(group["background_counter_saturated"])
+        measured = group[valid].groupby("threshold_dac_code")["background_count"].max().dropna().sort_index()
+        if measured.empty:
+            continue
+        x, y = measured.index.to_numpy(dtype=float), measured.to_numpy(dtype=float)
+        target = group["threshold_dac_code"].to_numpy(dtype=float)
+        left = np.searchsorted(x, target, side="right")-1
+        right = np.searchsorted(x, target, side="left")
+        inside = (left>=0) & (right<len(x))
+        bound = np.maximum(y[np.clip(left,0,len(x)-1)], y[np.clip(right,0,len(x)-1)])
+        missing = sparse & group["background_count"].isna() & inside
+        indexes = group.index[missing]
+        data.loc[indexes,"background_evaluation_count"] = bound[missing.to_numpy()]
+        data.loc[indexes,"background_evaluation_valid"] = True
+        data.loc[indexes,"background_evidence_source"] = "current_run_checkpoint_upper_bound_no_subtraction"
+    return data
+
+
 def _paired_scurve_efficiency(
     raw: pd.DataFrame,
     *,
@@ -995,6 +1026,10 @@ def _paired_scurve_efficiency(
     selected_settings = settings or AnalysisSettings()
     selected_settings.validate()
     frame = raw.copy()
+    if "background_mode" not in frame:
+        frame["background_mode"] = frame.get("scurve_background_mode", "paired")
+    if "tile_mode" not in frame:
+        frame["tile_mode"] = frame.get("scurve_tile_mode", "tile_crosstalk")
     defaults: dict[str, Any] = {
         "measurement_fclk_mhz": np.nan,
         "injection_pattern": "all",
@@ -1072,6 +1107,7 @@ def _paired_scurve_efficiency(
         frame["active_injection_pixel"]
     )
     keys = [
+        "background_mode", "tile_mode",
         "pair_id",
         "stage",
         "scan_phase",
@@ -1145,6 +1181,7 @@ def _paired_scurve_efficiency(
         }
     )
     paired = signal.merge(background, on=keys, how="outer", validate="one_to_one")
+    paired = _sparse_background_evidence(paired)
 
     # Prefer a step-1 fine acquisition over a duplicate coarse/expand point.
     # Every raw row remains available; only the default fit selection changes.
@@ -1286,24 +1323,29 @@ def _paired_scurve_efficiency(
         / paired["injections_for_analysis"]
     )
     paired["background_low"] = (
-        paired["background_count"] < paired["background_limit_count"]
+        paired["background_evaluation_count"] < paired["background_limit_count"]
     ) & (
-        paired["expected_background_count_from_noise_scan"].isna()
+        paired["background_mode"].eq("sparse")
+        | paired["expected_background_count_from_noise_scan"].isna()
         | (
             paired["expected_background_count_from_noise_scan"]
             < paired["background_limit_count"]
         )
     )
     paired["background_corrected_detected"] = (
-        paired["signal_count"] - paired["background_count"]
+        paired["signal_count"] - paired["background_count"].where(paired["background_mode"].eq("paired"), 0.0)
     )
+    paired["signal_processing_method"] = np.where(paired["background_mode"].eq("paired"),
+        "paired_background_subtraction", "signal_only_checkpoint_eligibility")
+    paired["inactive_signed_delta_count"] = (paired["signal_count"]-paired["background_count"]).where(
+        ~paired["active_injection_pixel_bool"] & paired["tile_mode"].eq("tile_crosstalk"))
     paired["efficiency"] = (
         paired["background_corrected_detected"]
         / paired["injections_for_analysis"]
     )
     paired["inactive_excess_hit_fraction"] = np.where(
         ~paired["active_injection_pixel_bool"],
-        paired["background_corrected_detected"].clip(lower=0)
+        paired["inactive_signed_delta_count"].clip(lower=0)
         / paired["injections_for_analysis"],
         np.nan,
     )
@@ -1314,12 +1356,12 @@ def _paired_scurve_efficiency(
         / paired["injections_for_analysis"]
     )
     paired["fit_valid_before_physical_branch"] = (
-        paired["signal_valid"].fillna(False)
-        & paired["background_valid"].fillna(False)
-        & ~paired["signal_counter_saturated"].fillna(False)
-        & ~paired["background_counter_saturated"].fillna(False)
-        & paired["active_injection_pixel_bool"].fillna(False)
-        & paired["background_low"].fillna(False)
+        _as_bool(paired["signal_valid"])
+        & _as_bool(paired["background_evaluation_valid"])
+        & ~_as_bool(paired["signal_counter_saturated"])
+        & ~_as_bool(paired["background_counter_saturated"])
+        & _as_bool(paired["active_injection_pixel_bool"])
+        & _as_bool(paired["background_low"])
         & (paired["injections_for_analysis"] > 0)
         & (paired["background_corrected_detected"] >= 0)
         & (
@@ -1345,7 +1387,7 @@ def _paired_scurve_efficiency(
     reasons = pd.Series("", index=paired.index, dtype=object)
     for field, invert, label in (
         ("signal_valid", True, "invalid_signal_counter"),
-        ("background_valid", True, "invalid_background_counter"),
+        ("background_evaluation_valid", True, "missing_or_invalid_background_evidence"),
         ("signal_counter_saturated", False, "signal_counter_saturated"),
         ("background_counter_saturated", False, "background_counter_saturated"),
         ("active_injection_pixel_bool", True, "inactive_pixel_not_used_for_scurve_fit"),
@@ -1356,7 +1398,7 @@ def _paired_scurve_efficiency(
             "duplicate_coarse_point_superseded_by_finer_phase",
         ),
     ):
-        flag = paired[field].astype(bool)
+        flag = _as_bool(paired[field])
         if invert:
             flag = ~flag
         reasons.loc[flag] += label + ";"
@@ -1422,6 +1464,9 @@ def _fit_scurve_group(
     result["fit_points_available_on_physical_branch"] = int(len(aggregated))
     result["minimum_efficiency"] = float(aggregated["efficiency"].min())
     result["maximum_efficiency"] = float(aggregated["efficiency"].max())
+    if result["maximum_efficiency"] < 0.90:
+        result["fit_status"] = "transition_not_resolved"
+        return result
     if (
         len(aggregated) < 5
         or result["minimum_efficiency"] > 0.2
@@ -1643,6 +1688,14 @@ def fit_scurves(
     return pd.DataFrame(rows)
 
 
+def _dense_scurve_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    phase = frame.get("scan_phase", pd.Series("", index=frame.index)).astype(str)
+    codes = pd.to_numeric(frame.get("threshold_dac_code"), errors="coerce")
+    present = set(codes.dropna())
+    adjacent = codes.map(lambda code: code-1 in present or code+1 in present)
+    return frame[phase.eq("fine") | (phase.eq("adaptive") & adjacent)]
+
+
 def summarize_scurve_branch_and_precision(
     efficiency: pd.DataFrame,
     scurve_results: pd.DataFrame,
@@ -1669,7 +1722,7 @@ def summarize_scurve_branch_and_precision(
             for value in physical["threshold_dac_code"].dropna().unique()
         )
         fine = physical[
-            (physical["scan_phase"].astype(str) == "fine")
+            physical.index.isin(_dense_scurve_rows(physical).index)
             & _as_bool(physical["preferred_for_default_analysis"])
         ]
         fine_codes = sorted(
@@ -1759,8 +1812,7 @@ def summarize_scurve_branch_and_precision(
             except KeyError:
                 pixel = frame.iloc[0:0]
             fine = pixel[
-                (pixel.get("scan_phase", pd.Series("", index=pixel.index)).astype(str)
-                 == "fine")
+                pixel.index.isin(_dense_scurve_rows(pixel).index)
                 & _as_bool(pixel.get(
                     "physical_branch_valid", pd.Series(False, index=pixel.index)
                 ))
@@ -3323,6 +3375,10 @@ def analyze_saved_experiment(
         store.write_table(analysis_dir / filename, table)
         outputs[key] = analysis_dir / filename
 
+    from .pixel_comparison_plots import inactive_noise_statistics, plot_inactive_noise
+    inactive_noise = inactive_noise_statistics(scurve_efficiency)
+    outputs["inactive_noise_statistics"] = store.write_table(analysis_dir / "inactive_noise_statistics.csv", inactive_noise)
+
     if generate_plots:
         from .plots import generate_diagnostic_plots
 
@@ -3348,6 +3404,7 @@ def analyze_saved_experiment(
             settings=selected_settings,
         )
         outputs["plots"] = plot_paths
+        outputs["plots"].update(plot_inactive_noise(inactive_noise, directory=analysis_dir / "plots", settings=selected_settings))
         from .plots import generate_recommendation_plots
 
         outputs["plots"].update(generate_recommendation_plots(analysis_dir, selected_settings))

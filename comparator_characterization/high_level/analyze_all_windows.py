@@ -31,6 +31,10 @@ def main() -> None:
     )
     parser.add_argument("--no-pdf", action="store_true")
     parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument(
+        "--language", choices=("ru", "en"), default="ru",
+        help="Язык подписей графиков.",
+    )
     arguments = parser.parse_args()
     outputs = analyze_all_windows(
         arguments.experiment,
@@ -38,6 +42,7 @@ def main() -> None:
             square_physical_pixels=arguments.square_pixels,
             save_pdf_plots=not arguments.no_pdf,
             plot_dpi=arguments.dpi,
+            plot_language=arguments.language,
         ),
         reanalyze_children=not arguments.reuse_child_analysis,
         generate_plots=not arguments.no_plots,

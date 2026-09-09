@@ -12,7 +12,7 @@ import pandas as pd
 
 from comparator_characterization import (
     load_reference_dac_calibrations,
-    select_reference_dac_pairs,
+    plan_reference_dac_pairs,
 )
 
 from comparator_characterization.high_level import characterization_config as config
@@ -23,7 +23,7 @@ def main() -> None:
         config.reference_calibration_files(),
         voltage_unit=config.REFERENCE_LUT_VOLTAGE_UNIT,
     )
-    selections = select_reference_dac_pairs(
+    plan = plan_reference_dac_pairs(
         calibrations["DAC_TST_REF1"],
         calibrations["DAC_TST_REF2"],
         config.injection_voltage_steps_v(),
@@ -36,6 +36,7 @@ def main() -> None:
         ),
         maximum_reference_step_error_v=config.MAXIMUM_REFERENCE_STEP_ERROR_V,
     )
+    selections = plan.selections
     table = pd.DataFrame(
         {
             "requested_step_mV": 1000 * item.requested_voltage_step_v,
@@ -50,6 +51,16 @@ def main() -> None:
         for item in selections
     )
     print(table.to_string(index=False))
+    unavailable = pd.DataFrame(plan.availability)
+    unavailable = unavailable[~unavailable["realizable"].astype(bool)]
+    if not unavailable.empty:
+        print("\nНедостижимые ступеньки, которые будут исключены из теста:")
+        columns = [
+            "requested_voltage_step_v",
+            "status",
+            "global_minimum_achievable_step_error_v",
+        ]
+        print(unavailable[columns].to_string(index=False))
 
 
 if __name__ == "__main__":

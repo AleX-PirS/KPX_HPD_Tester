@@ -17,7 +17,7 @@ import pandas as pd
 from .models import CharacterizationSettings, FRAMEWORK_VERSION, get_window_spec
 from .parameters import validate_eo_overrides
 from .storage import atomic_write_json, atomic_write_table, file_sha256, utc_now_text
-from .workflow import CharacterizationResult, characterize_comparator
+from .workflow import CharacterizationResult, _same_exposure, characterize_comparator
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +153,11 @@ def characterize_parameter_sweep(
     kwargs.pop("resume_experiment", None)
     kwargs.pop("eo_overrides", None)
     window = get_window_spec(kwargs.get("window", "AB")).name
-    run_scurve = kwargs.get("run_scurve", True)
+    run_scurve = bool(kwargs.get("run_scurve", True))
+    run_noise = bool(
+        kwargs.get("run_noise_scan", True)
+        or kwargs.get("run_equalization", True)
+    )
     combos = _grid_combinations(eo_parameter_grid, run_scurve=run_scurve)
     settings = kwargs.get("settings") or CharacterizationSettings()
     # Reusing one noise reference across different bias points is not valid.
@@ -241,13 +245,27 @@ def characterize_parameter_sweep(
             logger.info("SWEEP %.1f%% | комбинация %s/%s: %s",
                         100 * (entry["index"] - 1) / len(combos), entry["index"], len(combos), entry["eo_overrides"])
             try:
-                if kwargs.get("run_noise_scan", True) or kwargs.get("run_equalization", True):
+                equal_noise_and_scurve_exposure = bool(
+                    run_noise
+                    and run_scurve
+                    and _same_exposure(
+                        settings.noise.shutter_duration_s,
+                        settings.scurve.shutter_duration_s,
+                    )
+                )
+                if run_noise and not equal_noise_and_scurve_exposure:
                     if settings.noise.shutter_duration_s is None:
                         raise ValueError("noise exposure is required for a multi-run sweep")
                     (before_noise or interactive_noise_exposure_pause)(SweepNoiseExposure(
                         root, entry["index"], len(combos), entry["eo_overrides"],
                         settings.noise.shutter_duration_s,
                     ))
+                elif run_noise:
+                    logger.info(
+                        "SWEEP %.1f%% | noise и S-curve используют одинаковую "
+                        "экспозицию, Enter не требуется",
+                        100 * (entry["index"] - 1) / len(combos),
+                    )
                 result = characterize_comparator(
                     client, threshold_calibration_files,
                     results_root=_inside(root, entry["directory"]),

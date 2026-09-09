@@ -17,6 +17,7 @@ from urllib.parse import unquote, urlparse
 import webbrowser
 
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 import pandas as pd
 
@@ -125,7 +126,7 @@ def _validated_request(request: dict[str, Any]) -> dict[str, Any]:
     result["plot_type"] = str(_request_value(result, "plot_type", "pixel_scurve"))
     result["language"] = str(_request_value(result, "language", "ru"))
     result["output_format"] = str(_request_value(result, "output_format", "png")).lower()
-    result["pixel_geometry"] = str(_request_value(result, "pixel_geometry", "square"))
+    result["pixel_geometry"] = str(_request_value(result, "pixel_geometry", "stretched"))
     result["branch_view"] = str(_request_value(result, "branch_view", "positive"))
     result["heatmap_metric"] = str(
         _request_value(result, "heatmap_metric", "noise_center_v")
@@ -183,6 +184,7 @@ class AnalysisPlotData:
 
     def __init__(self, analysis_directory: str | Path):
         self.analysis_directory = resolve_analysis_directory(analysis_directory)
+        self.plot_defaults = {"language": "ru", "pixel_geometry": "stretched"}
         self._cache: dict[str, pd.DataFrame] = {}
         self._scurve_subset_cache: dict[tuple[Any, ...], pd.DataFrame] = {}
 
@@ -223,6 +225,8 @@ class AnalysisPlotData:
             "repeat_index", "column", "row", "local_trim_code",
             "injection_pattern", "active_injection_pixel_bool", "signal_count",
             "background_count", "efficiency", "physical_branch_valid",
+            "background_valid", "background_counter_saturated", "signal_valid",
+            "baseline_noise_boundary_code", "injections_for_analysis",
             "injection_voltage_step_v", "requested_injection_voltage_step_v",
             "injection_charge_electrons", "effective_injections_for_analysis",
             "measurement_fclk_mhz",
@@ -355,6 +359,7 @@ class AnalysisPlotData:
         default_pixel = min(pixels) if pixels else None
         return {
             "analysis_directory": str(self.analysis_directory),
+            "plot_defaults": self.plot_defaults,
             "pixels": [
                 {"column": column, "row": row, "label": f"C{column:02d} R{row:02d}"}
                 for column, row in sorted(pixels)
@@ -529,6 +534,8 @@ def _save_figure(
     stem: str,
     request: dict[str, Any],
 ) -> Path:
+    from .plot_language import localize_figure
+    localize_figure(figure, request["language"], request["pixel_geometry"] == "square")
     path = output_directory / f"{stem}.{request['output_format']}"
     figure.savefig(
         path,
@@ -631,7 +638,7 @@ def _plot_pixel_raw_counts(
     data: AnalysisPlotData, request: dict[str, Any], output: Path
 ) -> Path:
     pixel = _ensure_pixel(data, request)
-    points = data.scurve_points(request, pixel=pixel)
+    points = data.scurve_points({**request, "branch_view": "full"}, pixel=pixel)
     if points.empty:
         raise ValueError("Нет raw S-curve точек для выбранного пикселя")
     label = _labels(request["language"])
@@ -653,15 +660,12 @@ def _plot_pixel_raw_counts(
         codes_seen.extend(summary.index.tolist())
     axis.set_xlabel(label["dac"])
     axis.set_ylabel(label["count"])
-    axis.set_title("Raw S-curve counts" if request["language"] == "en" else "Raw-отсчеты S-кривой")
-    fit_results = _select_pixel(
-        _select_scurve(data.table("scurve_results.csv"), request), request
-    )
-    preferred = (
-        _transition_limits(fit_results)
-        if request["branch_view"] == "positive"
-        else None
-    )
+    axis.set_title("Raw S-curve counts" if request["language"] == "en" else "Исходные отсчеты S-кривой")
+    from .plots import _scurve_plot_code_window
+    from .models import AnalysisSettings
+    preferred = _scurve_plot_code_window(points, AnalysisSettings()) if request["branch_view"] == "positive" else None
+    axis.set_yscale("symlog", linthresh=1)
+    axis.set_ylim(bottom=0)
     _apply_dac_range(axis, request, codes_seen, preferred=preferred)
     axis.legend()
     _style_axis(axis, request)
@@ -789,9 +793,7 @@ def _plot_heatmap(
     if matrix.size == 0:
         raise ValueError("Heatmap не содержит конечных значений")
     square = request["pixel_geometry"] == "square"
-    width = 6.0 if square else 9.0
-    height = max(4.5, width * len(rows) / max(len(columns), 1)) if square else 5.2
-    figure, axis = plt.subplots(figsize=(width, height), layout="constrained")
+    figure, axis = plt.subplots(figsize=((6.2, 9.0) if square else (7.2, 6.5)))
     image = axis.imshow(
         matrix,
         origin="lower",
@@ -799,6 +801,10 @@ def _plot_heatmap(
         interpolation="nearest",
         extent=(min(columns) - 0.5, max(columns) + 0.5, min(rows) - 0.5, max(rows) + 0.5),
     )
+    if not square:
+        # The owned 16x32 half is deliberately stretched only enough to make
+        # the visible matrix field exactly square.
+        axis.set_box_aspect(1)
     label = _labels(request["language"])
     metric_titles = {
         "ru": {
@@ -821,7 +827,9 @@ def _plot_heatmap(
     axis.set_xlabel(label["column"])
     axis.set_ylabel(label["row"])
     axis.set_title(metric_titles[request["language"]][metric])
-    colorbar = figure.colorbar(image, ax=axis)
+    divider = make_axes_locatable(axis)
+    colorbar_axis = divider.append_axes("right", size="4%", pad=0.12)
+    colorbar = figure.colorbar(image, cax=colorbar_axis)
     colorbar.set_label(
         metric_titles[request["language"]][metric],
         fontsize=request["axis_font_size"],
@@ -899,7 +907,7 @@ _HTML = r"""<!doctype html>
 </div><p class="hint">Стандартный вид S-кривой показывает только физическую положительную ветвь. Полный вид оставляет обе полярности. Эти файлы добавляются в custom_plots и не изменяют автоматические графики.</p><div id="status" class="status"></div></div><div id="cards" class="cards"></div></div>
 <script>
 const $=id=>document.getElementById(id);let options={};
-async function init(){let r=await fetch('api/options');options=await r.json();$('source').textContent='Источник: '+options.analysis_directory;for(const p of options.pixels){let o=document.createElement('option');o.value=p.column+','+p.row;o.textContent=p.label;$('pixel').appendChild(o)}for(const s of options.noise_stages){let o=document.createElement('option');o.value=s;o.textContent=s;$('stage').appendChild(o)}for(const p of options.scurve_patterns){let o=document.createElement('option');o.value=p;o.textContent=p;$('pattern').appendChild(o)}for(const a of options.amplitudes){let o=document.createElement('option');o.value=a.value;o.textContent=a.label;$('amplitude').appendChild(o)}for(const f of options.measurement_fclk_values_mhz||[]){let o=document.createElement('option');o.value=f;o.textContent=f+' МГц';$('measurement_fclk').appendChild(o)}}
+async function init(){let r=await fetch('api/options');options=await r.json();$('language').value=options.plot_defaults.language;$('geometry').value=options.plot_defaults.pixel_geometry;$('source').textContent='Источник: '+options.analysis_directory;for(const p of options.pixels){let o=document.createElement('option');o.value=p.column+','+p.row;o.textContent=p.label;$('pixel').appendChild(o)}for(const s of options.noise_stages){let o=document.createElement('option');o.value=s;o.textContent=s;$('stage').appendChild(o)}for(const p of options.scurve_patterns){let o=document.createElement('option');o.value=p;o.textContent=p;$('pattern').appendChild(o)}for(const a of options.amplitudes){let o=document.createElement('option');o.value=a.value;o.textContent=a.label;$('amplitude').appendChild(o)}for(const f of options.measurement_fclk_values_mhz||[]){let o=document.createElement('option');o.value=f;o.textContent=f+' МГц';$('measurement_fclk').appendChild(o)}}
 function num(id){return $(id).value===''?null:Number($(id).value)}
 $('render').onclick=async()=>{let px=$('pixel').value.split(',');let body={plot_type:$('plot_type').value,language:$('language').value,column:px[0]?Number(px[0]):null,row:px[1]?Number(px[1]):null,stage:$('stage').value,injection_pattern:$('pattern').value,amplitude_index:$('amplitude').value,measurement_fclk_mhz:$('measurement_fclk').value,branch_view:$('branch').value,heatmap_metric:$('metric').value,pixel_geometry:$('geometry').value,output_format:$('format').value,dac_min:num('dac_min'),dac_max:num('dac_max'),title_font_size:num('title_font'),axis_font_size:num('axis_font'),tick_font_size:num('tick_font'),legend_font_size:num('legend_font'),dpi:num('dpi')};$('render').disabled=true;$('status').textContent='Построение...';$('cards').innerHTML='';try{let r=await fetch('api/render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let out=await r.json();if(!r.ok)throw Error(out.error||r.statusText);$('status').textContent='Создано: '+out.output_directory;for(const f of out.files){let d=document.createElement('div');d.className='card';if(f.preview){let i=document.createElement('img');i.src=f.url;d.appendChild(i)}let a=document.createElement('a');a.href=f.url;a.target='_blank';a.textContent=f.name;d.appendChild(a);$('cards').appendChild(d)}}catch(e){$('status').textContent='Ошибка: '+e.message}finally{$('render').disabled=false}};init().catch(e=>$('status').textContent='Ошибка загрузки: '+e.message);
 </script></body></html>"""
@@ -1004,6 +1012,8 @@ def serve_plot_dashboard(
     *,
     port: int = 0,
     open_browser: bool = True,
+    language: str = "ru",
+    square_physical_pixels: bool = False,
 ) -> None:
     """Serve the plot controller on localhost until Ctrl+C."""
 
@@ -1013,6 +1023,7 @@ def serve_plot_dashboard(
     server.token = token  # type: ignore[attr-defined]
     server.analysis_directory = analysis_directory  # type: ignore[attr-defined]
     server.plot_data = AnalysisPlotData(analysis_directory)  # type: ignore[attr-defined]
+    server.plot_data.plot_defaults = {"language": language, "pixel_geometry": "square" if square_physical_pixels else "stretched"}
     address = f"http://127.0.0.1:{server.server_port}/{token}/"
     print(f"Локальная страница графиков: {address}")
     print("Для остановки нажмите Ctrl+C. Данные не передаются во внешнюю сеть.")

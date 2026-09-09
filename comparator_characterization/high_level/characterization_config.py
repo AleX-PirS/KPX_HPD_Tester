@@ -86,7 +86,7 @@ REFERENCE_VERIFICATION_SAVE_SCREENSHOTS = False
 # основным до первого GET_PIXEL. Допустимые значения УПО:
 # 0, 1, 5, 10, 25, 50, 75, 100, 125, 150 МГц.
 ASIC_MAIN_FCLK_MHZ = 100
-ASIC_MEASUREMENT_FCLK_MHZ = 10
+ASIC_MEASUREMENT_FCLK_MHZ = 5
 # Совместимое имя для пользовательских файлов предыдущих версий.
 ASIC_INITIALIZATION_FCLK_MHZ = ASIC_MAIN_FCLK_MHZ
 
@@ -145,14 +145,18 @@ REFERENCE_LUT_VOLTAGE_UNIT = "auto"
 # Пользователь задает только требуемые положительные ступеньки REF1-REF2.
 # Единица здесь mV. Скрипт выбирает измеренные LUT-точки и всегда требует
 # физическое условие V_REF1 > V_REF2.
-INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 50.0, 100.0, 250.0)
+INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 40.0, 50.0, 75.0, 100.0, 150.0, 250.0)
 
 # Быстрый автономный тест шума по измерительному FCLK. Для полноценного sweep
 # задайте, например, (1, 5, 10, 25, 50). Безопасный исходный default содержит
 # одну частоту и не увеличивает время теста неожиданно.
 CLOCK_NOISE_MEASUREMENT_FCLK_MHZ = (5, 10, 25, 50, 75, 100, 125, 150)
-CLOCK_NOISE_INJECTION_STEP_MV = 100
+CLOCK_NOISE_INJECTION_STEP_MV = 40
 CLOCK_NOISE_INJECTION_PATTERN = "all"
+# Необязательный завершенный noise+equalization эксперимент. Из него быстрый
+# clock-noise тест берет ТОЛЬКО финальную trim-карту соответствующего окна.
+# Старые шумовые counts, границы и статистика в новый тест не переносятся.
+CLOCK_NOISE_TRIM_REFERENCE_EXPERIMENT: Path | None = None
 
 # По умолчанию оба выбранных кода строго больше 400.
 MINIMUM_REFERENCE_CODE = 401
@@ -170,38 +174,38 @@ MAXIMUM_REFERENCE_STEP_ERROR_V: float | None = 1e-3
 # Выберите ровно один источник GAIN для S-curve: код ИЛИ CSV.
 # Значения GAIN: целые числа 0..31 для каждого выбранного исправного пикселя.
 _GAIN_VALUES = [
-    [7, 7, 7, 18, 7, 7, 12, 7, 18, 12, 7, 7, 11, 7, 7, 7],       # row 0
-    [12, 10, 7, 12, 10, 12, 17, 18, 11, 12, 6, 7, 10, 7, 7, 10], # row 1
-    [17, 7, 7, 18, 7, 18, 10, 18, 18, 10, 18, 7, 18, 7, 12, 12], # row 2
-    [7, 7, 12, 7, 7, 10, 18, 18, 11, 7, 7, 18, 18, 18, 18, 12], # row 3
-    [18, 18, 7, 12, 7, 7, 7, 10, 10, 18, 7, 7, 7, 7, 7, 7],    # row 4
-    [7, 7, 7, 10, 10, 18, 11, 12, 18, 18, 18, 7, 18, 18, 10, 7], # row 5
-    [12, 12, 12, 10, 10, 18, 7, 18, 7, 18, 17, 10, 7, 18, 7, 10], # row 6
-    [10, 7, 6, 10, 10, 17, 18, 7, 10, 18, 10, 12, 7, 17, 18, 7], # row 7
-    [18, 12, 18, 18, 18, 10, 7, 18, 10, 12, 7, 7, 18, 9, 10, 10], # row 8
-    [18, 7, 18, 18, 7, 18, 18, 10, 10, 18, 18, 7, 12, 7, 10, 18], # row 9
-    [7, 18, 18, 11, 12, 7, 18, 18, 17, 18, 10, 7, 18, 18, 10, 10], # row 10
-    [7, 17, 7, 6, 10, 18, 6, 18, 10, 10, 10, 18, 6, 11, 10, 6], # row 11
-    [10, 18, 10, 10, 18, 7, 10, 17, 10, 7, 9, 18, 18, 18, 17, 18], # row 12
-    [9, 17, 6, 18, 10, 12, 7, 10, 17, 10, 10, 10, 10, 7, 10, 17], # row 13
-    [10, 10, 7, 18, 9, 10, 18, 17, 18, 10, 17, 18, 10, 18, 10, 7], # row 14
-    [17, 18, 7, 17, 17, 10, 6, 10, 9, 7, 9, 18, 6, 9, 10, 17], # row 15
-    [10, 18, 18, 10, 10, 7, 10, 17, 9, 10, 10, 10, 18, 6, 6, 9], # row 16
-    [10, 17, 18, 6, 7, 17, 10, 6, 10, 17, 10, 10, 10, 10, 10, 18], # row 17
-    [17, 6, 6, 10, 6, 10, 7, 10, 17, 7, 17, 10, 18, 17, 10, 10], # row 18
-    [9, 17, 17, 18, 18, 6, 6, 10, 18, 17, 18, 10, 10, 17, 17, 7], # row 19
-    [17, 17, 10, 9, 17, 10, 10, 6, 18, 7, 10, 10, 6, 12, 7, 7], # row 20
-    [9, 10, 17, 18, 6, 6, 9, 7, 17, 9, 6, 9, 6, 18, 9, 17],     # row 21
-    [18, 17, 17, 9, 6, 18, 9, 18, 18, 10, 6, 17, 18, 17, 17, 18], # row 22
-    [10, 17, 6, 17, 10, 9, 17, 10, 10, 18, 10, 6, 10, 17, 17, 10], # row 23
-    [9, 6, 10, 17, 10, 17, 10, 17, 18, 17, 18, 6, 10, 9, 17, 10], # row 24
-    [17, 6, 6, 17, 6, 6, 10, 10, 9, 10, 18, 18, 17, 17, 9, 18], # row 25
-    [6, 9, 9, 17, 18, 9, 17, 7, 17, 17, 6, 6, 10, 10, 6, 17],   # row 26
-    [10, 10, 6, 17, 9, 18, 6, 10, 10, 17, 9, 9, 10, 17, 17, 9], # row 27
-    [6, 6, 6, 6, 9, 9, 17, 17, 10, 10, 17, 17, 17, 17, 6, 6],  # row 28
-    [6, 16, 9, 9, 17, 17, 17, 10, 10, 9, 9, 6, 17, 10, 9, 10], # row 29
-    [6, 17, 17, 17, 9, 6, 9, 6, 6, 17, 10, 17, 10, 6, 6, 6],   # row 30
-    [10, 9, 9, 17, 10, 6, 9, 17, 9, 6, 9, 17, 17, 6, 9, 17],   # row 31
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 0
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 1
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 2
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 3
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 4
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 5
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 6
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 7
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 8
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 9
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 10
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 11
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 12
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 13
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 14
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 15
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 16
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 17
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 18
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 19
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 20
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 21
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 22
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 23
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 24
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 25
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 26
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 27
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 28
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 29
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 30
+    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 31
 ]
 
 # Формат:
@@ -228,6 +232,17 @@ GAIN_MAP_CSV: Path | None = None
 # Режим одного обычного S-curve запуска. Можно оставить ровно один режим или
 # перечислить несколько. Сравнение всех четырех вынесено в run_crosstalk.py.
 SCURVE_PATTERNS = ("all",)
+# paired: отдельный background перед каждым signal-shot.
+# sparse: background только периодически, а около перехода снимаются полные
+# повторы. Это стандартный ускоренный режим; raw signal никогда не заменяется.
+SCURVE_BACKGROUND_MODE = "sparse"
+SCURVE_SPARSE_BACKGROUND_INTERVAL_CODES = 16
+SCURVE_REPEATS = 1
+SCURVE_ADAPTIVE_REPEATS = True
+SCURVE_WEAK_SIGNAL_STEP_THRESHOLD_V = 0.025
+# tile_measurement: неактивная фаза MASK=0, TST_EN=0.
+# tile_crosstalk: неактивная фаза MASK=1, TST_EN=0 и ее отклик анализируется.
+SCURVE_TILE_MODE = "tile_crosstalk"
 # Используется только в режиме keysight_burst. Для upo_pwm это значение не
 # влияет ни на управление, ни на анализ.
 N_INJECTIONS = 1000
@@ -246,21 +261,16 @@ SCURVE_SCAN_DESCENDING = True
 SCURVE_COARSE_HIGH_CODE: int | None = 1023
 SCURVE_COARSE_LOW_CODE: int | None = 0
 SCURVE_COARSE_STEP = 8
-# После coarse-прохода соседние точки, между которыми расположен уровень 50%,
-# переснимаются с этим шагом. Значение 1 дает максимальную кодовую точность V50.
+# Переход V50 и шумовой колокол всегда измеряются с шагом 1.
+# При первом отклике после крупного шага пропущенные коды заполняются.
 SCURVE_FINE_STEP = 1
 SCURVE_FINE_MARGIN_CODES = 8
 
-# Мягкая остановка около шумовой базовой линии. Сначала полностью сохраняются
-# background и signal для текущего кода. Точка считается шумовой, если не менее
-# заданной доли исправных пикселей имеют background строго больше Nnom *
-# MULTIPLIER. Остановка выполняется только после двух таких кодов подряд, то
-# есть характерные 1-2 точки с количеством отсчетов намного выше N остаются в
-# raw-данных и на диагностических графиках. На coarse-сетке первая надежная
-# шумовая точка уже останавливает движение вниз, поскольку следующий шаг 8
-# может перескочить узкий шумовой пик. В fine-проходе остаются две соседние
-# точки с шагом 1. При PWM Nnom автоматически равно round(Freal * экспозиция
-# УПО), а offline-анализ дополнительно проверяет его по чистому плато.
+# После превышения фоном уровня N скан проходит максимум и спад к N.
+# Требуется заданное число соседних подтверждений с шагом 1 после защищенной
+# шумовой области. PIXEL_FRACTION используется в offline-выборе физической ветви.
+# COARSE_BASELINE_NOISE_CONSECUTIVE_CODES сохранен для старых конфигов;
+# новый адаптивный проход не останавливается на первой шумовой точке.
 SCURVE_BASELINE_NOISE_STOP_ENABLED = True
 SCURVE_BASELINE_NOISE_COUNT_MULTIPLIER = 1.0
 SCURVE_BASELINE_NOISE_PIXEL_FRACTION = 0.10
@@ -297,6 +307,8 @@ PLOT_DPI = 300
 # False: квадратная область карты, как в прежних gain-графиках. True:
 # физически квадратные ячейки и прямоугольная принадлежащая половина 16x32.
 PLOT_SQUARE_PHYSICAL_PIXELS = False
+# Язык автоматических PNG/PDF и общего анализа: "ru" или "en".
+PLOT_LANGUAGE = "ru"
 
 # Источник для локальной HTML-страницы. Допустим каталог эксперимента или
 # конкретный analysis/vNNN. None означает, что путь задается в командной строке.
@@ -323,14 +335,16 @@ ANALYSIS_WORKERS = 0
 PLOT_WORKERS = 0
 RAW_READ_WORKERS = 0
 # Небольшие наборы считаются без процессов, чтобы не тратить время на spawn.
-ANALYSIS_PARALLEL_MIN_GROUPS = 2048
+ANALYSIS_PARALLEL_MIN_GROUPS = 128
 
 # Дополнительный этап только для WINDOW="ALL". После независимых AB/BC/CD
 # пороги D/C/B равномерно распределяются по измеренному напряжению, A=1023,
 # затем REF2 свипируется при одном фиксированном REF1. На каждом Q выполняется
-# указанное число парных background/signal экспозиций.
+# указанное число парных background/signal экспозиций. Этот финальный
+# трехоконный sweep намеренно остается paired независимо от обычного режима
+# SCURVE_BACKGROUND_MODE, поскольку это более короткая итоговая проверка.
 ALL_WINDOW_FINAL_REF_SWEEP_ENABLED = True
-ALL_WINDOW_FINAL_REF_STEP_COUNT = 200
+ALL_WINDOW_FINAL_REF_STEP_COUNT = 100
 ALL_WINDOW_FINAL_REF_REPEATS = 4
 ALL_WINDOW_FINAL_REF_INJECTION_PATTERN = "all"
 ALL_WINDOW_COMMON_SHIFT_Z_THRESHOLD = 3.0
@@ -461,6 +475,14 @@ def build_settings(
     )
     settings.scurve.shutter_duration_s = SCURVE_SHUTTER_DURATION_S
     settings.scurve.injection_patterns = injection_patterns or SCURVE_PATTERNS
+    settings.scurve.background_mode = SCURVE_BACKGROUND_MODE
+    settings.scurve.sparse_background_interval_codes = (
+        SCURVE_SPARSE_BACKGROUND_INTERVAL_CODES
+    )
+    settings.scurve.repeats = SCURVE_REPEATS
+    settings.scurve.adaptive_repeats = SCURVE_ADAPTIVE_REPEATS
+    settings.scurve.weak_signal_dense_scan_below_v = SCURVE_WEAK_SIGNAL_STEP_THRESHOLD_V
+    settings.scurve.tile_mode = SCURVE_TILE_MODE
     settings.scurve.minimum_reference_code = MINIMUM_REFERENCE_CODE
     settings.scurve.maximum_reference_code = MAXIMUM_REFERENCE_CODE
     settings.scurve.minimum_reference_voltage_v = MINIMUM_REFERENCE_VOLTAGE_V
@@ -505,6 +527,7 @@ def build_settings(
         plot_dpi=PLOT_DPI,
         save_pdf_plots=SAVE_PDF_PLOTS,
         square_physical_pixels=PLOT_SQUARE_PHYSICAL_PIXELS,
+        plot_language=PLOT_LANGUAGE,
         scurve_fit_core_low_fraction=SCURVE_FIT_CORE_LOW_FRACTION,
         scurve_fit_core_high_fraction=SCURVE_FIT_CORE_HIGH_FRACTION,
         scurve_plot_noise_peak_search_codes=(
@@ -548,6 +571,7 @@ def build_reference_verification_settings() -> ReferenceStepVerificationSettings
     """Собрать настройки проверки REF через CH1/CH4."""
 
     return ReferenceStepVerificationSettings(
+        plot_language=PLOT_LANGUAGE,
         enabled=VERIFY_REFERENCE_STEPS_BEFORE_TEST,
         signal_channel=REFERENCE_SIGNAL_CHANNEL,
         trigger_channel=REFERENCE_TRIGGER_CHANNEL,

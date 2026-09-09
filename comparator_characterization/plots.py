@@ -14,12 +14,14 @@ from statistics import NormalDist
 from typing import Any
 
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 import pandas as pd
 from pixel_matrix import OWNED_COLUMNS
 
 from .models import AnalysisSettings
 from .parallel import process_pool, process_workers
+from .plot_language import localize_figure
 
 
 _NORMAL = NormalDist()
@@ -141,6 +143,7 @@ def _parallel_figures(function):
 
 
 def _save_figure(figure, directory, stem, settings) -> list[Path]:
+    localize_figure(figure, settings.plot_language, settings.square_physical_pixels)
     writer = _FIGURE_WRITER.get()
     if writer is not None:
         return writer.save(figure, directory, stem, settings)
@@ -213,10 +216,14 @@ def _heatmap(
         cmap=cmap,
         **kwargs,
     )
+    if aspect == "auto":
+        axis.set_box_aspect(1)
     axis.set_xlabel("Physical ASIC column")
     axis.set_ylabel("Physical ASIC row")
     axis.set_title(title)
-    colorbar = figure.colorbar(image, ax=axis, pad=0.02)
+    divider = make_axes_locatable(axis)
+    colorbar_axis = divider.append_axes("right", size="4%", pad=0.10)
+    colorbar = figure.colorbar(image, cax=colorbar_axis)
     colorbar.set_label(colorbar_label)
     return figure
 
@@ -372,13 +379,16 @@ def _scurve_noise_peak_lower_code(
     boundary_code: float,
     settings: AnalysisSettings,
 ) -> float:
-    """Extend a raw-count view to a supported local baseline-noise maximum.
+    """Extend a raw-count view through the local baseline-noise lobe.
 
     The matrix-level fit boundary remains unchanged. A pixel baseline may be
     displaced to either side of that boundary, so the display searches a local
     neighborhood in both directions. A point on the higher-code falling
     shoulder must support the maximum, so a single isolated counter excursion
-    does not move the left plot edge.
+    does not move the left plot edge.  After locating that maximum, the lower
+    edge is moved to the first measured point where the lobe falls back to the
+    effective injection count.  Thus the displayed left side contains the peak
+    and its return shoulder, without exposing the remote opposite-polarity scan.
     """
 
     if settings.scurve_plot_noise_peak_search_codes <= 0:
@@ -396,7 +406,7 @@ def _scurve_noise_peak_lower_code(
         data["background_count"], errors="coerce"
     )
     search_span = float(settings.scurve_plot_noise_peak_search_codes)
-    lower_limit = boundary_code - search_span
+    lower_limit = float(data["threshold_dac_code"].min())
     upper_limit = boundary_code + search_span
     data = data[
         data["threshold_dac_code"].between(lower_limit, upper_limit)
@@ -432,7 +442,12 @@ def _scurve_noise_peak_lower_code(
     supported = bool(np.any(shoulder >= tolerance * peak_value))
     if not supported:
         return boundary_code
-    return float(codes[peak_index])
+    lower_index = peak_index
+    for index in range(peak_index - 1, -1, -1):
+        lower_index = index
+        if float(values[index]) <= substantial_limit:
+            break
+    return float(codes[lower_index])
 
 
 def _scurve_plot_code_window(

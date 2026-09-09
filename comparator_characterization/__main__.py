@@ -113,6 +113,12 @@ def main() -> int:
         default=300,
         help="Разрешение PNG, по умолчанию 300 dpi.",
     )
+    parser.add_argument(
+        "--language",
+        choices=("ru", "en"),
+        default="ru",
+        help="Язык подписей автоматических графиков: ru (по умолчанию) или en.",
+    )
     parser.add_argument("--workers", type=int, default=0,
                         help="Процессы анализа: 0=авто (до 8), 1=последовательно.")
     parser.add_argument("--plot-workers", type=int, default=0,
@@ -130,6 +136,7 @@ def main() -> int:
         plot_dpi=args.dpi,
         save_pdf_plots=not args.no_pdf,
         square_physical_pixels=args.square_pixels,
+        plot_language=args.language,
     )
     common = dict(
         settings=analysis_settings, target_voltage=args.target_voltage,

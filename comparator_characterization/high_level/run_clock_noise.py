@@ -35,6 +35,9 @@ def main() -> None:
                 config.CLOCK_NOISE_MEASUREMENT_FCLK_MHZ
             ),
             injection_pattern=config.CLOCK_NOISE_INJECTION_PATTERN,
+            trim_reference_experiment=(
+                config.CLOCK_NOISE_TRIM_REFERENCE_EXPERIMENT
+            ),
             window=config.WINDOW,
             pixels=config.PIXELS,
             bad_pixel_map=config.BAD_PIXEL_MAP,

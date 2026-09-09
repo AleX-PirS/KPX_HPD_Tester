@@ -364,6 +364,29 @@ class ReferencePairSelection:
         }
 
 
+@dataclass(frozen=True)
+class ReferencePairPlan:
+    """Best realizable subset for one fixed measured REF1 level.
+
+    ``availability`` contains one row per requested step, including rejected
+    steps.  This makes an automatic hardware run explicit and reproducible
+    without turning a partly unsupported amplitude list into a late failure.
+    """
+
+    selections: tuple[ReferencePairSelection, ...]
+    availability: tuple[dict[str, Any], ...]
+    selected_ref1_code: int | None
+    selected_ref1_voltage_v: float | None
+
+    @property
+    def unavailable_steps_v(self) -> tuple[float, ...]:
+        return tuple(
+            float(row["requested_voltage_step_v"])
+            for row in self.availability
+            if not bool(row["realizable"])
+        )
+
+
 def load_reference_dac_calibrations(
     files: Mapping[str, str | Path | ReferenceDacCalibration],
     *,
@@ -645,6 +668,247 @@ def select_reference_dac_pairs(
             )
         )
     return tuple(selections)
+
+
+def plan_reference_dac_pairs(
+    ref1: ReferenceDacCalibration,
+    ref2: ReferenceDacCalibration,
+    requested_voltage_steps_v: Sequence[float],
+    *,
+    minimum_reference_code: int = 401,
+    maximum_reference_code: int = 1023,
+    minimum_reference_voltage_v: float | None = None,
+    preferred_reference_common_mode_v: float | None = None,
+    common_mode_step_error_slack_v: float = 0.0,
+    maximum_reference_step_error_v: float | None = 1e-3,
+) -> ReferencePairPlan:
+    """Return the largest realizable step subset for one fixed low REF1.
+
+    The same physical rules as :func:`select_reference_dac_pairs` apply.  The
+    fixed REF1 candidate that realizes the largest number of requested steps
+    with distinct REF2 codes is selected.  A tie is resolved by the lowest
+    measured REF1 voltage and then by total step error.  At least one physical
+    step must remain; callers may impose a higher minimum for their analysis.
+    """
+
+    requested = tuple(float(value) for value in requested_voltage_steps_v)
+    if not requested:
+        raise ValueError("requested_voltage_steps_v must not be empty")
+    if any(not math.isfinite(value) or value <= 0 for value in requested):
+        raise ValueError("every requested REF voltage step must be finite and positive")
+    if len(set(requested)) != len(requested):
+        raise ValueError("requested REF voltage steps must not contain duplicates")
+    if (
+        not isinstance(minimum_reference_code, int)
+        or isinstance(minimum_reference_code, bool)
+        or not 0 <= minimum_reference_code <= 1023
+    ):
+        raise ValueError("minimum_reference_code must be an integer in 0..1023")
+    if (
+        not isinstance(maximum_reference_code, int)
+        or isinstance(maximum_reference_code, bool)
+        or not 0 <= maximum_reference_code <= 1023
+    ):
+        raise ValueError("maximum_reference_code must be an integer in 0..1023")
+    if minimum_reference_code > maximum_reference_code:
+        raise ValueError("minimum_reference_code must not exceed maximum_reference_code")
+    if minimum_reference_voltage_v is not None:
+        minimum_reference_voltage_v = float(minimum_reference_voltage_v)
+        if not math.isfinite(minimum_reference_voltage_v):
+            raise ValueError("minimum_reference_voltage_v must be finite")
+    if maximum_reference_step_error_v is not None:
+        maximum_reference_step_error_v = float(maximum_reference_step_error_v)
+        if (
+            not math.isfinite(maximum_reference_step_error_v)
+            or maximum_reference_step_error_v < 0
+        ):
+            raise ValueError("maximum_reference_step_error_v must be finite and >= 0")
+    # Accepted only for API compatibility.  The project policy deliberately
+    # fixes the lowest feasible REF1 rather than optimizing common mode.
+    del preferred_reference_common_mode_v, common_mode_step_error_slack_v
+
+    def empty_plan(reason):
+        return ReferencePairPlan(selections=(), availability=tuple(
+            {"requested_voltage_step_v": target, "realizable": False, "reason": reason,
+             "status": "unrealizable", "global_minimum_achievable_step_error_v": None}
+            for target in requested), selected_ref1_code=None, selected_ref1_voltage_v=None)
+
+    ref1_mask = (
+        (ref1.codes >= minimum_reference_code)
+        & (ref1.codes <= maximum_reference_code)
+    )
+    ref2_mask = (
+        (ref2.codes >= minimum_reference_code)
+        & (ref2.codes <= maximum_reference_code)
+    )
+    if minimum_reference_voltage_v is not None:
+        ref1_mask &= ref1.voltages >= minimum_reference_voltage_v
+        ref2_mask &= ref2.voltages >= minimum_reference_voltage_v
+    ref1_codes = ref1.codes[ref1_mask]
+    ref1_voltages = ref1.voltages[ref1_mask]
+    ref2_codes = ref2.codes[ref2_mask]
+    ref2_voltages = ref2.voltages[ref2_mask]
+    if not len(ref1_codes) or not len(ref2_codes):
+        return empty_plan("no measured REF codes satisfy the configured bounds")
+
+    delta = ref1_voltages[:, None] - ref2_voltages[None, :]
+    valid_order = delta > 0
+    if not bool(np.any(valid_order)):
+        return empty_plan("no measured REF pair satisfies V_REF1 > V_REF2")
+    global_minimum_errors = tuple(
+        float(np.min(np.where(valid_order, np.abs(delta - target), np.inf)))
+        for target in requested
+    )
+    error_limit = (
+        float(maximum_reference_step_error_v)
+        if maximum_reference_step_error_v is not None
+        else float("inf")
+    )
+
+    def maximum_assignment(ref1_index: int) -> dict[int, int]:
+        options: dict[int, list[int]] = {}
+        for target_index, target in enumerate(requested):
+            errors = np.abs(delta[ref1_index] - target)
+            permitted = np.flatnonzero(
+                valid_order[ref1_index] & (errors <= error_limit + 1e-15)
+            )
+            options[target_index] = sorted(
+                (int(index) for index in permitted),
+                key=lambda index: (float(errors[index]), int(ref2_codes[index])),
+            )
+        ref2_to_target: dict[int, int] = {}
+
+        def assign(target_index: int, visited: set[int]) -> bool:
+            for ref2_index in options[target_index]:
+                if ref2_index in visited:
+                    continue
+                visited.add(ref2_index)
+                previous = ref2_to_target.get(ref2_index)
+                if previous is None or assign(previous, visited):
+                    ref2_to_target[ref2_index] = target_index
+                    return True
+            return False
+
+        for target_index in sorted(
+            options,
+            key=lambda index: (len(options[index]), requested[index], index),
+        ):
+            assign(target_index, set())
+        return {
+            target_index: ref2_index
+            for ref2_index, target_index in ref2_to_target.items()
+        }
+
+    candidates: list[tuple[tuple[float, ...], int, dict[int, int]]] = []
+    for ref1_index in range(len(ref1_codes)):
+        assignment = maximum_assignment(ref1_index)
+        if not assignment:
+            continue
+        errors = [
+            abs(float(delta[ref1_index, ref2_index]) - requested[target_index])
+            for target_index, ref2_index in assignment.items()
+        ]
+        score = (
+            -float(len(assignment)),
+            float(ref1_voltages[ref1_index]),
+            float(sum(errors)),
+            float(max(errors)),
+            float(ref1_codes[ref1_index]),
+        )
+        candidates.append((score, ref1_index, assignment))
+    if not candidates:
+        return empty_plan("no requested REF step fits the bounds and tolerance")
+    _, selected_ref1_index, assignment = min(candidates, key=lambda item: item[0])
+    code1 = int(ref1_codes[selected_ref1_index])
+    voltage1 = float(ref1_voltages[selected_ref1_index])
+    method = (
+        "fixed_lowest_measured_REF1_voltage_maximum_realizable_subset_"
+        "then_distinct_nearest_REF2_within_step_tolerance"
+    )
+    selections: list[ReferencePairSelection] = []
+    availability: list[dict[str, Any]] = []
+    for target_index, target in enumerate(requested):
+        ref2_index = assignment.get(target_index)
+        if ref2_index is None:
+            local_errors = np.abs(delta[selected_ref1_index] - target)
+            local_valid = valid_order[selected_ref1_index]
+            local_minimum = float(
+                np.min(np.where(local_valid, local_errors, np.inf))
+            )
+            has_local_candidate = bool(
+                np.any(local_valid & (local_errors <= error_limit + 1e-15))
+            )
+            availability.append(
+                {
+                    "requested_voltage_step_v": target,
+                    "realizable": False,
+                    "status": (
+                        "rejected_distinct_REF2_conflict"
+                        if has_local_candidate
+                        else "rejected_no_REF2_within_tolerance_at_fixed_REF1"
+                    ),
+                    "selected_ref1_code": code1,
+                    "selected_ref1_voltage_v": voltage1,
+                    "selected_ref2_code": None,
+                    "selected_ref2_voltage_v": None,
+                    "actual_voltage_step_v": None,
+                    "absolute_voltage_step_error_v": None,
+                    "minimum_error_at_selected_ref1_v": local_minimum,
+                    "global_minimum_achievable_step_error_v": (
+                        global_minimum_errors[target_index]
+                    ),
+                }
+            )
+            continue
+        code2 = int(ref2_codes[ref2_index])
+        voltage2 = float(ref2_voltages[ref2_index])
+        actual = voltage1 - voltage2
+        signed_error = actual - target
+        selection = ReferencePairSelection(
+            requested_voltage_step_v=target,
+            actual_voltage_step_v=actual,
+            voltage_step_error_v=signed_error,
+            absolute_voltage_step_error_v=abs(signed_error),
+            ref1_code=code1,
+            ref2_code=code2,
+            ref1_voltage_v=voltage1,
+            ref2_voltage_v=voltage2,
+            reference_common_mode_v=0.5 * (voltage1 + voltage2),
+            selection_method=method,
+            minimum_reference_code=minimum_reference_code,
+            maximum_reference_code=maximum_reference_code,
+            minimum_reference_voltage_v=minimum_reference_voltage_v,
+            selected_common_mode_target_v=None,
+            common_mode_step_error_slack_v=0.0,
+            minimum_achievable_step_error_v=global_minimum_errors[target_index],
+            fixed_ref1_voltage_v=voltage1,
+            ref1_shared_across_amplitudes=True,
+        )
+        selections.append(selection)
+        availability.append(
+            {
+                "requested_voltage_step_v": target,
+                "realizable": True,
+                "status": "selected",
+                "selected_ref1_code": code1,
+                "selected_ref1_voltage_v": voltage1,
+                "selected_ref2_code": code2,
+                "selected_ref2_voltage_v": voltage2,
+                "actual_voltage_step_v": actual,
+                "absolute_voltage_step_error_v": abs(signed_error),
+                "minimum_error_at_selected_ref1_v": abs(signed_error),
+                "global_minimum_achievable_step_error_v": (
+                    global_minimum_errors[target_index]
+                ),
+            }
+        )
+    selections.sort(key=lambda item: requested.index(item.requested_voltage_step_v))
+    return ReferencePairPlan(
+        selections=tuple(selections),
+        availability=tuple(availability),
+        selected_ref1_code=code1,
+        selected_ref1_voltage_v=voltage1,
+    )
 
 
 def load_threshold_dac_calibrations(

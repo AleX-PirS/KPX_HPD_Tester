@@ -29,6 +29,7 @@ from .storage import atomic_write_json, atomic_write_table, utc_now_text
 class ReferenceStepVerificationSettings:
     """Fully explicit oscilloscope and acceptance settings for REF verification."""
 
+    plot_language: str = "ru"
     enabled: bool = True
     signal_channel: int = 1
     trigger_channel: int = 4
@@ -58,6 +59,8 @@ class ReferenceStepVerificationSettings:
     save_screenshots: bool = False
 
     def validate(self) -> None:
+        if self.plot_language not in {"ru", "en"}:
+            raise ValueError("plot_language must be ru or en")
         if not isinstance(self.enabled, bool):
             raise TypeError("reference verification enabled must be bool")
         for name in ("signal_channel", "trigger_channel"):
@@ -346,7 +349,7 @@ def _comparison_table(captures: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _save_summary_plot(comparison: pd.DataFrame, output: Path) -> Path | None:
+def _save_summary_plot(comparison: pd.DataFrame, output: Path, language="ru") -> Path | None:
     if comparison.empty:
         return None
     import matplotlib.pyplot as plt
@@ -388,6 +391,8 @@ def _save_summary_plot(comparison: pd.DataFrame, output: Path) -> Path | None:
     axes[1].set_ylabel("CLK ON - CLK OFF step, mV")
     axes[1].set_title("Clock influence on measured step")
     output.parent.mkdir(parents=True, exist_ok=True)
+    from .plot_language import localize_figure
+    localize_figure(figure, language)
     figure.savefig(output, dpi=200, bbox_inches="tight")
     plt.close(figure)
     return output
@@ -607,7 +612,7 @@ def verify_reference_steps(
         output_directory / "clk_comparison.csv", comparison
     )
     plot_path = _save_summary_plot(
-        comparison, output_directory / "reference_step_verification.png"
+        comparison, output_directory / "reference_step_verification.png", settings.plot_language
     )
     failed_count = sum(not bool(row.get("capture_pass")) for row in captures)
     passed = bool(
