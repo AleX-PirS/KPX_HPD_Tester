@@ -145,7 +145,7 @@ REFERENCE_LUT_VOLTAGE_UNIT = "auto"
 # Пользователь задает только требуемые положительные ступеньки REF1-REF2.
 # Единица здесь mV. Скрипт выбирает измеренные LUT-точки и всегда требует
 # физическое условие V_REF1 > V_REF2.
-INJECTION_STEPS_MV = (10.0, 20.0, 30.0, 40.0, 50.0, 75.0, 100.0, 150.0, 250.0)
+INJECTION_STEPS_MV = (5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 75.0, 100.0, 150.0, 250.0)
 
 # Быстрый автономный тест шума по измерительному FCLK. Для полноценного sweep
 # задайте, например, (1, 5, 10, 25, 50). Безопасный исходный default содержит
@@ -173,39 +173,40 @@ MAXIMUM_REFERENCE_STEP_ERROR_V: float | None = 1e-3
 
 # Выберите ровно один источник GAIN для S-curve: код ИЛИ CSV.
 # Значения GAIN: целые числа 0..31 для каждого выбранного исправного пикселя.
+_UG = 4
 _GAIN_VALUES = [
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 0
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 1
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 2
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 3
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 4
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 5
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 6
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 7
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 8
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 9
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 10
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 11
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 12
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 13
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 14
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 15
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 16
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 17
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 18
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 19
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 20
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 21
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 22
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 23
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 24
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 25
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 26
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 27
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 28
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 29
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 30
-    [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],  # row 31
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 0
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 1
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 2
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 3
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 4
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 5
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 6
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 7
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 8
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 9
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 10
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 11
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 12
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 13
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 14
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 15
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 16
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 17
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 18
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 19
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 20
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 21
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 22
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 23
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 24
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 25
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 26
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 27
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 28
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 29
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 30
+    [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 31
 ]
 
 # Формат:
@@ -246,7 +247,7 @@ SCURVE_TILE_MODE = "tile_crosstalk"
 # Используется только в режиме keysight_burst. Для upo_pwm это значение не
 # влияет ни на управление, ни на анализ.
 N_INJECTIONS = 1000
-NOISE_SHUTTER_DURATION_S = 0.001
+NOISE_SHUTTER_DURATION_S = 0.010
 # Это единственное значение экспозиции, по которому upo_pwm вычисляет
 # N_nom=round(Freal*T). Оно должно совпадать с ручной настройкой GUI УПО.
 # При 100 кГц и 0.010 с получается номинально 1000 отрицательных фронтов.
@@ -258,8 +259,8 @@ NOISE_REPEATS = 4
 SCURVE_SCAN_DESCENDING = True
 # None означает крайний код, реально присутствующий в LUT. Для полной
 # характеристики 0..1023 явные значения ниже эквивалентны None.
-SCURVE_COARSE_HIGH_CODE: int | None = 1023
-SCURVE_COARSE_LOW_CODE: int | None = 0
+SCURVE_COARSE_HIGH_CODE: int | None = 900
+SCURVE_COARSE_LOW_CODE: int | None = 100
 SCURVE_COARSE_STEP = 8
 # Переход V50 и шумовой колокол всегда измеряются с шагом 1.
 # При первом отклике после крупного шага пропущенные коды заполняются.
