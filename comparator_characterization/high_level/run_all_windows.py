@@ -31,7 +31,6 @@ def main() -> None:
             base_pixel_config=config.base_pixel_config(),
             results_root=config.RESULTS_ROOT,
             settings=settings,
-            gain_map=config.gain_map(),
             run_noise_scan=True,
             run_equalization=True,
             run_scurve=True,
@@ -40,6 +39,7 @@ def main() -> None:
             **config.reference_hardware_arguments(
                 oscilloscope, required_for_scurve=True
             ),
+            **config.gain_hardware_arguments(),
             **config.injection_hardware_arguments(generator),
         )
     print(f"Связанная характеризация трех окон завершена: {result.experiment_path}")

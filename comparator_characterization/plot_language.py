@@ -16,6 +16,7 @@ _EN_TO_RU_EXACT = {
     "Common component": "Общая компонента",
     "Target": "Цель эквализации",
     "Trim = 0": "Trim = 0",
+    "Trim = 16": "Trim = 16",
     "Trim = 31": "Trim = 31",
     "Equalized": "После эквализации",
     "Baseline": "Базовая линия",
@@ -29,6 +30,7 @@ _EN_TO_RU_EXACT = {
     "Pixel count": "Число пикселей",
     "Fit count": "Число аппроксимаций",
     "Trim code": "Код подстройки",
+    "PX_GAIN code": "Код PX_GAIN",
     "Pearson r": "Коэффициент Пирсона r",
     "Q50, electrons": "Q50, электроны",
     "Offset, V": "Смещение, В",
@@ -143,6 +145,10 @@ _EN_TO_RU_PARTS = (
     (
         "AB/BC/CD trim distributions",
         "Распределения подстроек AB/BC/CD",
+    ),
+    (
+        "GAIN sweep",
+        "Свип GAIN",
     ),
     (
         "Compensated - raw gain",

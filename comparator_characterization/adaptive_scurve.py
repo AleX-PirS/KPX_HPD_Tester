@@ -15,7 +15,7 @@ def noise_reference_band(statistics, pixels, settings):
     if statistics is None or statistics.empty:
         return None
     data = statistics.copy()
-    for stage in ('equalized_final', 'baseline_noise', 'trim_00'):
+    for stage in ('equalized_final', 'baseline_noise', 'trim_16', 'trim_00'):
         selected = data[data.stage == stage]
         if not selected.empty:
             data = selected
@@ -35,7 +35,8 @@ def noise_reference_band(statistics, pixels, settings):
 def acquire_adaptive_scurve(*, backend, store, calibration, spec, pixels, trim_map,
         stage, scan_phase, codes, pulse_amplitude, pulse_amplitude_configuration,
         gain_map, injection_group, upper_non_limiting_code, noise_settings,
-        scurve_settings, measurement_fclk_mhz=None, noise_statistics=None):
+        scurve_settings, measurement_fclk_mhz=None, noise_statistics=None,
+        gain_sweep_code=None):
     settings = scurve_settings
     settings.validate()
     pixels = backend.active_pixels(pixels)
@@ -46,7 +47,10 @@ def acquire_adaptive_scurve(*, backend, store, calibration, spec, pixels, trim_m
     programmed_trim = backend.program_trim_map(spec, pixels, trim_map, commit=False)
     rows = backend.program_scurve_pixel_configuration(pixels, gain_map=gain_map,
         active_injection_pixels=active, tile_mode=settings.tile_mode)
-    store.write_table(store.root/'inputs/scurve_pixel_configuration'/f'{stage}_{group.group_id}.csv', pd.DataFrame(rows))
+    configuration_directory = store.root/'inputs/scurve_pixel_configuration'
+    if gain_sweep_code is not None:
+        configuration_directory = configuration_directory/f'gain_{int(gain_sweep_code):02d}'
+    store.write_table(configuration_directory/f'{stage}_{group.group_id}.csv', pd.DataFrame(rows))
     descending = settings.scan_descending
     direction = -1 if descending else 1
     planned = tuple(sorted(set(int(c) for c in codes), reverse=descending))
@@ -77,10 +81,12 @@ def acquire_adaptive_scurve(*, backend, store, calibration, spec, pixels, trim_m
             'threshold_dac_code':code, 'repeat_index':repeat, 'pulse_amplitude':pulse_amplitude,
             'injection_pattern':group.pattern, 'injection_group_id':group.group_id,
             'measurement_fclk_mhz':measurement_fclk_mhz,
+            'gain_sweep_code':gain_sweep_code,
             'scurve_background_mode':settings.background_mode, 'scurve_tile_mode':settings.tile_mode}
         pair_id = ExperimentStore.acquisition_id(json.dumps(common, sort_keys=True, ensure_ascii=True))
         outcome = _acquire_point(backend=backend, store=store, calibration=calibration,
             spec=spec, pixels=pixels, trim_map=programmed_trim, upper_non_limiting_code=upper_non_limiting_code,
+            gain_map=gain_map,
             descriptor={**common, 'acquisition_type':kind},
             request=ShotRequest(measurement_kind='scurve', acquisition_type=kind,
                 shutter_duration_s=settings.shutter_duration_s, test_pulses=kind=='signal',

@@ -31,8 +31,9 @@ def main() -> None:
             base_pixel_config=config.base_pixel_config(),
             results_root=config.RESULTS_ROOT,
             settings=settings,
-            gain_map=config.gain_map(),
-            noise_reference_experiment=config.noise_reference_path(),
+            noise_reference_experiment=config.noise_reference_path(
+                for_gain_sweep=config.gain_sweep_enabled()
+            ),
             run_noise_scan=False,
             run_equalization=False,
             run_scurve=True,
@@ -41,6 +42,7 @@ def main() -> None:
             **config.reference_hardware_arguments(
                 oscilloscope, required_for_scurve=True
             ),
+            **config.gain_hardware_arguments(),
             **config.injection_hardware_arguments(generator),
         )
     print(f"S-curve эксперимент завершен: {result.experiment_path}")

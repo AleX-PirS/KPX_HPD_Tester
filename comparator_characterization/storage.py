@@ -40,6 +40,7 @@ INDEX_FIELDS = (
     "threshold_dac_code",
     "repeat_index",
     "pulse_amplitude",
+    "gain_sweep_code",
     "status",
     "row_count",
     "relative_path",
@@ -287,6 +288,7 @@ class ExperimentStore:
                 "threshold_dac_code",
                 "repeat_index",
                 "pulse_amplitude",
+                "gain_sweep_code",
                 "injection_pattern",
                 "injection_group_id",
             )
@@ -349,7 +351,13 @@ class ExperimentStore:
             f"{acquisition_type}{amplitude_tag}_repeat_{repeat:03d}_"
             f"{acquisition_id}.csv"
         )
-        return Path(kind) / stage / phase / f"dac_{code:04d}" / filename
+        gain_code = descriptor.get("gain_sweep_code")
+        gain_path = (
+            Path(f"gain_{int(gain_code):02d}")
+            if gain_code is not None and str(gain_code) != ""
+            else Path()
+        )
+        return Path(kind) / gain_path / stage / phase / f"dac_{code:04d}" / filename
 
     def write_acquisition(
         self,

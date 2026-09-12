@@ -504,7 +504,9 @@ def generate_analysis_report(
     if not noise_fits.empty:
         lines.extend(["", "## Noise scan и эквализация", ""])
         noise_rows: list[list[Any]] = []
-        for stage in ("trim_00", "trim_31", "equalized_final", "baseline_noise"):
+        for stage in (
+            "trim_00", "trim_16", "trim_31", "equalized_final", "baseline_noise"
+        ):
             data = noise_fits[noise_fits["stage"].astype(str) == stage]
             if data.empty:
                 continue

@@ -65,7 +65,10 @@ def plot_window_pixels(analysis_paths, *, directory, settings):
                         if not final.empty:
                             ax.scatter(final.local_trim_code,final.center_selected_v*1000,marker='*',s=100,color='C3',label='equalized_final',zorder=5);any_data=True
                     else:
-                        for stage in ('trim_00','trim_31','equalized_final','baseline_noise'):
+                        for stage in (
+                            'trim_00','trim_16','trim_31',
+                            'equalized_final','baseline_noise'
+                        ):
                             curve = frame[frame.stage==stage].sort_values('threshold_voltage_v')
                             if not curve.empty:
                                 ax.plot(curve.threshold_voltage_v*1000,curve.mean_count,'.-',ms=2,label=stage);any_data=True

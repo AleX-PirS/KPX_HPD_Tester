@@ -142,6 +142,15 @@ REFERENCE_DAC_LUTS = {
 # задайте "V", "mV" или "uV", чтобы исключить неверную единицу.
 REFERENCE_LUT_VOLTAGE_UNIT = "auto"
 
+# Режим задания REF:
+# "lut" выбирает пары по REFERENCE_DAC_LUTS и INJECTION_STEPS_MV;
+# "manual" использует ровно одну заданную пару кодов и пользовательский
+# эквивалент ступеньки, не обращаясь к REF LUT.
+REFERENCE_MODE = "lut"
+MANUAL_REF1_CODE = 600
+MANUAL_REF2_CODE = 800
+MANUAL_REF_EQUIVALENT_STEP_MV = 100.0
+
 # Пользователь задает только требуемые положительные ступеньки REF1-REF2.
 # Единица здесь mV. Скрипт выбирает измеренные LUT-точки и всегда требует
 # физическое условие V_REF1 > V_REF2.
@@ -171,9 +180,30 @@ REFERENCE_COMMON_MODE_STEP_ERROR_SLACK_V = 0.0
 # Максимально допустимая ошибка выбранной по LUT ступеньки: 1 мВ.
 MAXIMUM_REFERENCE_STEP_ERROR_V: float | None = 1e-3
 
-# Выберите ровно один источник GAIN для S-curve: код ИЛИ CSV.
-# Значения GAIN: целые числа 0..31 для каждого выбранного исправного пикселя.
-_UG = 4
+# Одно число запускает обычную S-кривую. Список/tuple, например (4, 8, 12),
+# запускает S-кривые последовательно для нескольких единообразных GAIN-кодов.
+# Noise scan и эквализация при таком свипе не повторяются для каждого GAIN.
+_UG: int | Sequence[int] = 4
+
+
+def _configured_ug_codes() -> tuple[int, ...]:
+    values = (_UG,) if isinstance(_UG, int) and not isinstance(_UG, bool) else _UG
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError("_UG must be an integer or a sequence of integers")
+    codes: list[int] = []
+    for value in values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("every _UG sweep item must be an integer")
+        if not 0 <= value <= 31:
+            raise ValueError("every _UG value must be in 0..31")
+        if value not in codes:
+            codes.append(value)
+    if not codes:
+        raise ValueError("_UG sweep must not be empty")
+    return tuple(codes)
+
+
+_UG_DEFAULT_MAP_VALUE = _configured_ug_codes()[0]
 _GAIN_VALUES = [
     [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 0
     [_UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG, _UG],  # row 1
@@ -213,7 +243,11 @@ _GAIN_VALUES = [
 #   key   = (column, row)
 #   value = GAIN, 0..31
 GAIN_MAP: Mapping[tuple[int, int], int] = {
-    (column, row): _GAIN_VALUES[row][column - 16]
+    (column, row): (
+        _GAIN_VALUES[row][column - 16]
+        if isinstance(_UG, int) and not isinstance(_UG, bool)
+        else _UG_DEFAULT_MAP_VALUE
+    )
     for row in range(32)
     for column in range(16, 32)
 }
@@ -296,6 +330,11 @@ RESULTS_ROOT = PROJECT_ROOT / "results"
 # Нужен для отдельного S-curve/crosstalk запуска. Укажите каталог завершенного
 # noise+equalization эксперимента.
 NOISE_REFERENCE_EXPERIMENT: Path | None = None
+# Необязательная отдельная reference для _UG-свипа в run_scurve.py. Если _UG
+# является списком/tuple, этот путь имеет приоритет над общей reference выше.
+# Из эксперимента загружаются final trim-карта и noise statistics; noise scan
+# повторно не выполняется.
+UG_SWEEP_NOISE_REFERENCE_EXPERIMENT: Path | None = None
 
 # Пиксели для подробных графиков задаются физическими (column, row).
 # Пустой кортеж включает автоматический выбор типичных пикселей.
@@ -438,13 +477,39 @@ def gain_map() -> Mapping[tuple[int, int], int] | Sequence[int] | Sequence[Seque
     )
 
 
-def noise_reference_path() -> Path:
-    if NOISE_REFERENCE_EXPERIMENT is None:
-        raise ValueError("Не задан NOISE_REFERENCE_EXPERIMENT")
-    path = Path(NOISE_REFERENCE_EXPERIMENT)
+def noise_reference_path(*, for_gain_sweep: bool = False) -> Path:
+    selected = (
+        UG_SWEEP_NOISE_REFERENCE_EXPERIMENT
+        if for_gain_sweep and UG_SWEEP_NOISE_REFERENCE_EXPERIMENT is not None
+        else NOISE_REFERENCE_EXPERIMENT
+    )
+    if selected is None:
+        name = (
+            "UG_SWEEP_NOISE_REFERENCE_EXPERIMENT или NOISE_REFERENCE_EXPERIMENT"
+            if for_gain_sweep
+            else "NOISE_REFERENCE_EXPERIMENT"
+        )
+        raise ValueError(f"Не задан {name}")
+    path = Path(selected)
     if not (path / "metadata.json").is_file():
         raise FileNotFoundError(f"Не найден завершенный noise-эксперимент: {path}")
     return path
+
+
+def gain_hardware_arguments() -> dict[str, Any]:
+    """Return one per-pixel map or a uniform _UG sweep definition."""
+
+    if isinstance(_UG, Sequence) and not isinstance(_UG, (str, bytes)):
+        if GAIN_MAP_CSV is not None:
+            raise ValueError(
+                "_UG sweep cannot be combined with GAIN_MAP_CSV"
+            )
+        return {"gain_sweep_codes": _configured_ug_codes()}
+    return {"gain_map": gain_map()}
+
+
+def gain_sweep_enabled() -> bool:
+    return isinstance(_UG, Sequence) and not isinstance(_UG, (str, bytes))
 
 
 def injection_voltage_steps_v() -> tuple[float, ...]:
@@ -611,18 +676,31 @@ def reference_hardware_arguments(
     verify = bool(VERIFY_REFERENCE_STEPS_BEFORE_TEST)
     if not (required_for_scurve or verify):
         return {}
-    arguments: dict[str, Any] = {
-        "reference_calibration_files": reference_calibration_files(),
-        "injection_voltage_steps_v": tuple(
-            float(value) * 1e-3
-            for value in (
-                INJECTION_STEPS_MV
-                if injection_steps_mv is None
-                else injection_steps_mv
-            )
-        ),
-        "reference_calibration_voltage_unit": REFERENCE_LUT_VOLTAGE_UNIT,
-    }
+    mode = str(REFERENCE_MODE).strip().lower()
+    if mode == "lut":
+        arguments: dict[str, Any] = {
+            "reference_calibration_files": reference_calibration_files(),
+            "injection_voltage_steps_v": tuple(
+                float(value) * 1e-3
+                for value in (
+                    INJECTION_STEPS_MV
+                    if injection_steps_mv is None
+                    else injection_steps_mv
+                )
+            ),
+            "reference_calibration_voltage_unit": REFERENCE_LUT_VOLTAGE_UNIT,
+        }
+    elif mode == "manual":
+        equivalent_step = float(MANUAL_REF_EQUIVALENT_STEP_MV) * 1e-3
+        arguments = {
+            "manual_reference_configuration": {
+                "DAC_TST_REF1": MANUAL_REF1_CODE,
+                "DAC_TST_REF2": MANUAL_REF2_CODE,
+                "voltage_step_v": equivalent_step,
+            }
+        }
+    else:
+        raise ValueError("REFERENCE_MODE must be 'lut' or 'manual'")
     if verify:
         if oscilloscope is None:
             raise RuntimeError("Проверка REF включена, но осциллограф не был открыт")
@@ -705,12 +783,17 @@ def run_characterization(client, calibration_files, **kwargs):
         if EO_OVERRIDES:
             kwargs["eo_overrides"] = EO_OVERRIDES
         kwargs.pop("window", None)
+        joint_ref_sweep_enabled = (
+            ALL_WINDOW_FINAL_REF_SWEEP_ENABLED
+            and str(REFERENCE_MODE).strip().lower() == "lut"
+            and not gain_sweep_enabled()
+        )
         return characterize_all_windows(
             client,
             calibration_files,
             resume_experiment=RESUME_EXPERIMENT,
             all_window_settings=AllWindowSettings(
-                final_ref_sweep_enabled=ALL_WINDOW_FINAL_REF_SWEEP_ENABLED,
+                final_ref_sweep_enabled=joint_ref_sweep_enabled,
                 final_ref_step_count=ALL_WINDOW_FINAL_REF_STEP_COUNT,
                 final_ref_repeats=ALL_WINDOW_FINAL_REF_REPEATS,
                 final_ref_injection_pattern=ALL_WINDOW_FINAL_REF_INJECTION_PATTERN,

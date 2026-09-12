@@ -766,6 +766,7 @@ def _plot_heatmap(
                     for stage in (
                         "equalized_final",
                         "baseline_noise",
+                        "trim_16",
                         "trim_00",
                         "trim_31",
                     )

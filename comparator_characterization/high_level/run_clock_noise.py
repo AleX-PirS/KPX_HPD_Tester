@@ -44,7 +44,6 @@ def main() -> None:
             base_pixel_config=config.base_pixel_config(),
             results_root=config.RESULTS_ROOT,
             settings=settings,
-            gain_map=config.gain_map(),
             initialization_fclk_mhz=config.ASIC_MAIN_FCLK_MHZ,
             measurement_fclk_mhz=config.ASIC_MEASUREMENT_FCLK_MHZ,
             eo_overrides=config.EO_OVERRIDES,
@@ -54,6 +53,7 @@ def main() -> None:
                 required_for_scurve=True,
                 injection_steps_mv=(config.CLOCK_NOISE_INJECTION_STEP_MV,),
             ),
+            **config.gain_hardware_arguments(),
             **config.injection_hardware_arguments(generator),
         )
     print(f"FCLK noise test завершен: {result.experiment_path}")

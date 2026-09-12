@@ -816,6 +816,7 @@ def generate_diagnostic_plots(
 
     stage_styles = {
         "trim_00": ("Trim = 0", "#1f77b4"),
+        "trim_16": ("Trim = 16", "#ff7f0e"),
         "trim_31": ("Trim = 31", "#d62728"),
         "equalized_final": ("Equalized", "#2ca02c"),
         "baseline_noise": ("Baseline", "#9467bd"),
@@ -902,7 +903,9 @@ def generate_diagnostic_plots(
         # visually hides the much narrower equalized population. Keep both
         # views and give every measured stage an independent, data-driven scale.
         displayed_stages = [
-            stage for stage in ("trim_00", "equalized_final", "trim_31", "baseline_noise")
+            stage for stage in (
+                "trim_00", "trim_16", "equalized_final", "trim_31", "baseline_noise"
+            )
             if stage in available_distributions
         ]
         figure, axes = plt.subplots(
@@ -1316,7 +1319,9 @@ def generate_diagnostic_plots(
                         )
 
         uniform_stages = noise_statistics[
-            noise_statistics["stage"].astype(str).isin(("trim_00", "trim_31"))
+            noise_statistics["stage"].astype(str).isin(
+                ("trim_00", "trim_16", "trim_31")
+            )
             | noise_statistics["stage"].astype(str).str.startswith("trim_full_")
         ].copy()
         if not uniform_stages.empty:
@@ -1439,7 +1444,9 @@ def generate_diagnostic_plots(
                 outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
 
     representative_stage = next((
-        stage for stage in ("equalized_final", "trim_00", "baseline_noise", "trim_31")
+        stage for stage in (
+            "equalized_final", "trim_16", "trim_00", "baseline_noise", "trim_31"
+        )
         if not _stage_frame(noise_fits, stage).empty
     ), "trim_00")
     representative_fits = _stage_frame(noise_fits, representative_stage)
@@ -2132,6 +2139,47 @@ def generate_diagnostic_plots(
                 .drop_duplicates("pulse_amplitude_native")
                 .sort_values("actual_step")
             )
+            manual_pair = (
+                not pair_table.empty
+                and "reference_pair_selection_method" in pair_table
+                and pair_table["reference_pair_selection_method"]
+                .astype(str)
+                .str.startswith("explicit_manual")
+                .all()
+            )
+            if manual_pair:
+                plt.close(figure)
+                manual_figure, manual_axes = plt.subplots(
+                    1, 2, figsize=(9.4, 4.2)
+                )
+                manual_row = pair_table.iloc[0]
+                manual_axes[0].bar(
+                    ("REF1", "REF2"),
+                    (
+                        float(manual_row["ref1_dac_code"]),
+                        float(manual_row["ref2_dac_code"]),
+                    ),
+                    color=("#e45756", "#72b7b2"),
+                )
+                manual_axes[0].set_ylabel("Explicit DAC code")
+                manual_axes[0].set_title("Programmed REF codes")
+                manual_axes[1].bar(
+                    ("User equivalent",),
+                    (1000.0 * float(manual_row["actual_step"]),),
+                    color="#4c78a8",
+                )
+                manual_axes[1].set_ylabel("Equivalent step, mV")
+                manual_axes[1].set_title("Configured value, not LUT measurement")
+                manual_figure.suptitle(
+                    "Manual REF configuration and user-equivalent step"
+                )
+                outputs["reference_pair_selection"] = _save_figure(
+                    manual_figure,
+                    plot_directory,
+                    "reference_pair_selection",
+                    settings,
+                )
+                pair_table = pair_table.iloc[0:0]
             if not pair_table.empty:
                 x = 1000 * pair_table["requested_step"].fillna(pair_table["actual_step"])
                 y = 1000 * pair_table["actual_step"]
@@ -2180,7 +2228,11 @@ def generate_diagnostic_plots(
             else:
                 plt.close(figure)
 
-        for pattern, data in summary.groupby("injection_pattern", sort=True):
+        if "gain_sweep_code" not in summary:
+            summary["gain_sweep_code"] = np.nan
+        for (gain_code, pattern), data in summary.groupby(
+            ["gain_sweep_code", "injection_pattern"], dropna=False, sort=True
+        ):
             charge = _numeric_series(data, "injection_charge_electrons")
             step = _numeric_series(data, "injection_voltage_step_v")
             if charge.notna().all() and charge.nunique() > 1:
@@ -2221,12 +2273,81 @@ def generate_diagnostic_plots(
             axes[1].set_ylabel("S-curve width, mV")
             for axis in axes:
                 axis.set_xlabel(x_label)
-            figure.suptitle(f"Matrix amplitude response, pattern {pattern}")
-            stem = f"matrix_amplitude_response_{_safe_stem(pattern)}"
+            gain_label = (
+                f", GAIN {int(gain_code)}" if math.isfinite(_number(gain_code)) else ""
+            )
+            figure.suptitle(
+                f"Matrix amplitude response, pattern {pattern}{gain_label}"
+            )
+            stem = (
+                f"matrix_amplitude_response_{_safe_stem(pattern)}"
+                + (f"_gain_{int(gain_code):02d}" if gain_label else "")
+            )
             outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
 
+        gain_codes = pd.to_numeric(
+            summary.get("gain_sweep_code", pd.Series(dtype=float)),
+            errors="coerce",
+        )
+        if gain_codes.nunique() > 1:
+            gain_summary = summary.copy()
+            gain_summary["gain_sweep_code"] = gain_codes
+            gain_summary = gain_summary.dropna(subset=["gain_sweep_code"])
+            for plot_index, ((amplitude, pattern), data) in enumerate(
+                gain_summary.groupby(
+                    ["pulse_amplitude_native", "injection_pattern"],
+                    dropna=False,
+                    sort=True,
+                )
+            ):
+                data = data.sort_values("gain_sweep_code")
+                x = data["gain_sweep_code"].to_numpy(dtype=float)
+                figure, axes = plt.subplots(1, 2, figsize=(10.8, 4.3))
+                axes[0].plot(x, data["v50_median_v"], marker="o")
+                axes[0].fill_between(
+                    x,
+                    pd.to_numeric(data["v50_q10_v"], errors="coerce"),
+                    pd.to_numeric(data["v50_q90_v"], errors="coerce"),
+                    alpha=0.22,
+                )
+                axes[0].set_ylabel("V50, V")
+                axes[1].plot(
+                    x,
+                    1000.0 * pd.to_numeric(
+                        data["sigma_median_v"], errors="coerce"
+                    ),
+                    marker="o",
+                    color="#d95f02",
+                )
+                axes[1].fill_between(
+                    x,
+                    1000.0 * pd.to_numeric(
+                        data["sigma_q10_v"], errors="coerce"
+                    ),
+                    1000.0 * pd.to_numeric(
+                        data["sigma_q90_v"], errors="coerce"
+                    ),
+                    alpha=0.22,
+                    color="#d95f02",
+                )
+                axes[1].set_ylabel("S-curve width, mV")
+                for axis in axes:
+                    axis.set_xlabel("PX_GAIN code")
+                    axis.set_xticks(x)
+                figure.suptitle(
+                    f"GAIN sweep: {_amplitude_label(data)}, pattern {pattern}"
+                )
+                stem = f"gain_sweep_response_{plot_index:03d}_{_safe_stem(pattern)}"
+                outputs[stem] = _save_figure(
+                    figure, plot_directory, stem, settings
+                )
+
     if not scurve_gain_results.empty:
-        for pattern, data in scurve_gain_results.groupby("injection_pattern", sort=True):
+        if "gain_sweep_code" not in scurve_gain_results:
+            scurve_gain_results["gain_sweep_code"] = np.nan
+        for (gain_code, pattern), data in scurve_gain_results.groupby(
+            ["gain_sweep_code", "injection_pattern"], dropna=False, sort=True
+        ):
             gain = pd.to_numeric(data["nominal_gain_mv_per_ke"], errors="coerce")
             usable = data[gain.notna()].copy()
             if usable.empty:
@@ -2257,17 +2378,36 @@ def generate_diagnostic_plots(
             axes[1].set_ylabel("Pixel count")
             figure.suptitle(
                 f"Per-pixel nominal charge response, pattern {pattern}"
+                + (
+                    f", GAIN {int(gain_code)}"
+                    if math.isfinite(_number(gain_code)) else ""
+                )
             )
-            stem = f"nominal_gain_{_safe_stem(pattern)}"
+            stem = f"nominal_gain_{_safe_stem(pattern)}" + (
+                f"_gain_{int(gain_code):02d}"
+                if math.isfinite(_number(gain_code)) else ""
+            )
             outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
 
     if not scurve_gain_compensated.empty and not scurve_gain_comparison.empty:
-        for pattern, compensated_data in scurve_gain_compensated.groupby(
-            "injection_pattern", sort=True
+        if "gain_sweep_code" not in scurve_gain_compensated:
+            scurve_gain_compensated["gain_sweep_code"] = np.nan
+        if "gain_sweep_code" not in scurve_gain_comparison:
+            scurve_gain_comparison["gain_sweep_code"] = np.nan
+        for (gain_code, pattern), compensated_data in scurve_gain_compensated.groupby(
+            ["gain_sweep_code", "injection_pattern"], dropna=False, sort=True
         ):
             comparison = scurve_gain_comparison[
-                scurve_gain_comparison["injection_pattern"].astype(str)
-                == str(pattern)
+                (
+                    scurve_gain_comparison["injection_pattern"].astype(str)
+                    == str(pattern)
+                )
+                & (
+                    pd.to_numeric(
+                        scurve_gain_comparison["gain_sweep_code"], errors="coerce"
+                    ).fillna(-1)
+                    == (-1 if pd.isna(gain_code) else gain_code)
+                )
             ].copy()
             compensated_map = _matrix_array(
                 compensated_data, "nominal_gain_mv_per_ke"
@@ -2354,9 +2494,16 @@ def generate_diagnostic_plots(
             figure.suptitle(
                 f"Diagnostic baseline/IR-drop compensation, pattern {pattern}\n"
                 "A per-amplitude spatial plane is removed; raw gain remains primary"
+                + (
+                    f", GAIN {int(gain_code)}"
+                    if math.isfinite(_number(gain_code)) else ""
+                )
             )
             figure.tight_layout(rect=(0, 0, 1, 0.93))
-            stem = f"nominal_gain_spatially_compensated_{_safe_stem(pattern)}"
+            stem = f"nominal_gain_spatially_compensated_{_safe_stem(pattern)}" + (
+                f"_gain_{int(gain_code):02d}"
+                if math.isfinite(_number(gain_code)) else ""
+            )
             outputs[stem] = _save_figure(
                 figure, plot_directory, stem, settings
             )
@@ -2496,11 +2643,14 @@ def generate_diagnostic_plots(
             source_kind = str(summary_row.get("source_kind", "unknown"))
             source_stage = str(summary_row.get("source_stage", "unknown"))
             pattern = str(summary_row.get("injection_pattern", "none"))
+            gain_code = _number(summary_row.get("gain_sweep_code"))
             clock = _number(summary_row.get("measurement_fclk_mhz"))
             step = _number(summary_row.get("injection_voltage_step_v"))
             details = [source_stage]
             if pattern != "none":
                 details.append(f"pattern {pattern}")
+            if math.isfinite(gain_code):
+                details.append(f"GAIN {int(gain_code)}")
             if math.isfinite(clock):
                 details.append(f"FCLK {clock:g} MHz")
             if math.isfinite(step):
@@ -2524,6 +2674,9 @@ def generate_diagnostic_plots(
                     _safe_stem(source_kind),
                     _safe_stem(source_stage)[:70],
                     _safe_stem(pattern),
+                    f"gain_{int(gain_code):02d}"
+                    if math.isfinite(gain_code)
+                    else "gain_none",
                     f"fclk_{clock:g}" if math.isfinite(clock) else "fclk_none",
                 )
             )
@@ -2534,9 +2687,13 @@ def generate_diagnostic_plots(
             scurve_results["fit_status"].isin(("ok", "poor_quality"))
         ].copy()
         if not usable_results.empty:
+            if "gain_sweep_code" not in usable_results:
+                usable_results["gain_sweep_code"] = np.nan
             coordinates = _plot_coordinates(settings, usable_results, "v50_v")
-            for pattern, pattern_data in usable_results.groupby(
-                "injection_pattern", sort=True
+            for (gain_code, pattern), pattern_data in usable_results.groupby(
+                ["gain_sweep_code", "injection_pattern"],
+                dropna=False,
+                sort=True,
             ):
                 for column, row in coordinates:
                     pixel = pattern_data[
@@ -2570,10 +2727,18 @@ def generate_diagnostic_plots(
                     axis.set_ylabel("V50, V")
                     axis.set_title(
                         f"Pixel C{column:02d} R{row:02d}: amplitude response, {pattern}"
+                        + (
+                            f", GAIN {int(gain_code)}"
+                            if math.isfinite(_number(gain_code)) else ""
+                        )
                     )
                     stem = (
                         f"pixel_C{column:02d}_R{row:02d}_"
                         f"amplitude_response_{_safe_stem(pattern)}"
+                        + (
+                            f"_gain_{int(gain_code):02d}"
+                            if math.isfinite(_number(gain_code)) else ""
+                        )
                     )
                     outputs[stem] = _save_figure(
                         figure, plot_directory, stem, settings
@@ -2593,6 +2758,8 @@ def generate_diagnostic_plots(
 
     if not crosstalk_pixel_metrics.empty:
         pixel_metrics = crosstalk_pixel_metrics.copy()
+        if "gain_sweep_code" not in pixel_metrics:
+            pixel_metrics["gain_sweep_code"] = np.nan
         pixel_metrics["delta_v50_mv"] = 1000 * pd.to_numeric(
             pixel_metrics["delta_v50_v"], errors="coerce"
         )
@@ -2600,11 +2767,11 @@ def generate_diagnostic_plots(
             pixel_metrics["sigma_ratio_to_reference"], errors="coerce"
         ) - 1.0
         metric_groups = pixel_metrics.groupby(
-            ["pulse_amplitude_native", "injection_pattern"],
+            ["gain_sweep_code", "pulse_amplitude_native", "injection_pattern"],
             dropna=False,
             sort=True,
         )
-        for metric_index, ((amplitude, pattern), data) in enumerate(metric_groups):
+        for metric_index, ((gain_code, amplitude, pattern), data) in enumerate(metric_groups):
             reference_patterns = set(data["reference_injection_pattern"].dropna().astype(str))
             if str(pattern) in reference_patterns:
                 continue
@@ -2679,21 +2846,31 @@ def generate_diagnostic_plots(
                 axis.set_ylabel("Physical row")
             figure.suptitle(
                 f"Injection-density shift: {_amplitude_label(data)}, pattern {pattern}"
+                + (
+                    f", GAIN {int(gain_code)}"
+                    if math.isfinite(_number(gain_code)) else ""
+                )
             )
             stem = (
                 f"crosstalk_pixel_maps_{_safe_stem(pattern)}_"
                 f"amplitude_{metric_index:03d}"
+                + (
+                    f"_gain_{int(gain_code):02d}"
+                    if math.isfinite(_number(gain_code)) else ""
+                )
             )
             outputs[stem] = _save_figure(figure, plot_directory, stem, settings)
 
     if not crosstalk_summary.empty and crosstalk_summary["injection_pattern"].nunique() > 1:
-        amplitudes = list(
-            crosstalk_summary["pulse_amplitude_native"].drop_duplicates()
+        if "gain_sweep_code" not in crosstalk_summary:
+            crosstalk_summary["gain_sweep_code"] = np.nan
+        summary_groups = crosstalk_summary.groupby(
+            ["gain_sweep_code", "pulse_amplitude_native"],
+            dropna=False,
+            sort=True,
         )
-        for amplitude_index, amplitude in enumerate(amplitudes):
-            data = crosstalk_summary[
-                crosstalk_summary["pulse_amplitude_native"] == amplitude
-            ].copy()
+        for amplitude_index, ((gain_code, amplitude), data) in enumerate(summary_groups):
+            data = data.copy()
             data = data.sort_values("median_active_pixels_per_shot")
             x = pd.to_numeric(
                 data["median_active_pixels_per_shot"], errors="coerce"
@@ -2740,8 +2917,12 @@ def generate_diagnostic_plots(
                 axis.set_xlabel("Active pixels per shot")
             figure.suptitle(
                 f"Injection-density coupling diagnostics, amplitude {amplitude}"
+                + (
+                    f", GAIN {int(gain_code)}"
+                    if math.isfinite(_number(gain_code)) else ""
+                )
             )
-            suffix = f"_{amplitude_index:03d}" if len(amplitudes) > 1 else ""
+            suffix = f"_{amplitude_index:03d}" if summary_groups.ngroups > 1 else ""
             outputs[f"injection_crosstalk{suffix}"] = _save_figure(
                 figure,
                 plot_directory,
@@ -2757,14 +2938,19 @@ def generate_diagnostic_plots(
         summary = summary.dropna(subset=["measurement_fclk_mhz"])
         if not summary.empty:
             figure, axes = plt.subplots(1, 2, figsize=(10.8, 4.4))
-            for (amplitude, pattern), data in summary.groupby(
-                ["pulse_amplitude_native", "injection_pattern"],
+            if "gain_sweep_code" not in summary:
+                summary["gain_sweep_code"] = np.nan
+            for (gain_code, amplitude, pattern), data in summary.groupby(
+                ["gain_sweep_code", "pulse_amplitude_native", "injection_pattern"],
                 dropna=False,
                 sort=True,
             ):
                 data = data.sort_values("measurement_fclk_mhz")
                 x = data["measurement_fclk_mhz"].to_numpy(dtype=float)
-                label = f"{pattern}, {_amplitude_label(data)}"
+                label = f"{pattern}, {_amplitude_label(data)}" + (
+                    f", GAIN {int(gain_code)}"
+                    if math.isfinite(_number(gain_code)) else ""
+                )
                 axes[0].plot(
                     x,
                     pd.to_numeric(data["sigma_dac_median"], errors="coerce"),
@@ -2810,6 +2996,8 @@ def generate_diagnostic_plots(
 
     if len(clock_values) > 1 and not clock_scurve_efficiency.empty:
         clock_data = clock_scurve_efficiency.copy()
+        if "gain_sweep_code" not in clock_data:
+            clock_data["gain_sweep_code"] = np.nan
         clock_data["measurement_fclk_mhz"] = pd.to_numeric(
             clock_data["measurement_fclk_mhz"], errors="coerce"
         )
@@ -2817,9 +3005,9 @@ def generate_diagnostic_plots(
             _truthy_series(clock_data, "fit_valid")
             & _truthy_series(clock_data, "active_injection_pixel_bool")
         ]
-        for plot_index, ((amplitude, pattern), data) in enumerate(
+        for plot_index, ((gain_code, amplitude, pattern), data) in enumerate(
             clock_data.groupby(
-                ["pulse_amplitude_native", "injection_pattern"],
+                ["gain_sweep_code", "pulse_amplitude_native", "injection_pattern"],
                 dropna=False,
                 sort=True,
             )
@@ -2858,6 +3046,10 @@ def generate_diagnostic_plots(
                 axis.set_title(
                     f"Matrix S-curves versus measurement FCLK\n"
                     f"{_amplitude_label(data)}, pattern {pattern}"
+                    + (
+                        f", GAIN {int(gain_code)}"
+                        if math.isfinite(_number(gain_code)) else ""
+                    )
                 )
                 axis.legend(title="Measurement FCLK")
                 stem = (
@@ -2870,9 +3062,19 @@ def generate_diagnostic_plots(
             else:
                 plt.close(figure)
 
+            result_gain_codes = pd.to_numeric(
+                clock_scurve_results["gain_sweep_code"]
+                if "gain_sweep_code" in clock_scurve_results
+                else pd.Series(np.nan, index=clock_scurve_results.index),
+                errors="coerce",
+            ).fillna(-1)
             result_subset = clock_scurve_results[
                 (clock_scurve_results["pulse_amplitude_native"] == amplitude)
                 & (clock_scurve_results["injection_pattern"] == pattern)
+                & (
+                    result_gain_codes
+                    == (-1 if pd.isna(gain_code) else gain_code)
+                )
             ] if not clock_scurve_results.empty else pd.DataFrame()
             coordinates = _plot_coordinates(
                 settings,

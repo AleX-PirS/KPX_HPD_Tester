@@ -424,8 +424,15 @@ def verify_reference_steps(
     if not selections:
         raise ValueError("reference verification requires at least one REF pair")
     ref1_codes = {item.ref1_code for item in selections}
-    ref1_voltages = {item.ref1_voltage_v for item in selections}
-    if len(ref1_codes) != 1 or len(ref1_voltages) != 1:
+    finite_ref_levels = all(
+        math.isfinite(float(item.ref1_voltage_v))
+        and math.isfinite(float(item.ref2_voltage_v))
+        for item in selections
+    )
+    ref1_voltages = (
+        {item.ref1_voltage_v for item in selections} if finite_ref_levels else set()
+    )
+    if len(ref1_codes) != 1 or (finite_ref_levels and len(ref1_voltages) != 1):
         raise ValueError("reference verification requires one fixed REF1 for all amplitudes")
     if not isinstance(pwm_frequency_khz, int) or not isinstance(pwm_high_time_ns, int):
         raise TypeError("PWM frequency and high time must be integers")
@@ -448,7 +455,11 @@ def verify_reference_steps(
             "pwm_frequency_khz": pwm_frequency_khz,
             "pwm_high_time_ns": pwm_high_time_ns,
             "amux_signal": "TST_SIG",
-            "physical_ref_order": "V_REF1 > V_REF2",
+            "physical_ref_order": (
+                "V_REF1 > V_REF2"
+                if finite_ref_levels
+                else "not_derived_from_LUT_manual_equivalent_step"
+            ),
             "acceptance_uses_step_magnitude": True,
         },
     )
@@ -570,10 +581,17 @@ def verify_reference_steps(
                         "lut_step_error_v": selection.voltage_step_error_v,
                         "ref1_code": selection.ref1_code,
                         "ref2_code": selection.ref2_code,
-                        "ref1_voltage_v": selection.ref1_voltage_v,
-                        "ref2_voltage_v": selection.ref2_voltage_v,
-                        "ref1_above_ref2": selection.ref1_voltage_v
-                        > selection.ref2_voltage_v,
+                        "ref1_voltage_v": (
+                            selection.ref1_voltage_v if finite_ref_levels else None
+                        ),
+                        "ref2_voltage_v": (
+                            selection.ref2_voltage_v if finite_ref_levels else None
+                        ),
+                        "ref1_above_ref2": (
+                            selection.ref1_voltage_v > selection.ref2_voltage_v
+                            if finite_ref_levels
+                            else None
+                        ),
                         **metrics,
                         "scope_to_lut_absolute_error_v": scope_lut_error,
                         "scope_to_requested_absolute_error_v": scope_requested_error,
@@ -641,7 +659,9 @@ def verify_reference_steps(
             "clk_comparison_csv": comparison_table.name,
             "summary_plot_png": plot_path.name if plot_path is not None else None,
             "fixed_ref1_code": selections[0].ref1_code,
-            "fixed_ref1_voltage_v": selections[0].ref1_voltage_v,
+            "fixed_ref1_voltage_v": (
+                selections[0].ref1_voltage_v if finite_ref_levels else None
+            ),
         },
     )
     result = ReferenceStepVerificationResult(

@@ -26,6 +26,7 @@ from .analysis import (
 )
 from .calibration import (
     ReferenceDacCalibration,
+    ReferencePairSelection,
     ThresholdDacCalibration,
     load_reference_dac_calibrations,
     load_threshold_dac_calibrations,
@@ -175,6 +176,7 @@ def _normalized_document(value: Any) -> Any:
 # still rejected by the strict comparison below.
 _RESUME_DEFAULT_MIGRATION_PATHS: tuple[tuple[str, ...], ...] = (
     ("noise", "empty_matrix_repeats_to_skip_remaining"),
+    ("equalization", "trim_reference"),
     ("scurve", "coarse_baseline_noise_consecutive_codes"),
     ("scurve", "reference_common_mode_step_error_slack_v"),
     ("scurve", "sparse_background_interval_codes"),
@@ -469,9 +471,13 @@ def _load_and_freeze_noise_reference(
     if statistics.empty:
         raise RuntimeError("noise-reference experiment contains no usable raw noise data")
     available_stages = set(statistics["stage"].astype(str))
-    if not ({"equalized_final", "baseline_noise", "trim_00"} & available_stages):
+    if not (
+        {"equalized_final", "baseline_noise", "trim_16", "trim_00"}
+        & available_stages
+    ):
         raise RuntimeError(
-            "noise reference has no equalized_final, baseline_noise or trim_00 stage"
+            "noise reference has no equalized_final, baseline_noise, trim_16 "
+            "or trim_00 stage"
         )
 
     reference_directory = destination_store.root / "inputs" / "noise_reference"
@@ -727,7 +733,7 @@ def _select_final_trim_map(
             source = "experimentally_measured_candidate"
         elif coordinate in estimate:
             trim = int(estimate[coordinate])
-            source = "endpoint_interpolation_fallback"
+            source = "three_point_piecewise_interpolation_fallback"
         elif unchanged is not None and coordinate in unchanged:
             trim = int(unchanged[coordinate])
             source = "initial_trim_preserved_NO_RELIABLE_EQUALIZATION"
@@ -761,10 +767,13 @@ def _safe_background_codes(
     if final.empty:
         final = noise_statistics[noise_statistics["stage"] == "baseline_noise"].copy()
     if final.empty:
+        final = noise_statistics[noise_statistics["stage"] == "trim_16"].copy()
+    if final.empty:
         final = noise_statistics[noise_statistics["stage"] == "trim_00"].copy()
     if final.empty:
         raise RuntimeError(
-            "S-curve range selection requires an equalized_final or baseline_noise noise scan"
+            "S-curve range selection requires equalized_final, baseline_noise, "
+            "trim_16 or trim_00 noise data"
         )
     if "shutter_duration_s" not in final:
         raise RuntimeError(
@@ -1110,6 +1119,7 @@ def characterize_comparator(
         str, str | Path | ReferenceDacCalibration
     ] | None = None,
     injection_voltage_steps_v: Sequence[float] | None = None,
+    manual_reference_configuration: Mapping[str, Any] | None = None,
     reference_calibration_voltage_unit: str = "auto",
     reference_step_oscilloscope: Any | None = None,
     reference_step_verification_settings: (
@@ -1118,6 +1128,7 @@ def characterize_comparator(
     reference_verification_pwm_frequency_khz: int = 100,
     reference_verification_pwm_high_time_ns: int = 5_000,
     gain_map: Mapping[tuple[int, int], int] | Sequence[Any] | None = None,
+    gain_sweep_codes: Sequence[int] | None = None,
     counter_key: str | None = None,
     confirm_inferred_counter_mapping: bool = False,
     upper_non_limiting_code: int | None = None,
@@ -1147,6 +1158,9 @@ def characterize_comparator(
     shutter exposure. When measured REF1 and REF2 LUT paths plus
     ``injection_voltage_steps_v`` are supplied, native codes are selected
     automatically with the mandatory physical order ``V_REF1 > V_REF2``.
+    Alternatively, ``manual_reference_configuration`` supplies one exact
+    REF1/REF2 code pair and one user-equivalent positive voltage step.
+    ``gain_sweep_codes`` runs uniform per-code S-curves in isolated subfolders.
     S-curve-only runs may freeze and reuse a previous noise experiment through
     ``noise_reference_experiment``. Supplying enabled REF verification settings
     makes the same selected steps run through AMUX ``TST_SIG`` and an
@@ -1246,7 +1260,76 @@ def characterize_comparator(
     reference_calibrations: dict[str, ReferenceDacCalibration] = {}
     reference_pair_selections: tuple[Any, ...] = ()
     reference_pair_availability: tuple[dict[str, Any], ...] = ()
-    if injection_voltage_steps_v is not None:
+    if manual_reference_configuration is not None:
+        if injection_voltage_steps_v is not None or reference_calibration_files is not None:
+            raise ValueError(
+                "manual_reference_configuration cannot be combined with REF LUTs "
+                "or injection_voltage_steps_v"
+            )
+        if selected_settings.scurve.pulse_amplitudes:
+            raise ValueError(
+                "manual_reference_configuration cannot be combined with "
+                "settings.scurve.pulse_amplitudes"
+            )
+        if not (run_scurve or reference_verification_enabled):
+            raise ValueError(
+                "manual_reference_configuration requires run_scurve=True or "
+                "enabled REF-step oscilloscope verification"
+            )
+        required_manual = {
+            "DAC_TST_REF1", "DAC_TST_REF2", "voltage_step_v"
+        }
+        missing_manual = required_manual - set(manual_reference_configuration)
+        if missing_manual:
+            raise ValueError(
+                "manual_reference_configuration is missing: "
+                + ", ".join(sorted(missing_manual))
+            )
+        ref1_code = manual_reference_configuration["DAC_TST_REF1"]
+        ref2_code = manual_reference_configuration["DAC_TST_REF2"]
+        for name, code in (("DAC_TST_REF1", ref1_code), ("DAC_TST_REF2", ref2_code)):
+            if not isinstance(code, int) or isinstance(code, bool) or not 0 <= code <= 1023:
+                raise ValueError(f"manual {name} must be an integer in 0..1023")
+        equivalent_step = float(manual_reference_configuration["voltage_step_v"])
+        if not math.isfinite(equivalent_step) or equivalent_step <= 0:
+            raise ValueError("manual voltage_step_v must be finite and positive")
+        manual_selection = ReferencePairSelection(
+            requested_voltage_step_v=equivalent_step,
+            actual_voltage_step_v=equivalent_step,
+            voltage_step_error_v=0.0,
+            absolute_voltage_step_error_v=0.0,
+            ref1_code=int(ref1_code),
+            ref2_code=int(ref2_code),
+            ref1_voltage_v=float("nan"),
+            ref2_voltage_v=float("nan"),
+            reference_common_mode_v=float("nan"),
+            selection_method="explicit_manual_REF_codes_and_equivalent_step",
+            minimum_reference_code=0,
+            maximum_reference_code=1023,
+            minimum_reference_voltage_v=None,
+            fixed_ref1_voltage_v=None,
+            ref1_shared_across_amplitudes=True,
+        )
+        reference_pair_selections = (manual_selection,)
+        reference_pair_availability = ({
+            "requested_voltage_step_v": equivalent_step,
+            "realizable": True,
+            "status": "explicit_manual_REF_codes_and_equivalent_step",
+            "selected_ref1_code": int(ref1_code),
+            "selected_ref2_code": int(ref2_code),
+        },)
+        selected_settings.scurve.pulse_amplitudes = (
+            {
+                **manual_selection.to_pulse_amplitude(),
+                "reference_code_policy": "explicit_manual",
+                "manual_equivalent_voltage_step": True,
+            },
+        )
+        logger.info(
+            "Manual REF preflight: REF1=%d, REF2=%d, equivalent step=%g mV",
+            ref1_code, ref2_code, 1000.0 * equivalent_step,
+        )
+    elif injection_voltage_steps_v is not None:
         if not (run_scurve or reference_verification_enabled):
             raise ValueError(
                 "injection_voltage_steps_v requires run_scurve=True or enabled "
@@ -1327,8 +1410,8 @@ def characterize_comparator(
         )
     if reference_verification_enabled and not reference_pair_selections:
         raise ValueError(
-            "enabled REF-step verification requires REF1/REF2 LUTs and "
-            "injection_voltage_steps_v"
+            "enabled REF-step verification requires either REF1/REF2 LUTs "
+            "with injection_voltage_steps_v or manual_reference_configuration"
         )
     bounded_amplitudes = []
     for amplitude in selected_settings.scurve.pulse_amplitudes:
@@ -1338,12 +1421,28 @@ def characterize_comparator(
             amplitude = dict(amplitude)
             for name in ("DAC_TST_REF1", "DAC_TST_REF2"):
                 code = amplitude.get(name)
-                if not isinstance(code, int) or isinstance(code, bool) or not (
-                    selected_settings.scurve.minimum_reference_code <= code <= selected_settings.scurve.maximum_reference_code
-                ):
-                    raise ValueError(f"{name} must be within the configured inclusive REF code bounds")
-            amplitude["minimum_reference_code"] = selected_settings.scurve.minimum_reference_code
-            amplitude["maximum_reference_code"] = selected_settings.scurve.maximum_reference_code
+                manual_code = amplitude.get("reference_code_policy") == "explicit_manual"
+                valid_code = (
+                    isinstance(code, int)
+                    and not isinstance(code, bool)
+                    and (
+                        0 <= code <= 1023
+                        if manual_code
+                        else selected_settings.scurve.minimum_reference_code
+                        <= code
+                        <= selected_settings.scurve.maximum_reference_code
+                    )
+                )
+                if not valid_code:
+                    raise ValueError(
+                        f"{name} is outside the permitted REF code range"
+                    )
+            amplitude["minimum_reference_code"] = (
+                0 if manual_code else selected_settings.scurve.minimum_reference_code
+            )
+            amplitude["maximum_reference_code"] = (
+                1023 if manual_code else selected_settings.scurve.maximum_reference_code
+            )
         bounded_amplitudes.append(amplitude)
     selected_settings.scurve.pulse_amplitudes = tuple(bounded_amplitudes)
     selected_settings.validate()
@@ -1416,14 +1515,44 @@ def characterize_comparator(
         selected_settings.scurve.n_injections = derived_injections
         selected_settings.validate()
     normalized_gain_map: dict[tuple[int, int], int] | None = None
+    normalized_gain_maps: tuple[
+        tuple[int | None, dict[tuple[int, int], int]], ...
+    ] = ()
     if run_scurve:
-        if gain_map is None:
-            raise ValueError("run_scurve=True requires a per-pixel gain_map")
-        normalized_gain_map = resolve_gain_map(
-            gain_map,
-            required_pixels=selected_pixels,
-            owned_columns=OWNED_COLUMNS,
-        )
+        if gain_sweep_codes is not None:
+            if gain_map is not None:
+                raise ValueError(
+                    "supply either gain_map or gain_sweep_codes, not both"
+                )
+            codes: list[int] = []
+            for value in gain_sweep_codes:
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise TypeError("every gain_sweep_codes item must be an integer")
+                if not 0 <= value <= 31:
+                    raise ValueError("every gain_sweep_codes item must be in 0..31")
+                if value not in codes:
+                    codes.append(value)
+            if not codes:
+                raise ValueError("gain_sweep_codes must not be empty")
+            normalized_gain_maps = tuple(
+                (
+                    code,
+                    {coordinate: code for coordinate in selected_pixels},
+                )
+                for code in codes
+            )
+            normalized_gain_map = dict(normalized_gain_maps[0][1])
+        else:
+            if gain_map is None:
+                raise ValueError(
+                    "run_scurve=True requires gain_map or gain_sweep_codes"
+                )
+            normalized_gain_map = resolve_gain_map(
+                gain_map,
+                required_pixels=selected_pixels,
+                owned_columns=OWNED_COLUMNS,
+            )
+            normalized_gain_maps = ((None, normalized_gain_map),)
 
     if upper_non_limiting_code is None:
         upper_non_limiting_code, upper_selection = (
@@ -1544,20 +1673,32 @@ def characterize_comparator(
             pixels=selected_pixels,
             bad_pixels=bad_pixels,
         )
-        if normalized_gain_map is not None:
-            gain_relative = store.metadata.get("gain_map", {}).get("normalized_csv")
-            if not gain_relative:
-                raise ValueError("resume metadata has no normalized GAIN map")
-            stored_gain_frame = pd.read_csv(store.root / gain_relative)
-            stored_gain = {
-                (int(row["column"]), int(row["row"])): int(row["gain"])
-                for _, row in stored_gain_frame.iterrows()
-            }
-            for coordinate, value in normalized_gain_map.items():
-                if stored_gain.get(coordinate) != value:
+        if normalized_gain_maps:
+            if normalized_gain_maps[0][0] is not None:
+                stored_sweep = store.metadata.get("gain_sweep", {})
+                stored_codes = tuple(int(value) for value in stored_sweep.get("codes", ()))
+                requested_codes = tuple(
+                    int(code) for code, _ in normalized_gain_maps if code is not None
+                )
+                if stored_codes != requested_codes:
                     raise ValueError(
-                        f"resume GAIN map differs at Col={coordinate[0]} Row={coordinate[1]}"
+                        "resume GAIN sweep codes differ from the original experiment"
                     )
+            else:
+                gain_relative = store.metadata.get("gain_map", {}).get("normalized_csv")
+                if not gain_relative:
+                    raise ValueError("resume metadata has no normalized GAIN map")
+                stored_gain_frame = pd.read_csv(store.root / gain_relative)
+                stored_gain = {
+                    (int(row["column"]), int(row["row"])): int(row["gain"])
+                    for _, row in stored_gain_frame.iterrows()
+                }
+                for coordinate, value in normalized_gain_maps[0][1].items():
+                    if stored_gain.get(coordinate) != value:
+                        raise ValueError(
+                            f"resume GAIN map differs at Col={coordinate[0]} "
+                            f"Row={coordinate[1]}"
+                        )
         resume_update: dict[str, Any] = {
             "status": "in_progress",
             "resumed_utc": utc_now_text(),
@@ -1626,6 +1767,16 @@ def characterize_comparator(
                     measurement_fclk_values
                 ),
                 "measurement_clock_sweep": measurement_clock_sweep,
+                "gain_sweep_codes": [
+                    int(code)
+                    for code, _ in normalized_gain_maps
+                    if code is not None
+                ],
+                "manual_reference_configuration": (
+                    dict(manual_reference_configuration)
+                    if manual_reference_configuration is not None
+                    else None
+                ),
                 "allow_scurve_without_noise_reference": bool(
                     allow_scurve_without_noise_reference
                 ),
@@ -1664,7 +1815,11 @@ def characterize_comparator(
                 "pwm_frequency_khz": reference_verification_pwm_frequency_khz,
                 "pwm_high_time_ns": reference_verification_pwm_high_time_ns,
                 "amux_signal": "TST_SIG",
-                "physical_ref_order": "V_REF1 > V_REF2",
+                "physical_ref_order": (
+                    "not_derived_from_LUT_manual_equivalent_step"
+                    if manual_reference_configuration is not None
+                    else "V_REF1 > V_REF2"
+                ),
             },
             "test_injection_configuration": {
                 "ctrl_source": (
@@ -1717,7 +1872,9 @@ def characterize_comparator(
                 "upo_pwm_count_derivation": upo_pwm_count_metadata,
                 "reference_pair_selection": {
                     "source": (
-                        "measured_REF1_REF2_LUTs"
+                        "explicit_manual_REF_codes_and_equivalent_step"
+                        if manual_reference_configuration is not None
+                        else "measured_REF1_REF2_LUTs"
                         if reference_pair_selections
                         else "manual_or_external_pulse_amplitudes"
                     ),
@@ -1752,12 +1909,26 @@ def characterize_comparator(
                     "maximum_reference_step_error_v": (
                         selected_settings.scurve.maximum_reference_step_error_v
                     ),
-                    "physical_order": "V_REF1 > V_REF2",
-                    "candidate_codes": "measured_LUT_rows_only",
-                    "ref1_policy": (
-                        "one_fixed_lowest_feasible_measured_voltage_for_all_amplitudes"
+                    "physical_order": (
+                        "not_derived_from_LUT_manual_equivalent_step"
+                        if manual_reference_configuration is not None
+                        else "V_REF1 > V_REF2"
                     ),
-                    "varying_reference": "REF2_only",
+                    "candidate_codes": (
+                        "one_explicit_manual_pair"
+                        if manual_reference_configuration is not None
+                        else "measured_LUT_rows_only"
+                    ),
+                    "ref1_policy": (
+                        "one_explicit_manual_REF1_code"
+                        if manual_reference_configuration is not None
+                        else "one_fixed_lowest_feasible_measured_voltage_for_all_amplitudes"
+                    ),
+                    "varying_reference": (
+                        "none_single_manual_pair"
+                        if manual_reference_configuration is not None
+                        else "REF2_only"
+                    ),
                 },
             },
             **dict(additional_metadata or {}),
@@ -1981,17 +2152,28 @@ def characterize_comparator(
                         store.root
                     ).as_posix()
                 )
-            if normalized_gain_map is not None:
-                gain_path = store.root / "inputs" / "gain_map.csv"
-                store.write_table(
-                    gain_path,
-                    pd.DataFrame(
-                        [
-                            {"column": column, "row": row, "gain": gain}
-                            for (column, row), gain in normalized_gain_map.items()
-                        ]
-                    ),
-                )
+            if normalized_gain_maps:
+                gain_paths: dict[str, str] = {}
+                for gain_code, active_gain_map in normalized_gain_maps:
+                    gain_path = (
+                        store.root / "inputs" / "gain_map.csv"
+                        if gain_code is None
+                        else store.root / "inputs" / "gain_sweep"
+                        / f"gain_{gain_code:02d}" / "gain_map.csv"
+                    )
+                    store.write_table(
+                        gain_path,
+                        pd.DataFrame(
+                            [
+                                {"column": column, "row": row, "gain": gain}
+                                for (column, row), gain in active_gain_map.items()
+                            ]
+                        ),
+                    )
+                    if gain_code is not None:
+                        gain_paths[str(gain_code)] = gain_path.relative_to(
+                            store.root
+                        ).as_posix()
                 group_rows = []
                 for pattern in selected_settings.scurve.injection_patterns:
                     for group in build_injection_groups(selected_pixels, pattern):
@@ -2011,17 +2193,37 @@ def characterize_comparator(
                             )
                 groups_path = store.root / "inputs" / "injection_groups.csv"
                 store.write_table(groups_path, pd.DataFrame(group_rows))
-                store.update_metadata(
-                    gain_map={
-                        "normalized_csv": gain_path.relative_to(store.root).as_posix(),
-                        "coordinate_order": "physical (column, row)",
-                        "sequence_order_if_used": (
-                            "gain_map[row][owned_column_index], index 0 is first "
-                            "pixel_matrix.OWNED_COLUMNS value; flat form is row-major"
-                        ),
-                    },
-                    injection_groups=groups_path.relative_to(store.root).as_posix(),
-                )
+                gain_metadata = {
+                    "coordinate_order": "physical (column, row)",
+                    "sequence_order_if_used": (
+                        "gain_map[row][owned_column_index], index 0 is first "
+                        "pixel_matrix.OWNED_COLUMNS value; flat form is row-major"
+                    ),
+                }
+                metadata_update: dict[str, Any] = {
+                    "injection_groups": groups_path.relative_to(
+                        store.root
+                    ).as_posix(),
+                }
+                if normalized_gain_maps[0][0] is None:
+                    metadata_update["gain_map"] = {
+                        **gain_metadata,
+                        "normalized_csv": (
+                            store.root / "inputs" / "gain_map.csv"
+                        ).relative_to(store.root).as_posix(),
+                    }
+                else:
+                    metadata_update["gain_sweep"] = {
+                        **gain_metadata,
+                        "codes": [
+                            int(code)
+                            for code, _ in normalized_gain_maps
+                            if code is not None
+                        ],
+                        "normalized_csv_by_code": gain_paths,
+                        "raw_subdirectory_pattern": "raw/scurve/gain_XX",
+                    }
+                store.update_metadata(**metadata_update)
 
         if reference_verification_enabled:
             assert reference_verification is not None
@@ -2141,11 +2343,17 @@ def characterize_comparator(
                 overall_percent_estimate=10.0,
             )
             if run_noise_scan:
-                endpoint_trims = (
+                preliminary_trims = tuple(dict.fromkeys((
                     selected_settings.equalization.trim_min,
+                    selected_settings.equalization.trim_reference,
                     selected_settings.equalization.trim_max,
+                )))
+                preliminary_progress_end = (
+                    30.0
+                    if selected_settings.equalization.scan_all_trim_codes
+                    else primary_analysis_progress
                 )
-                for endpoint_index, trim in enumerate(endpoint_trims):
+                for preliminary_index, trim in enumerate(preliminary_trims):
                     stage = f"trim_{trim:02d}"
                     trim_map = {coordinate: trim for coordinate in selected_pixels}
                     acquire_noise_scan(
@@ -2158,12 +2366,27 @@ def characterize_comparator(
                         stage=stage,
                         upper_non_limiting_code=upper_non_limiting_code,
                         settings=selected_settings.noise,
-                        overall_progress_start=10.0 + 10.0 * endpoint_index,
-                        overall_progress_end=20.0 + 10.0 * endpoint_index,
+                        overall_progress_start=(
+                            10.0
+                            + (preliminary_progress_end - 10.0)
+                            * preliminary_index
+                            / len(preliminary_trims)
+                        ),
+                        overall_progress_end=(
+                            10.0
+                            + (preliminary_progress_end - 10.0)
+                            * (preliminary_index + 1)
+                            / len(preliminary_trims)
+                        ),
                     )
                     store.log_status(
-                        f"Завершен endpoint noise scan при trim={trim}",
-                        overall_percent_estimate=20.0 + 10.0 * endpoint_index,
+                        f"Завершен предварительный noise scan при trim={trim}",
+                        overall_percent_estimate=(
+                            10.0
+                            + (preliminary_progress_end - 10.0)
+                            * (preliminary_index + 1)
+                            / len(preliminary_trims)
+                        ),
                     )
                 if selected_settings.equalization.scan_all_trim_codes:
                     store.update_metadata(
@@ -2175,9 +2398,8 @@ def characterize_comparator(
                                     selected_settings.equalization.trim_max + 1,
                                 )
                             ),
-                            "endpoint_stage_names": [
-                                f"trim_{selected_settings.equalization.trim_min:02d}",
-                                f"trim_{selected_settings.equalization.trim_max:02d}",
+                            "preliminary_stage_names": [
+                                f"trim_{trim:02d}" for trim in preliminary_trims
                             ],
                             "intermediate_stage_prefix": "trim_full_",
                         }
@@ -2186,6 +2408,8 @@ def characterize_comparator(
                         selected_settings.equalization.trim_min + 1,
                         selected_settings.equalization.trim_max,
                     ):
+                        if trim in preliminary_trims:
+                            continue
                         acquire_noise_scan(
                             backend=backend,
                             store=store,
@@ -2216,13 +2440,66 @@ def characterize_comparator(
             target_voltage, target_method, reachability = select_equalization_target(
                 noise_fits,
                 trim0_stage=f"trim_{selected_settings.equalization.trim_min:02d}",
+                trim16_stage=(
+                    f"trim_{selected_settings.equalization.trim_reference:02d}"
+                ),
                 trim31_stage=f"trim_{selected_settings.equalization.trim_max:02d}",
+                trim_reference_code=(
+                    selected_settings.equalization.trim_reference
+                ),
                 requested_target_voltage=selected_settings.equalization.target_voltage,
             )
             online_directory = store.root / "analysis" / "online_checkpoint"
             store.write_table(
                 online_directory / "reachable_range_per_pixel.csv", reachability
             )
+            direction_reversal = reachability.get(
+                "trim_corner_direction_reversal",
+                pd.Series(False, index=reachability.index),
+            ).fillna(False).astype(bool)
+            reversal_coordinates = {
+                (int(row["column"]), int(row["row"]))
+                for _, row in reachability[direction_reversal].iterrows()
+            }
+            trim_model_counts = {
+                str(model): int(count)
+                for model, count in reachability["trim_model_selected"]
+                .value_counts(dropna=False)
+                .items()
+            }
+            store.update_metadata(
+                trim_anchor_diagnostics={
+                    "preliminary_trim_codes": [
+                        selected_settings.equalization.trim_min,
+                        selected_settings.equalization.trim_reference,
+                        selected_settings.equalization.trim_max,
+                    ],
+                    "estimator": "adaptive_linear_or_piecewise_0_reference_31",
+                    "central_reference_has_zero_nominal_offset": True,
+                    "central_reference_is_preferred_operating_code": False,
+                    "optimization_objective": (
+                        "minimize_equalized_effective_threshold_dispersion"
+                    ),
+                    "selected_model_pixel_counts": trim_model_counts,
+                    "resolved_curvature_pixel_count": int(
+                        reachability["trim_curvature_resolved"].fillna(False).sum()
+                    ),
+                    "corner_direction_reversal_pixel_count": len(
+                        reversal_coordinates
+                    ),
+                    "corner_direction_reversal_pixels": [
+                        {"column": column, "row": row}
+                        for column, row in sorted(reversal_coordinates)
+                    ],
+                    "final_choice_requires_measured_local_candidates": True,
+                }
+            )
+            if reversal_coordinates:
+                store.log_status(
+                    f"Обнаружено {len(reversal_coordinates)} пикселей с "
+                    "разворотом направления trim-кривой у края; для них будет "
+                    "выполнен расширенный измеренный поиск около оцененного кода"
+                )
             estimate = _estimated_trim_map(reachability)
             missing_estimates = set(selected_pixels) - set(estimate)
             unresolved_baseline = {
@@ -2230,7 +2507,7 @@ def characterize_comparator(
             }
             if missing_estimates:
                 store.log_status(
-                    f"Для {len(missing_estimates)} пикселей нет двух надежных endpoint-центров. "
+                    f"Для {len(missing_estimates)} пикселей нет двух надежных trim-якорей. "
                     "Их исходный trim сохраняется; пиксели не маскируются автоматически. "
                     f"Рекомендации: {online_directory}"
                 )
@@ -2291,6 +2568,7 @@ def characterize_comparator(
                 (int(row["column"]), int(row["row"])) for _, row in measured.iterrows()
             }
             expansion_needed = set(estimate) - measured_coordinates
+            expansion_needed.update(reversal_coordinates)
             if radius > 0 and not measured.empty:
                 boundary_suffixes = (f"_m{radius:02d}", f"_p{radius:02d}")
                 boundary = measured[
@@ -2460,6 +2738,8 @@ def characterize_comparator(
                 else 10.0
             )
             total_scurve_groups = (
+                len(normalized_gain_maps)
+                *
                 len(measurement_fclk_values)
                 * len(selected_settings.scurve.pulse_amplitudes)
                 * sum(
@@ -2640,6 +2920,8 @@ def characterize_comparator(
                 amplitude: Any,
                 amplitude_configuration: Mapping[str, Any],
                 active_measurement_fclk_mhz: int,
+                active_gain_map: Mapping[tuple[int, int], int],
+                active_gain_code: int | None,
             ) -> tuple[ScurveScanRun, ...]:
                 runs: list[ScurveScanRun] = []
                 for group in groups:
@@ -2655,7 +2937,8 @@ def characterize_comparator(
                         codes=codes,
                         pulse_amplitude=amplitude,
                         pulse_amplitude_configuration=amplitude_configuration,
-                        gain_map=normalized_gain_map,
+                        gain_map=active_gain_map,
+                        gain_sweep_code=active_gain_code,
                         injection_group=group,
                         upper_non_limiting_code=upper_non_limiting_code,
                         noise_settings=selected_settings.noise,
@@ -2667,7 +2950,13 @@ def characterize_comparator(
 
             try:
                 scurve_jobs = [
-                    (clock_index, clock_mhz, amplitude_index, amplitude, pattern)
+                    (
+                        gain_index, gain_code, active_gain_map,
+                        clock_index, clock_mhz, amplitude_index, amplitude, pattern,
+                    )
+                    for gain_index, (gain_code, active_gain_map) in enumerate(
+                        normalized_gain_maps
+                    )
                     for clock_index, clock_mhz in enumerate(measurement_fclk_values)
                     for amplitude_index, amplitude in enumerate(
                         selected_settings.scurve.pulse_amplitudes
@@ -2675,6 +2964,9 @@ def characterize_comparator(
                     for pattern in selected_settings.scurve.injection_patterns
                 ]
                 for (
+                    gain_index,
+                    active_gain_code,
+                    active_gain_map,
                     clock_index,
                     active_measurement_fclk_mhz,
                     amplitude_index,
@@ -2690,12 +2982,20 @@ def characterize_comparator(
                         if measurement_clock_sweep
                         else ""
                     )
+                    gain_stage_prefix = (
+                        f"gain_{active_gain_code:02d}_"
+                        if active_gain_code is not None
+                        else ""
+                    )
                     stage = (
-                        f"{stage_prefix}pulse_amplitude_{amplitude_index:03d}_"
+                        f"{gain_stage_prefix}{stage_prefix}"
+                        f"pulse_amplitude_{amplitude_index:03d}_"
                         f"pattern_{pattern}"
                     )
                     store.log_status(
-                        f"S-curve: FCLK измерения "
+                        f"S-curve: GAIN "
+                        f"{active_gain_code if active_gain_code is not None else 'map'} "
+                        f"({gain_index + 1}/{len(normalized_gain_maps)}), FCLK измерения "
                         f"{active_measurement_fclk_mhz} МГц "
                         f"({clock_index + 1}/{len(measurement_fclk_values)}), "
                         f"амплитуда {amplitude_index + 1}/"
@@ -2704,7 +3004,9 @@ def characterize_comparator(
                     )
                     acquire_groups(groups, stage=stage, phase="adaptive", codes=coarse_codes,
                         amplitude=amplitude, amplitude_configuration=amplitude_configuration,
-                        active_measurement_fclk_mhz=active_measurement_fclk_mhz)
+                        active_measurement_fclk_mhz=active_measurement_fclk_mhz,
+                        active_gain_map=active_gain_map,
+                        active_gain_code=active_gain_code)
                     completed_scurve_groups += len(groups)
                     scurve_fraction = completed_scurve_groups / max(
                         total_scurve_groups, 1
@@ -2715,7 +3017,8 @@ def characterize_comparator(
                         f"{active_measurement_fclk_mhz} МГц, амплитуда "
                         f"{amplitude_index + 1}/"
                         f"{len(selected_settings.scurve.pulse_amplitudes)}, "
-                        f"режим {pattern}",
+                        f"режим {pattern}, GAIN "
+                        f"{active_gain_code if active_gain_code is not None else 'map'}",
                         stage_percent=100.0 * scurve_fraction,
                         overall_percent_estimate=(
                             scurve_progress_start
@@ -2910,7 +3213,14 @@ def characterize_measurement_clock_noise(
     )
     selected_settings.scurve.injection_patterns = (injection_pattern,)
     voltage_steps = characterization_arguments.get("injection_voltage_steps_v")
-    if voltage_steps is not None:
+    manual_reference = characterization_arguments.get(
+        "manual_reference_configuration"
+    )
+    if manual_reference is not None:
+        # The common workflow validates the exact REF1/REF2 pair and its one
+        # positive equivalent voltage step.
+        pass
+    elif voltage_steps is not None:
         if len(tuple(voltage_steps)) != 1:
             raise ValueError(
                 "clock-noise test requires exactly one injection_voltage_steps_v value"

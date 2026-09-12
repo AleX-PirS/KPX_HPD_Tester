@@ -32,14 +32,15 @@ def main() -> None:
         result = characterize_injection_crosstalk(
             client,
             config.threshold_calibration_files(),
-            noise_reference_experiment=config.noise_reference_path(),
+            noise_reference_experiment=config.noise_reference_path(
+                for_gain_sweep=config.gain_sweep_enabled()
+            ),
             window=config.WINDOW,
             pixels=config.PIXELS,
             bad_pixel_map=config.BAD_PIXEL_MAP,
             base_pixel_config=config.base_pixel_config(),
             results_root=config.RESULTS_ROOT,
             settings=settings,
-            gain_map=config.gain_map(),
             initialization_fclk_mhz=config.ASIC_MAIN_FCLK_MHZ,
             measurement_fclk_mhz=config.ASIC_MEASUREMENT_FCLK_MHZ,
             eo_overrides=config.EO_OVERRIDES,
@@ -47,6 +48,7 @@ def main() -> None:
             **config.reference_hardware_arguments(
                 oscilloscope, required_for_scurve=True
             ),
+            **config.gain_hardware_arguments(),
             **config.injection_hardware_arguments(generator),
         )
     print(f"Тест наводок завершен: {result.experiment_path}")

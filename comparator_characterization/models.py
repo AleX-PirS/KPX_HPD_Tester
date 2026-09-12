@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.19.0"
+FRAMEWORK_VERSION = "0.20.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -238,6 +238,7 @@ class NoiseScanSettings:
 @dataclass
 class EqualizationSettings:
     trim_min: int = 0
+    trim_reference: int = 16
     trim_max: int = 31
     local_search_radius: int = 1
     expanded_search_radius: int = 3
@@ -251,6 +252,14 @@ class EqualizationSettings:
     def validate(self) -> None:
         if not 0 <= self.trim_min < self.trim_max <= 31:
             raise ValueError("trim endpoints must satisfy 0 <= min < max <= 31")
+        if (
+            not isinstance(self.trim_reference, int)
+            or isinstance(self.trim_reference, bool)
+            or not self.trim_min < self.trim_reference < self.trim_max
+        ):
+            raise ValueError(
+                "trim_reference must be an integer strictly inside the trim range"
+            )
         if self.local_search_radius < 0:
             raise ValueError("local_search_radius must be >= 0")
         if self.expanded_search_radius < self.local_search_radius:

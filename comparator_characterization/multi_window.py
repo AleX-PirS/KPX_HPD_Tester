@@ -312,7 +312,11 @@ def _extract_window_metrics(
     if baseline.empty and not noise.empty:
         final = noise[noise["stage"].astype(str) == "equalized_final"].copy()
         if final.empty:
-            final = noise[noise["stage"].astype(str).isin(("trim_00", "baseline_noise"))].copy()
+            final = noise[
+                noise["stage"].astype(str).isin(
+                    ("trim_16", "trim_00", "baseline_noise")
+                )
+            ].copy()
         baseline = final[["column", "row", "center_selected_v"]].rename(
             columns={"center_selected_v": "baseline_v"}
         )
@@ -1780,6 +1784,11 @@ def characterize_all_windows(
     settings.validate()
     run_noise = bool(kwargs.get("run_noise_scan", True) or kwargs.get("run_equalization", True))
     run_scurve = bool(kwargs.get("run_scurve", True))
+    joint_ref_sweep_enabled = bool(
+        selected_all.final_ref_sweep_enabled
+        and kwargs.get("manual_reference_configuration") is None
+        and kwargs.get("gain_sweep_codes") is None
+    )
     results_root = kwargs.get("results_root", "results")
     if resume_experiment is None:
         parent = ExperimentStore.create(results_root, window="ALL", metadata={
@@ -1788,7 +1797,17 @@ def characterize_all_windows(
             "windows": list(_WINDOWS),
             "all_window_settings": asdict(selected_all),
             "window_runs": {},
-            "run_options": {"run_noise_scan": run_noise, "run_scurve": run_scurve},
+            "run_options": {
+                "run_noise_scan": run_noise,
+                "run_scurve": run_scurve,
+                "joint_ref_sweep_enabled": joint_ref_sweep_enabled,
+                "joint_ref_sweep_disabled_reason": (
+                    "manual_REF_or_GAIN_sweep_requires_independent_S_curves"
+                    if selected_all.final_ref_sweep_enabled
+                    and not joint_ref_sweep_enabled
+                    else None
+                ),
+            },
         })
     else:
         parent = ExperimentStore(resume_experiment)
@@ -1802,7 +1821,7 @@ def characterize_all_windows(
     completed: list[str] = []
     if (
         run_scurve
-        and selected_all.final_ref_sweep_enabled
+        and joint_ref_sweep_enabled
         and kwargs.get("reference_calibration_files") is not None
         and kwargs.get("injection_voltage_steps_v") is not None
     ):
@@ -1942,12 +1961,12 @@ def characterize_all_windows(
         joint_already_complete = (
             parent.metadata.get("joint_ref_sweep", {}).get("status") == "complete"
         )
-        if run_scurve and selected_all.final_ref_sweep_enabled and joint_already_complete:
+        if run_scurve and joint_ref_sweep_enabled and joint_already_complete:
             parent.log_status(
                 "ALL: финальный REF sweep уже полностью сохранен, повторная "
                 "аппаратная съемка пропущена"
             )
-        elif run_scurve and selected_all.final_ref_sweep_enabled:
+        elif run_scurve and joint_ref_sweep_enabled:
             joint_executor = kwargs.get("shot_executor")
             if joint_executor is None and kwargs.get("keysight_generator") is not None:
                 joint_executor = KeysightBurstShotExecutor(

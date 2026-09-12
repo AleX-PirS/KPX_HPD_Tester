@@ -19,6 +19,23 @@ from comparator_characterization.high_level import characterization_config as co
 
 
 def main() -> None:
+    mode = str(config.REFERENCE_MODE).strip().lower()
+    if mode == "manual":
+        table = pd.DataFrame(
+            [
+                {
+                    "mode": "manual",
+                    "equivalent_step_mV": config.MANUAL_REF_EQUIVALENT_STEP_MV,
+                    "REF1_code": config.MANUAL_REF1_CODE,
+                    "REF2_code": config.MANUAL_REF2_CODE,
+                    "REF_LUT_used": False,
+                }
+            ]
+        )
+        print(table.to_string(index=False))
+        return
+    if mode != "lut":
+        raise ValueError("REFERENCE_MODE must be 'lut' or 'manual'")
     calibrations = load_reference_dac_calibrations(
         config.reference_calibration_files(),
         voltage_unit=config.REFERENCE_LUT_VOLTAGE_UNIT,

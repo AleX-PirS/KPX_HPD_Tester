@@ -184,6 +184,7 @@ def _raw_rows(
     spec: WindowSpec,
     calibration: ThresholdDacCalibration,
     trim_map: Mapping[tuple[int, int], int],
+    gain_map: Mapping[tuple[int, int], int] | None = None,
     threshold_code: int,
     upper_non_limiting_code: int,
     shutter_duration_s: float | None,
@@ -232,6 +233,12 @@ def _raw_rows(
                 "upper_non_limiting_dac_code": upper_non_limiting_code,
                 "local_trim_field": spec.pixel_trim_field,
                 "local_trim_code": int(trim_map[(column, row)]),
+                "local_gain_code": (
+                    int(gain_map[(column, row)])
+                    if gain_map is not None and (column, row) in gain_map
+                    else float("nan")
+                ),
+                "gain_sweep_code": descriptor.get("gain_sweep_code"),
                 "shutter_duration_s": shutter_duration_s,
                 "repeat_index": descriptor["repeat_index"],
                 "pair_id": pair_id or "",
@@ -303,6 +310,7 @@ def _acquire_point(
     spec: WindowSpec,
     pixels: Sequence[tuple[int, int]],
     trim_map: Mapping[tuple[int, int], int],
+    gain_map: Mapping[tuple[int, int], int] | None = None,
     upper_non_limiting_code: int,
     descriptor: Mapping[str, Any],
     request: ShotRequest,
@@ -338,6 +346,7 @@ def _acquire_point(
             spec=spec,
             calibration=calibration,
             trim_map=trim_map,
+            gain_map=gain_map,
             threshold_code=int(descriptor["threshold_dac_code"]),
             upper_non_limiting_code=upper_non_limiting_code,
             shutter_duration_s=request.shutter_duration_s,
@@ -856,6 +865,7 @@ def run_scurve_points(
     pulse_amplitude: Any,
     pulse_amplitude_configuration: Mapping[str, Any],
     gain_map: Mapping[tuple[int, int], int],
+    gain_sweep_code: int | None = None,
     injection_group: InjectionGroup,
     upper_non_limiting_code: int,
     noise_settings: NoiseScanSettings,
@@ -877,6 +887,7 @@ def run_scurve_points(
         pulse_amplitude=pulse_amplitude,
         pulse_amplitude_configuration=pulse_amplitude_configuration,
         gain_map=gain_map,
+        gain_sweep_code=gain_sweep_code,
         injection_group=injection_group,
         upper_non_limiting_code=upper_non_limiting_code,
         noise_settings=noise_settings,

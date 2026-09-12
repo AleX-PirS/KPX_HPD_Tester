@@ -341,7 +341,7 @@ class ReferencePairSelection:
     ref1_shared_across_amplitudes: bool = False
 
     def to_pulse_amplitude(self) -> dict[str, Any]:
-        return {
+        result = {
             "DAC_TST_REF1": self.ref1_code,
             "DAC_TST_REF2": self.ref2_code,
             "requested_voltage_step_v": self.requested_voltage_step_v,
@@ -362,6 +362,20 @@ class ReferencePairSelection:
             "maximum_reference_code": self.maximum_reference_code,
             "minimum_reference_voltage_v": self.minimum_reference_voltage_v,
         }
+        for name in (
+            "ref1_voltage_v",
+            "ref2_voltage_v",
+            "reference_common_mode_v",
+            "fixed_ref1_voltage_v",
+        ):
+            value = result.get(name)
+            if value is None or not math.isfinite(float(value)):
+                result.pop(name, None)
+        if not (
+            "ref1_voltage_v" in result and "ref2_voltage_v" in result
+        ):
+            result.pop("ref1_voltage_above_ref2", None)
+        return result
 
 
 @dataclass(frozen=True)

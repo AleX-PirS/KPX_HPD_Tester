@@ -584,34 +584,387 @@ def fit_noise_statistics(
     return pd.DataFrame(rows)
 
 
+def _piecewise_trim_prediction(
+    frame: pd.DataFrame,
+    target_voltage: float,
+    *,
+    trim_reference_code: int,
+) -> np.ndarray:
+    """Estimate an integer trim from the best measured 0/ref/31 segment.
+
+    The reference code is an additional measured anchor, not a preferred
+    operating code.  If two branches reach the target, the branch with the
+    smaller predicted voltage residual wins.  Rail headroom is only a tie
+    breaker.
+    """
+
+    v0 = pd.to_numeric(
+        frame["center_selected_v_trim0"], errors="coerce"
+    ).to_numpy(dtype=float)
+    vr = pd.to_numeric(
+        frame["center_selected_v_trim_reference"], errors="coerce"
+    ).to_numpy(dtype=float)
+    v31 = pd.to_numeric(
+        frame["center_selected_v_trim31"], errors="coerce"
+    ).to_numpy(dtype=float)
+    target = float(target_voltage)
+    result = np.full(len(frame), np.nan, dtype=float)
+
+    def segment_candidates(
+        code_a: float, code_b: float, voltage_a: float, voltage_b: float
+    ) -> list[tuple[int, float]]:
+        if not (math.isfinite(voltage_a) and math.isfinite(voltage_b)):
+            return []
+        if math.isclose(voltage_a, voltage_b, rel_tol=1e-12, abs_tol=1e-15):
+            return []
+        trim = code_a + (target - voltage_a) * (code_b - code_a) / (
+            voltage_b - voltage_a
+        )
+        bounded = min(max(trim, code_a), code_b)
+        integer_codes = {
+            int(np.clip(math.floor(bounded), code_a, code_b)),
+            int(np.clip(math.ceil(bounded), code_a, code_b)),
+            int(code_a),
+            int(code_b),
+        }
+        return [
+            (
+                code,
+                voltage_a
+                + (code - code_a) * (voltage_b - voltage_a) / (code_b - code_a),
+            )
+            for code in integer_codes
+        ]
+
+    for index, (left, middle, right) in enumerate(zip(v0, vr, v31)):
+        candidates = [
+            candidate
+            for segment in (
+                segment_candidates(
+                    0.0, float(trim_reference_code), left, middle
+                ),
+                segment_candidates(
+                    float(trim_reference_code), 31.0, middle, right
+                ),
+            )
+            for candidate in segment
+        ]
+        if not candidates:
+            candidates.extend(segment_candidates(0.0, 31.0, left, right))
+        if candidates:
+            result[index] = min(
+                candidates,
+                key=lambda item: (
+                    abs(item[1] - target),
+                    -min(item[0], 31 - item[0]),
+                    item[0],
+                ),
+            )[0]
+    return result
+
+
+def _piecewise_center_at_trim(
+    frame: pd.DataFrame,
+    trims: np.ndarray | pd.Series,
+    *,
+    trim_reference_code: int,
+) -> np.ndarray:
+    """Predict center at integer trims, falling back to endpoint interpolation."""
+
+    v0 = pd.to_numeric(
+        frame["center_selected_v_trim0"], errors="coerce"
+    ).to_numpy(dtype=float)
+    vr = pd.to_numeric(
+        frame["center_selected_v_trim_reference"], errors="coerce"
+    ).to_numpy(dtype=float)
+    v31 = pd.to_numeric(
+        frame["center_selected_v_trim31"], errors="coerce"
+    ).to_numpy(dtype=float)
+    trim = np.asarray(trims, dtype=float)
+    endpoint = v0 + trim * (v31 - v0) / 31.0
+    lower = v0 + trim * (vr - v0) / float(trim_reference_code)
+    upper = vr + (trim - trim_reference_code) * (v31 - vr) / float(
+        31 - trim_reference_code
+    )
+    piecewise = np.where(trim <= trim_reference_code, lower, upper)
+    alternate = np.where(trim <= trim_reference_code, upper, lower)
+    piecewise = np.where(np.isfinite(piecewise), piecewise, alternate)
+    piecewise = np.where(trim == trim_reference_code, vr, piecewise)
+    return np.where(np.isfinite(piecewise), piecewise, endpoint)
+
+
+def _linear_trim_parameters(
+    frame: pd.DataFrame, trim_reference_code: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Least-squares line through every available trim anchor per pixel."""
+
+    codes = np.asarray([0.0, float(trim_reference_code), 31.0])
+    voltages = np.column_stack(
+        [
+            pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+            for column in (
+                "center_selected_v_trim0",
+                "center_selected_v_trim_reference",
+                "center_selected_v_trim31",
+            )
+        ]
+    )
+    finite = np.isfinite(voltages)
+    count = finite.sum(axis=1)
+    safe_count = np.maximum(count, 1)
+    x_mean = np.sum(np.where(finite, codes, 0.0), axis=1) / safe_count
+    y_mean = np.sum(np.where(finite, voltages, 0.0), axis=1) / safe_count
+    centered_x = codes - x_mean[:, None]
+    denominator = np.sum(np.where(finite, centered_x**2, 0.0), axis=1)
+    numerator = np.sum(
+        np.where(finite, centered_x * (voltages - y_mean[:, None]), 0.0),
+        axis=1,
+    )
+    slope = np.divide(
+        numerator,
+        denominator,
+        out=np.full(len(frame), np.nan, dtype=float),
+        where=(count >= 2) & (denominator > 0),
+    )
+    intercept = y_mean - slope * x_mean
+    return intercept, slope
+
+
+def _adaptive_trim_prediction(
+    frame: pd.DataFrame,
+    target_voltage: float,
+    *,
+    trim_reference_code: int,
+) -> np.ndarray:
+    """Estimate integer trims with the selected linear or piecewise model."""
+
+    center_grid = np.column_stack(
+        [
+            _adaptive_center_at_trim(
+                frame,
+                np.full(len(frame), code, dtype=float),
+                trim_reference_code=trim_reference_code,
+            )
+            for code in range(32)
+        ]
+    )
+    # Ordered only for exact ties: maximize rail headroom, then use the lower
+    # code.  Code 16 has no special status in this ordering.
+    code_order = np.asarray(
+        sorted(range(32), key=lambda code: (-min(code, 31 - code), code))
+    )
+    distance = abs(center_grid[:, code_order] - float(target_voltage))
+    distance = np.where(np.isfinite(distance), distance, np.inf)
+    best_ordered_index = np.argmin(distance, axis=1)
+    result = code_order[best_ordered_index].astype(float)
+    result[np.isinf(distance).all(axis=1)] = np.nan
+    return result
+
+
+def _adaptive_center_at_trim(
+    frame: pd.DataFrame,
+    trims: np.ndarray | pd.Series,
+    *,
+    trim_reference_code: int,
+) -> np.ndarray:
+    """Predict centers with the per-pixel linearity decision."""
+
+    trim = np.asarray(trims, dtype=float)
+    piecewise = _piecewise_center_at_trim(
+        frame, trim, trim_reference_code=trim_reference_code
+    )
+    intercept, slope = _linear_trim_parameters(frame, trim_reference_code)
+    linear = intercept + slope * trim
+    model = frame.get(
+        "trim_model_selected",
+        pd.Series("piecewise_0_reference_31", index=frame.index),
+    ).astype(str).to_numpy()
+    result = np.where(model == "piecewise_0_reference_31", piecewise, linear)
+    return np.where(np.isfinite(result), result, piecewise)
+
+
 def select_equalization_target(
     noise_fits: pd.DataFrame,
     *,
     trim0_stage: str = "trim_00",
+    trim16_stage: str = "trim_16",
     trim31_stage: str = "trim_31",
+    trim_reference_code: int = 16,
     requested_target_voltage: float | None = None,
 ) -> tuple[float, str, pd.DataFrame]:
-    endpoint0 = noise_fits[noise_fits["stage"] == trim0_stage].copy()
-    endpoint31 = noise_fits[noise_fits["stage"] == trim31_stage].copy()
-    columns = ["column", "row", "center_selected_v", "fit_status"]
+    """Select a target using measured trim 0, reference and 31 anchors.
+
+    Saved experiments without the middle anchor remain supported.  With three
+    anchors, each pixel uses a joint linear fit unless the middle point shows
+    curvature that is resolved relative to fit uncertainty or one trim LSB.
+    Resolved curvature uses the measured piecewise-linear curve.
+    """
+
+    if not isinstance(trim_reference_code, int) or isinstance(
+        trim_reference_code, bool
+    ) or not 0 < trim_reference_code < 31:
+        raise ValueError("trim_reference_code must be an integer in 1..30")
+    fits = noise_fits.copy()
+    for optional_column, default in (
+        ("center_fit_uncertainty_v", np.nan),
+        ("center_selected_method", "unknown"),
+    ):
+        if optional_column not in fits:
+            fits[optional_column] = default
+    endpoint0 = fits[fits["stage"] == trim0_stage].copy()
+    reference = fits[fits["stage"] == trim16_stage].copy()
+    endpoint31 = fits[fits["stage"] == trim31_stage].copy()
+    columns = [
+        "column",
+        "row",
+        "center_selected_v",
+        "fit_status",
+        "center_fit_uncertainty_v",
+        "center_selected_method",
+    ]
     merged = endpoint0[columns].merge(
         endpoint31[columns],
         on=["column", "row"],
         suffixes=("_trim0", "_trim31"),
         how="outer",
     )
-    merged["reachable_min_v"] = merged[
-        ["center_selected_v_trim0", "center_selected_v_trim31"]
-    ].min(axis=1, skipna=False)
-    merged["reachable_max_v"] = merged[
-        ["center_selected_v_trim0", "center_selected_v_trim31"]
-    ].max(axis=1, skipna=False)
+    if reference.empty:
+        merged["center_selected_v_trim_reference"] = np.nan
+        merged["fit_status_trim_reference"] = "not_measured"
+        merged["center_fit_uncertainty_v_trim_reference"] = np.nan
+        merged["center_selected_method_trim_reference"] = "not_measured"
+    else:
+        reference = reference[columns].rename(
+            columns={
+                "center_selected_v": "center_selected_v_trim_reference",
+                "fit_status": "fit_status_trim_reference",
+                "center_fit_uncertainty_v": (
+                    "center_fit_uncertainty_v_trim_reference"
+                ),
+                "center_selected_method": (
+                    "center_selected_method_trim_reference"
+                ),
+            }
+        )
+        merged = merged.merge(reference, on=["column", "row"], how="outer")
+    anchor_columns = [
+        "center_selected_v_trim0",
+        "center_selected_v_trim_reference",
+        "center_selected_v_trim31",
+    ]
+    merged["valid_trim_anchor_count"] = merged[anchor_columns].apply(
+        lambda row: int(np.isfinite(pd.to_numeric(row, errors="coerce")).sum()),
+        axis=1,
+    )
+    merged["reachable_min_v"] = merged[anchor_columns].min(axis=1, skipna=True)
+    merged["reachable_max_v"] = merged[anchor_columns].max(axis=1, skipna=True)
+    v0 = pd.to_numeric(merged["center_selected_v_trim0"], errors="coerce")
+    vr = pd.to_numeric(
+        merged["center_selected_v_trim_reference"], errors="coerce"
+    )
+    v31 = pd.to_numeric(merged["center_selected_v_trim31"], errors="coerce")
+    endpoint_slope = (v31 - v0) / 31.0
+    merged["trim_slope_v_per_code"] = endpoint_slope
+    merged["trim_reference_code"] = trim_reference_code
+    merged["trim_reference_linearity_error_v"] = vr - (
+        v0 + endpoint_slope * trim_reference_code
+    )
+    merged["trim_reference_available"] = np.isfinite(vr)
+    merged["trim_low_side_slope_v_per_code"] = (
+        vr - v0
+    ) / float(trim_reference_code)
+    merged["trim_high_side_slope_v_per_code"] = (
+        v31 - vr
+    ) / float(31 - trim_reference_code)
+    all_three = np.isfinite(v0) & np.isfinite(vr) & np.isfinite(v31)
+    merged["trim_corner_direction_reversal"] = (
+        merged["trim_low_side_slope_v_per_code"]
+        * merged["trim_high_side_slope_v_per_code"]
+        <= 0
+    ).where(all_three, False)
+    merged["trim_curve_monotonic"] = (
+        ((v0 <= vr) & (vr <= v31)) | ((v0 >= vr) & (vr >= v31))
+    ).where(all_three, False)
+
+    # A departure smaller than half of a local trim LSB cannot improve the
+    # integer recommendation.  For fitted centers, also require 3-sigma
+    # significance before adding a piecewise degree of freedom.
+    local_slopes = np.column_stack(
+        [
+            abs(endpoint_slope.to_numpy(dtype=float)),
+            abs(
+                merged["trim_low_side_slope_v_per_code"].to_numpy(dtype=float)
+            ),
+            abs(
+                merged["trim_high_side_slope_v_per_code"].to_numpy(dtype=float)
+            ),
+        ]
+    )
+    finite_local_slope = np.isfinite(local_slopes)
+    local_lsb = np.max(
+        np.where(finite_local_slope, local_slopes, -np.inf), axis=1
+    )
+    local_lsb[~finite_local_slope.any(axis=1)] = np.nan
+    resolution_limit = 0.5 * local_lsb
+    weight = float(trim_reference_code) / 31.0
+    uncertainty_columns = (
+        "center_fit_uncertainty_v_trim0",
+        "center_fit_uncertainty_v_trim_reference",
+        "center_fit_uncertainty_v_trim31",
+    )
+    uncertainty = [
+        pd.to_numeric(merged[column], errors="coerce").to_numpy(dtype=float)
+        for column in uncertainty_columns
+    ]
+    method_columns = (
+        "center_selected_method_trim0",
+        "center_selected_method_trim_reference",
+        "center_selected_method_trim31",
+    )
+    for index, column in enumerate(method_columns):
+        is_fit = merged[column].astype(str).eq("fit").to_numpy()
+        uncertainty[index] = np.where(is_fit, uncertainty[index], np.nan)
+    curvature_uncertainty = np.sqrt(
+        uncertainty[1] ** 2
+        + ((1.0 - weight) * uncertainty[0]) ** 2
+        + (weight * uncertainty[2]) ** 2
+    )
+    statistical_limit = 3.0 * curvature_uncertainty
+    curvature_limit = np.where(
+        np.isfinite(statistical_limit),
+        np.maximum(resolution_limit, statistical_limit),
+        resolution_limit,
+    )
+    curvature_error = abs(
+        merged["trim_reference_linearity_error_v"].to_numpy(dtype=float)
+    )
+    curvature_resolved = all_three.to_numpy() & (
+        curvature_error > curvature_limit
+    )
+    direction_reversal = merged["trim_corner_direction_reversal"].to_numpy(
+        dtype=bool
+    )
+    curvature_resolved |= direction_reversal
+    merged["trim_curvature_resolution_limit_v"] = curvature_limit
+    merged["trim_curvature_significance_sigma"] = np.divide(
+        curvature_error,
+        curvature_uncertainty,
+        out=np.full(len(merged), np.nan, dtype=float),
+        where=np.isfinite(curvature_uncertainty) & (curvature_uncertainty > 0),
+    )
+    merged["trim_curvature_resolved"] = curvature_resolved
+    merged["trim_model_selected"] = np.where(
+        curvature_resolved,
+        "piecewise_0_reference_31",
+        "linear_all_valid_anchors",
+    )
     valid = merged[
         np.isfinite(merged["reachable_min_v"])
         & np.isfinite(merged["reachable_max_v"])
+        & (merged["valid_trim_anchor_count"] >= 2)
     ].copy()
     if valid.empty:
-        raise RuntimeError("no pixels have valid centers at both trim endpoints")
+        raise RuntimeError("no pixels have at least two valid trim anchor centers")
 
     if requested_target_voltage is not None:
         target = float(requested_target_voltage)
@@ -629,7 +982,7 @@ def select_equalization_target(
         )
         dense = np.linspace(float(endpoints.min()), float(endpoints.max()), 2001)
         candidates = np.unique(np.concatenate((endpoints, dense)))
-        midpoint_reference = float(
+        endpoint_midpoint_reference = float(
             np.median(
                 (
                     valid["center_selected_v_trim0"].to_numpy(dtype=float)
@@ -638,36 +991,73 @@ def select_equalization_target(
                 / 2
             )
         )
+        measured_reference_centers = pd.to_numeric(
+            valid["center_selected_v_trim_reference"], errors="coerce"
+        )
+        midpoint_reference = (
+            float(np.nanmedian(measured_reference_centers))
+            if np.isfinite(measured_reference_centers).any()
+            else endpoint_midpoint_reference
+        )
         best_score: tuple[float, ...] | None = None
         target = midpoint_reference
+        center_grid = np.column_stack(
+            [
+                _adaptive_center_at_trim(
+                    valid,
+                    np.full(len(valid), code, dtype=float),
+                    trim_reference_code=trim_reference_code,
+                )
+                for code in range(32)
+            ]
+        )
+        code_order = np.asarray(
+            sorted(range(32), key=lambda code: (-min(code, 31 - code), code))
+        )
+        ordered_center_grid = center_grid[:, code_order]
         for candidate in candidates:
             reachable = (
                 (valid["reachable_min_v"].to_numpy(dtype=float) <= candidate)
                 & (candidate <= valid["reachable_max_v"].to_numpy(dtype=float))
             )
-            v0 = valid["center_selected_v_trim0"].to_numpy(dtype=float)
-            v31 = valid["center_selected_v_trim31"].to_numpy(dtype=float)
-            slope = (v31 - v0) / 31.0
-            with np.errstate(divide="ignore", invalid="ignore"):
-                trim_float = (candidate - v0) / slope
-            trim_integer = np.clip(np.rint(trim_float), 0, 31)
-            predicted = v0 + trim_integer * slope
+            distance = abs(ordered_center_grid - candidate)
+            distance = np.where(np.isfinite(distance), distance, np.inf)
+            trim_integer = code_order[np.argmin(distance, axis=1)]
+            predicted = center_grid[
+                np.arange(len(valid), dtype=int), trim_integer
+            ]
+            missing_prediction = np.isinf(distance).all(axis=1)
+            predicted = np.where(
+                missing_prediction, np.nan, predicted
+            )
             residual = predicted - candidate
             saturation = (trim_integer == 0) | (trim_integer == 31)
             trim_headroom = np.minimum(trim_integer, 31 - trim_integer)
+            reachable_predicted = predicted[reachable]
+            predicted_spread = (
+                float(np.nanstd(reachable_predicted))
+                if np.any(reachable)
+                else np.inf
+            )
             score = (
                 -float(np.sum(reachable)),
+                predicted_spread,
+                float(np.sqrt(np.nanmean(residual[reachable] ** 2)))
+                if np.any(reachable)
+                else np.inf,
+                float(np.nanquantile(abs(residual[reachable]), 0.95))
+                if np.any(reachable)
+                else np.inf,
                 float(np.sum(saturation & reachable)),
                 -float(np.nanmedian(trim_headroom[reachable])) if np.any(reachable) else np.inf,
-                float(np.sqrt(np.nanmean(residual[reachable] ** 2))) if np.any(reachable) else np.inf,
                 abs(float(candidate) - midpoint_reference),
             )
             if best_score is None or score < best_score:
                 best_score = score
                 target = float(candidate)
         method = (
-            "maximize_common_reach_then_minimize_predicted_saturation_"
-            "maximize_trim_headroom_and_minimize_integer_trim_residual"
+            "maximize_common_reach_then_minimize_equalized_threshold_spread_"
+            "and_integer_residual_adaptive_linear_or_piecewise_0_reference_31"
         )
 
     merged["target_voltage_v"] = target
@@ -675,32 +1065,32 @@ def select_equalization_target(
         (merged["reachable_min_v"] <= target)
         & (target <= merged["reachable_max_v"])
     )
-    slope = (
-        merged["center_selected_v_trim31"] - merged["center_selected_v_trim0"]
-    ) / 31.0
-    merged["trim_slope_v_per_code"] = slope
-    with np.errstate(divide="ignore", invalid="ignore"):
-        estimated = (target - merged["center_selected_v_trim0"]) / slope
-    endpoint_distance0 = abs(merged["center_selected_v_trim0"] - target)
-    endpoint_distance31 = abs(merged["center_selected_v_trim31"] - target)
-    valid_endpoints = (
-        np.isfinite(merged["center_selected_v_trim0"])
-        & np.isfinite(merged["center_selected_v_trim31"])
-    )
-    endpoint_fallback = pd.Series(
-        np.where(
-            valid_endpoints,
-            np.where(endpoint_distance31 < endpoint_distance0, 31.0, 0.0),
-            np.nan,
+    estimated = pd.Series(
+        _adaptive_trim_prediction(
+            merged, target, trim_reference_code=trim_reference_code
         ),
         index=merged.index,
     )
-    estimated = estimated.where(np.isfinite(estimated), endpoint_fallback)
+    anchor_distances = np.column_stack(
+        [
+            abs(v0.to_numpy(dtype=float) - target),
+            abs(vr.to_numpy(dtype=float) - target),
+            abs(v31.to_numpy(dtype=float) - target),
+        ]
+    )
+    anchor_distances[~np.isfinite(anchor_distances)] = np.inf
+    anchor_codes = np.asarray([0.0, float(trim_reference_code), 31.0])
+    nearest_anchor = anchor_codes[np.argmin(anchor_distances, axis=1)]
+    nearest_anchor[np.isinf(anchor_distances).all(axis=1)] = np.nan
+    estimated = estimated.where(
+        np.isfinite(estimated), pd.Series(nearest_anchor, index=merged.index)
+    )
     merged["estimated_trim_float"] = estimated
     merged["estimated_trim_code"] = np.clip(np.rint(estimated), 0, 31).astype("Int64")
-    merged["predicted_center_v"] = (
-        merged["center_selected_v_trim0"]
-        + merged["estimated_trim_code"].astype(float) * slope
+    merged["predicted_center_v"] = _adaptive_center_at_trim(
+        merged,
+        merged["estimated_trim_code"].astype(float),
+        trim_reference_code=trim_reference_code,
     )
     merged["predicted_residual_v"] = merged["predicted_center_v"] - target
     return target, method, merged
@@ -711,7 +1101,7 @@ def choose_measured_trim_map(
     *,
     target_voltage: float,
     stage_prefixes: Iterable[str] = ("trim_candidate_", "trim_expand_", "trim_full_"),
-    stage_names: Iterable[str] = ("trim_00", "trim_31"),
+    stage_names: Iterable[str] = ("trim_00", "trim_16", "trim_31"),
 ) -> pd.DataFrame:
     prefixes = tuple(stage_prefixes)
     exact_names = tuple(stage_names)
@@ -750,6 +1140,7 @@ def choose_measured_trim_map(
 
 _SCURVE_STAGE_COLUMNS = (
     "stage",
+    "gain_sweep_code",
     "measurement_fclk_mhz",
     "pulse_amplitude_native",
     "injection_pattern",
@@ -988,8 +1379,10 @@ def _sparse_background_evidence(paired: pd.DataFrame) -> pd.DataFrame:
     data["background_evaluation_count"] = data["background_count"]
     data["background_evaluation_valid"] = _as_bool(data["background_valid"])
     data["background_evidence_source"] = np.where(data["background_count"].notna(), "paired_measurement", "missing")
-    identities = ["stage", "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern",
-                  "injection_group_id", "column", "row", "local_trim_code"]
+    identities = ["stage", "gain_sweep_code", "measurement_fclk_mhz",
+                  "pulse_amplitude_native", "injection_pattern",
+                  "injection_group_id", "column", "row", "local_trim_code",
+                  "local_gain_code"]
     for _, group in data.groupby(identities, dropna=False, sort=False):
         sparse = group["background_mode"].eq("sparse")
         if not sparse.any():
@@ -1031,6 +1424,8 @@ def _paired_scurve_efficiency(
     if "tile_mode" not in frame:
         frame["tile_mode"] = frame.get("scurve_tile_mode", "tile_crosstalk")
     defaults: dict[str, Any] = {
+        "gain_sweep_code": np.nan,
+        "local_gain_code": np.nan,
         "measurement_fclk_mhz": np.nan,
         "injection_pattern": "all",
         "injection_group_id": "all",
@@ -1070,6 +1465,8 @@ def _paired_scurve_efficiency(
         "column",
         "row",
         "local_trim_code",
+        "local_gain_code",
+        "gain_sweep_code",
         "selected_count",
         "actual_injections",
         "programmed_injections",
@@ -1118,6 +1515,8 @@ def _paired_scurve_efficiency(
         "column",
         "row",
         "local_trim_code",
+        "local_gain_code",
+        "gain_sweep_code",
         "injection_pattern",
         "injection_group_id",
         "injection_phase_column",
@@ -1206,6 +1605,8 @@ def _paired_scurve_efficiency(
         "column",
         "row",
         "local_trim_code",
+        "local_gain_code",
+        "gain_sweep_code",
         "injection_pattern",
         "injection_group_id",
     ]
@@ -1266,7 +1667,9 @@ def _paired_scurve_efficiency(
         ].copy()
         if final_noise.empty:
             final_noise = noise_statistics[
-                noise_statistics["stage"].isin(("baseline_noise", "trim_00"))
+                noise_statistics["stage"].isin(
+                    ("baseline_noise", "trim_16", "trim_00")
+                )
             ].copy()
     expected = final_noise.reindex(columns=expected_columns).rename(
         columns={
@@ -1648,8 +2051,9 @@ def fit_scurves(
     selected_settings = settings or AnalysisSettings()
     selected_settings.validate()
     group_columns = [
-        "stage", "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern",
-        "column", "row", "local_trim_code",
+        "stage", "gain_sweep_code", "measurement_fclk_mhz",
+        "pulse_amplitude_native", "injection_pattern",
+        "column", "row", "local_trim_code", "local_gain_code",
     ]
     metadata_columns = [column for column in (
             "injection_voltage_step_v",
@@ -1705,6 +2109,8 @@ def summarize_scurve_branch_and_precision(
     if efficiency.empty:
         return pd.DataFrame(), pd.DataFrame()
     frame = efficiency.copy()
+    if "gain_sweep_code" not in frame:
+        frame["gain_sweep_code"] = np.nan
     frame["threshold_dac_code"] = pd.to_numeric(
         frame["threshold_dac_code"], errors="coerce"
     )
@@ -1794,23 +2200,36 @@ def summarize_scurve_branch_and_precision(
     precision_rows: list[dict[str, Any]] = []
     result_group_columns = [
         "stage",
+        "gain_sweep_code",
         "measurement_fclk_mhz",
         "pulse_amplitude_native",
         "injection_pattern",
         "column",
         "row",
         "local_trim_code",
+        "local_gain_code",
     ]
     if not scurve_results.empty:
-        grouped_efficiency = frame.groupby(
-            result_group_columns, dropna=False, sort=False
-        )
+        missing_key = "__SCURVE_GROUP_NA__"
+
+        def normalized_group_key(values: Iterable[Any]) -> tuple[Any, ...]:
+            return tuple(
+                missing_key if pd.isna(value) else value for value in values
+            )
+
+        grouped_efficiency = {
+            normalized_group_key(
+                keys if isinstance(keys, tuple) else (keys,)
+            ): group
+            for keys, group in frame.groupby(
+                result_group_columns, dropna=False, sort=False
+            )
+        }
         for _, result in scurve_results.iterrows():
-            key = tuple(result.get(column) for column in result_group_columns)
-            try:
-                pixel = grouped_efficiency.get_group(key)
-            except KeyError:
-                pixel = frame.iloc[0:0]
+            key = normalized_group_key(
+                result.get(column) for column in result_group_columns
+            )
+            pixel = grouped_efficiency.get(key, frame.iloc[0:0])
             fine = pixel[
                 pixel.index.isin(_dense_scurve_rows(pixel).index)
                 & _as_bool(pixel.get(
@@ -1893,6 +2312,11 @@ def calculate_injection_crosstalk_metrics(
     if efficiency.empty or "injection_pattern" not in efficiency:
         return pd.DataFrame(), pd.DataFrame()
     frame = efficiency.copy()
+    if "gain_sweep_code" not in frame:
+        frame["gain_sweep_code"] = -1
+    frame["gain_sweep_code"] = pd.to_numeric(
+        frame["gain_sweep_code"], errors="coerce"
+    ).fillna(-1)
     if "measurement_fclk_mhz" not in frame:
         frame["measurement_fclk_mhz"] = -1
     frame["measurement_fclk_mhz"] = pd.to_numeric(
@@ -1906,7 +2330,7 @@ def calculate_injection_crosstalk_metrics(
     )
     density = (
         frame.groupby(
-            ["measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
+            ["gain_sweep_code", "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
             as_index=False,
             dropna=False,
         )["active_injection_pixel_count"]
@@ -1917,15 +2341,16 @@ def calculate_injection_crosstalk_metrics(
         density.sort_values(
             [
                 "measurement_fclk_mhz",
+                "gain_sweep_code",
                 "pulse_amplitude_native",
                 "median_active_pixels_per_shot",
                 "injection_pattern",
             ]
         )
         .drop_duplicates(
-            ["measurement_fclk_mhz", "pulse_amplitude_native"], keep="first"
+            ["gain_sweep_code", "measurement_fclk_mhz", "pulse_amplitude_native"], keep="first"
         )
-        .set_index(["measurement_fclk_mhz", "pulse_amplitude_native"])[
+        .set_index(["gain_sweep_code", "measurement_fclk_mhz", "pulse_amplitude_native"])[
             "injection_pattern"
         ]
         .to_dict()
@@ -1934,6 +2359,11 @@ def calculate_injection_crosstalk_metrics(
     pixel_metrics = pd.DataFrame()
     if not scurve_results.empty:
         results = scurve_results.copy()
+        if "gain_sweep_code" not in results:
+            results["gain_sweep_code"] = -1
+        results["gain_sweep_code"] = pd.to_numeric(
+            results["gain_sweep_code"], errors="coerce"
+        ).fillna(-1)
         if "measurement_fclk_mhz" not in results:
             results["measurement_fclk_mhz"] = -1
         results["measurement_fclk_mhz"] = pd.to_numeric(
@@ -1941,13 +2371,17 @@ def calculate_injection_crosstalk_metrics(
         ).fillna(-1)
         scurve_results = results
         reference_rows = []
-        for (clock_mhz, amplitude), reference_pattern in (
+        for (gain_code, clock_mhz, amplitude), reference_pattern in (
             reference_by_clock_amplitude.items()
         ):
             subset = results[
                 (
                     results["measurement_fclk_mhz"].fillna(-1)
                     == (-1 if pd.isna(clock_mhz) else clock_mhz)
+                )
+                & (
+                    results["gain_sweep_code"].fillna(-1)
+                    == (-1 if pd.isna(gain_code) else gain_code)
                 )
                 & (results["pulse_amplitude_native"] == amplitude)
                 & (results["injection_pattern"] == reference_pattern)
@@ -1963,6 +2397,7 @@ def calculate_injection_crosstalk_metrics(
             reference = reference[
                 [
                     "measurement_fclk_mhz",
+                    "gain_sweep_code",
                     "pulse_amplitude_native",
                     "column",
                     "row",
@@ -1980,6 +2415,7 @@ def calculate_injection_crosstalk_metrics(
                 reference,
                 on=[
                     "measurement_fclk_mhz",
+                    "gain_sweep_code",
                     "pulse_amplitude_native",
                     "column",
                     "row",
@@ -1998,8 +2434,8 @@ def calculate_injection_crosstalk_metrics(
             )
 
     summary_rows: list[dict[str, Any]] = []
-    for (clock_mhz, amplitude, pattern), group in frame.groupby(
-        ["measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
+    for (gain_code, clock_mhz, amplitude, pattern), group in frame.groupby(
+        ["gain_sweep_code", "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
         dropna=False,
         sort=True,
     ):
@@ -2017,6 +2453,10 @@ def calculate_injection_crosstalk_metrics(
                 )
                 & (scurve_results["pulse_amplitude_native"] == amplitude)
                 & (scurve_results["injection_pattern"] == pattern)
+                & (
+                    scurve_results["gain_sweep_code"].fillna(-1)
+                    == (-1 if pd.isna(gain_code) else gain_code)
+                )
             ]
             if not scurve_results.empty
             else pd.DataFrame()
@@ -2029,17 +2469,22 @@ def calculate_injection_crosstalk_metrics(
                 )
                 & (pixel_metrics["pulse_amplitude_native"] == amplitude)
                 & (pixel_metrics["injection_pattern"] == pattern)
+                & (
+                    pixel_metrics["gain_sweep_code"].fillna(-1)
+                    == (-1 if pd.isna(gain_code) else gain_code)
+                )
             ]
             if not pixel_metrics.empty
             else pd.DataFrame()
         )
         summary_rows.append(
             {
+                "gain_sweep_code": gain_code,
                 "measurement_fclk_mhz": clock_mhz,
                 "pulse_amplitude_native": amplitude,
                 "injection_pattern": pattern,
                 "reference_injection_pattern": reference_by_clock_amplitude.get(
-                    (clock_mhz, amplitude)
+                    (gain_code, clock_mhz, amplitude)
                 ),
                 "group_count": int(group["injection_group_id"].nunique()),
                 "median_active_pixels_per_shot": float(
@@ -2074,6 +2519,10 @@ def calculate_injection_crosstalk_metrics(
             table["measurement_fclk_mhz"] = table[
                 "measurement_fclk_mhz"
             ].replace(-1, np.nan)
+        if not table.empty and "gain_sweep_code" in table:
+            table["gain_sweep_code"] = table["gain_sweep_code"].replace(
+                -1, np.nan
+            )
     return pixel_metrics, summary
 
 
@@ -2090,6 +2539,8 @@ def calculate_measurement_clock_noise_metrics(
     if scurve_results.empty or "measurement_fclk_mhz" not in scurve_results:
         return pd.DataFrame(), pd.DataFrame()
     frame = scurve_results.copy()
+    if "gain_sweep_code" not in frame:
+        frame["gain_sweep_code"] = np.nan
     frame["measurement_fclk_mhz"] = pd.to_numeric(
         frame["measurement_fclk_mhz"], errors="coerce"
     )
@@ -2108,6 +2559,7 @@ def calculate_measurement_clock_noise_metrics(
         frame.get("fit_rmse_efficiency"), errors="coerce"
     )
     pixel_columns = [
+        "gain_sweep_code",
         "measurement_fclk_mhz",
         "pulse_amplitude_native",
         "injection_pattern",
@@ -2130,8 +2582,8 @@ def calculate_measurement_clock_noise_metrics(
     pixel_metrics = frame.reindex(columns=pixel_columns).copy()
 
     summary_rows: list[dict[str, Any]] = []
-    for (clock_mhz, amplitude, pattern), group in frame.groupby(
-        ["measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
+    for (gain_code, clock_mhz, amplitude, pattern), group in frame.groupby(
+        ["gain_sweep_code", "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"],
         dropna=False,
         sort=True,
     ):
@@ -2144,6 +2596,7 @@ def calculate_measurement_clock_noise_metrics(
         r2 = pd.to_numeric(usable["fit_r2"], errors="coerce").dropna()
         summary_rows.append(
             {
+                "gain_sweep_code": gain_code,
                 "measurement_fclk_mhz": float(clock_mhz),
                 "pulse_amplitude_native": amplitude,
                 "injection_pattern": pattern,
@@ -2260,7 +2713,9 @@ def uniform_trim_characterization(noise_fits: pd.DataFrame) -> pd.DataFrame:
     if noise_fits.empty or "stage" not in noise_fits:
         return pd.DataFrame()
     stages = noise_fits["stage"].astype(str)
-    mask = stages.isin(("trim_00", "trim_31")) | stages.str.startswith("trim_full_")
+    mask = stages.isin(
+        ("trim_00", "trim_16", "trim_31")
+    ) | stages.str.startswith("trim_full_")
     frame = noise_fits[mask].copy()
     if frame.empty:
         return frame
@@ -2313,16 +2768,21 @@ def summarize_scurve_amplitudes(scurve_results: pd.DataFrame) -> pd.DataFrame:
     if "measurement_fclk_mhz" not in scurve_results:
         scurve_results = scurve_results.copy()
         scurve_results["measurement_fclk_mhz"] = np.nan
+    if "gain_sweep_code" not in scurve_results:
+        scurve_results = scurve_results.copy()
+        scurve_results["gain_sweep_code"] = np.nan
     rows: list[dict[str, Any]] = []
     group_columns = [
-        "measurement_fclk_mhz", "pulse_amplitude_native", "injection_pattern"
+        "gain_sweep_code", "measurement_fclk_mhz",
+        "pulse_amplitude_native", "injection_pattern"
     ]
     for keys, group in scurve_results.groupby(group_columns, dropna=False, sort=True):
-        measurement_fclk_mhz, amplitude, pattern = keys
+        gain_sweep_code, measurement_fclk_mhz, amplitude, pattern = keys
         valid = group[group["fit_status"].isin(("ok", "poor_quality"))]
         v50 = pd.to_numeric(valid["v50_v"], errors="coerce").dropna()
         sigma = pd.to_numeric(valid["sigma_v"], errors="coerce").dropna()
         row: dict[str, Any] = {
+            "gain_sweep_code": gain_sweep_code,
             "measurement_fclk_mhz": measurement_fclk_mhz,
             "pulse_amplitude_native": amplitude,
             "injection_pattern": pattern,
@@ -2351,6 +2811,8 @@ def summarize_scurve_amplitudes(scurve_results: pd.DataFrame) -> pd.DataFrame:
             "ref1_voltage_v",
             "ref2_voltage_v",
             "reference_common_mode_v",
+            "reference_pair_selection_method",
+            "injection_charge_status",
         ):
             if column in group:
                 row[column] = group.iloc[0][column]
@@ -2366,6 +2828,9 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
     if "measurement_fclk_mhz" not in scurve_results:
         scurve_results = scurve_results.copy()
         scurve_results["measurement_fclk_mhz"] = np.nan
+    if "gain_sweep_code" not in scurve_results:
+        scurve_results = scurve_results.copy()
+        scurve_results["gain_sweep_code"] = np.nan
     frame = scurve_results[scurve_results["fit_status"].isin(("ok", "poor_quality"))].copy()
     frame["injection_voltage_step_v"] = pd.to_numeric(
         frame["injection_voltage_step_v"], errors="coerce"
@@ -2378,8 +2843,8 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
     frame["v50_v"] = pd.to_numeric(frame["v50_v"], errors="coerce")
     frame = frame.dropna(subset=["injection_voltage_step_v", "v50_v"])
     rows: list[dict[str, Any]] = []
-    for (measurement_fclk_mhz, pattern, column, row), group in frame.groupby(
-        ["measurement_fclk_mhz", "injection_pattern", "column", "row"],
+    for (gain_sweep_code, measurement_fclk_mhz, pattern, column, row), group in frame.groupby(
+        ["gain_sweep_code", "measurement_fclk_mhz", "injection_pattern", "column", "row"],
         dropna=False,
         sort=True,
     ):
@@ -2447,6 +2912,7 @@ def fit_scurve_gain_results(scurve_results: pd.DataFrame) -> pd.DataFrame:
                     linear_point_count = int(stop)
         rows.append(
             {
+                "gain_sweep_code": gain_sweep_code,
                 "measurement_fclk_mhz": measurement_fclk_mhz,
                 "injection_pattern": pattern,
                 "column": int(column),
@@ -2498,6 +2964,7 @@ def fit_spatially_compensated_scurve_gain_results(
     if plane.empty:
         return empty, empty, empty
     for column in (
+        "gain_sweep_code",
         "measurement_fclk_mhz",
         "injection_voltage_step_v",
         "column",
@@ -2507,6 +2974,7 @@ def fit_spatially_compensated_scurve_gain_results(
         plane[column] = pd.to_numeric(plane[column], errors="coerce")
     group_keys = [
         "source_stage",
+        "gain_sweep_code",
         "measurement_fclk_mhz",
         "injection_pattern",
         "injection_voltage_step_v",
@@ -2526,6 +2994,11 @@ def fit_spatially_compensated_scurve_gain_results(
         "fit_inlier",
     ]
     corrected = scurve_results.copy()
+    if "gain_sweep_code" not in corrected:
+        corrected["gain_sweep_code"] = np.nan
+    corrected["gain_sweep_code"] = pd.to_numeric(
+        corrected["gain_sweep_code"], errors="coerce"
+    )
     corrected["measurement_fclk_mhz"] = pd.to_numeric(
         corrected.get("measurement_fclk_mhz", np.nan), errors="coerce"
     )
@@ -2536,6 +3009,7 @@ def fit_spatially_compensated_scurve_gain_results(
         plane[merge_columns].rename(columns={"source_stage": "stage"}),
         on=[
             "stage",
+            "gain_sweep_code",
             "measurement_fclk_mhz",
             "injection_pattern",
             "injection_voltage_step_v",
@@ -2572,7 +3046,10 @@ def fit_spatially_compensated_scurve_gain_results(
     if raw_gain.empty or compensated_gain.empty:
         comparison = empty
     else:
-        keys = ["measurement_fclk_mhz", "injection_pattern", "column", "row"]
+        keys = [
+            "gain_sweep_code", "measurement_fclk_mhz",
+            "injection_pattern", "column", "row"
+        ]
         raw_columns = keys + [
             "nominal_gain_mv_per_ke",
             "fit_r2",
@@ -2598,6 +3075,7 @@ def fit_spatially_compensated_scurve_gain_results(
         column
         for column in (
             "stage",
+            "gain_sweep_code",
             "measurement_fclk_mhz",
             "injection_pattern",
             "injection_voltage_step_v",
@@ -2621,6 +3099,7 @@ _SPATIAL_BASELINE_PIXEL_COLUMNS = [
     "analysis_group",
     "source_kind",
     "source_stage",
+    "gain_sweep_code",
     "measurement_fclk_mhz",
     "injection_pattern",
     "injection_voltage_step_v",
@@ -2638,6 +3117,7 @@ _SPATIAL_BASELINE_SUMMARY_COLUMNS = [
     "analysis_group",
     "source_kind",
     "source_stage",
+    "gain_sweep_code",
     "measurement_fclk_mhz",
     "injection_pattern",
     "injection_voltage_step_v",
@@ -2796,6 +3276,7 @@ def _fit_spatial_baseline_group(group: pd.DataFrame) -> tuple[pd.DataFrame, dict
         "analysis_group": metadata["analysis_group"],
         "source_kind": metadata["source_kind"],
         "source_stage": metadata["source_stage"],
+        "gain_sweep_code": metadata["gain_sweep_code"],
         "measurement_fclk_mhz": metadata["measurement_fclk_mhz"],
         "injection_pattern": metadata["injection_pattern"],
         "injection_voltage_step_v": metadata["injection_voltage_step_v"],
@@ -2850,6 +3331,7 @@ def analyze_spatial_baseline(
         )
         noise["source_kind"] = "noise_effective_threshold"
         noise["source_stage"] = noise.get("stage", "noise")
+        noise["gain_sweep_code"] = np.nan
         noise["measurement_fclk_mhz"] = np.nan
         noise["injection_pattern"] = "none"
         noise["injection_voltage_step_v"] = np.nan
@@ -2869,6 +3351,9 @@ def analyze_spatial_baseline(
             scurve["effective_baseline_v"] = pd.to_numeric(scurve["v50_v"], errors="coerce")
             scurve["source_kind"] = "scurve_v50_at_injected_step"
             scurve["source_stage"] = scurve.get("stage", "scurve")
+            scurve["gain_sweep_code"] = pd.to_numeric(
+                scurve.get("gain_sweep_code", np.nan), errors="coerce"
+            )
             scurve["measurement_fclk_mhz"] = pd.to_numeric(
                 scurve.get("measurement_fclk_mhz", np.nan), errors="coerce"
             )
@@ -2898,6 +3383,9 @@ def analyze_spatial_baseline(
             )
             intercept["source_kind"] = "scurve_zero_charge_intercept"
             intercept["source_stage"] = "v50_vs_charge_intercept"
+            intercept["gain_sweep_code"] = pd.to_numeric(
+                intercept.get("gain_sweep_code", np.nan), errors="coerce"
+            )
             intercept["measurement_fclk_mhz"] = pd.to_numeric(
                 intercept.get("measurement_fclk_mhz", np.nan), errors="coerce"
             )
@@ -2918,10 +3406,14 @@ def analyze_spatial_baseline(
         )
 
     source = pd.concat(candidates, ignore_index=True, sort=False)
+    if "gain_sweep_code" not in source:
+        source["gain_sweep_code"] = np.nan
     source["analysis_group"] = (
         source["source_kind"].astype(str)
         + "__"
         + source["source_stage"].astype(str)
+        + "__gain_"
+        + source["gain_sweep_code"].fillna("none").astype(str)
         + "__fclk_"
         + source["measurement_fclk_mhz"].fillna("none").astype(str)
         + "__pattern_"
@@ -3050,6 +3542,7 @@ def analyze_saved_experiment(
 
         for stage, filename in (
             ("trim_00", "threshold_trim0.csv"),
+            ("trim_16", "threshold_trim16.csv"),
             ("trim_31", "threshold_trim31.csv"),
         ):
             table = noise_fits[noise_fits["stage"] == stage].copy()
@@ -3149,7 +3642,7 @@ def analyze_saved_experiment(
 
     summary_source = final
     if summary_source.empty and not noise_fits.empty and "stage" in noise_fits:
-        for fallback_stage in ("baseline_noise", "trim_00"):
+        for fallback_stage in ("baseline_noise", "trim_16", "trim_00"):
             summary_source = noise_fits[noise_fits["stage"] == fallback_stage].copy()
             if not summary_source.empty:
                 break
@@ -3166,7 +3659,7 @@ def analyze_saved_experiment(
     outputs["summary"] = analysis_dir / "summary.csv"
     outputs.update(save_noise_recommendations(
         analysis_dir, noise_fits, noise_statistics,
-        target_voltage=target_voltage, bad_pixel_map=bad_pixels,
+        target_voltage=selected_target, bad_pixel_map=bad_pixels,
     ))
     coverage_document = {
         "source_kind": "raw_acquisitions", "source_status": store.metadata.get("status"),

@@ -349,7 +349,11 @@ def injection_charge_metadata(
             "injection_charge_uncertainty_c": charge
             * float(capacitance_relative_uncertainty),
             "injection_charge_electrons": charge / ELEMENTARY_CHARGE_C,
-            "injection_charge_status": "nominal_c_times_delta_v",
+            "injection_charge_status": (
+                "nominal_c_times_user_equivalent_delta_v"
+                if pulse_amplitude.get("manual_equivalent_voltage_step")
+                else "nominal_c_times_delta_v"
+            ),
         }
     )
     return result
