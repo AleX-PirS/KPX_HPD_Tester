@@ -22,6 +22,7 @@ from .storage import (
     ExperimentStore,
     atomic_write_json,
     atomic_write_table,
+    atomic_write_text,
     file_sha256,
     utc_now_text,
 )
@@ -3683,6 +3684,7 @@ def analyze_saved_experiment(
     crosstalk_summary = pd.DataFrame()
     measurement_clock_pixels = pd.DataFrame()
     measurement_clock_summary = pd.DataFrame()
+    scurve_noise_statistics = noise_statistics
     if not raw_scurve.empty:
         if n_injections is not None:
             count_columns = [
@@ -3820,6 +3822,28 @@ def analyze_saved_experiment(
             analysis_dir / "measurement_clock_noise_summary.csv"
         )
 
+    from .gain_sweep import build_gain_sweep_metrics
+
+    gain_sweep_noise_fits = noise_fits
+    if gain_sweep_noise_fits.empty and not scurve_noise_statistics.empty:
+        gain_sweep_noise_fits = fit_noise_statistics(
+            scurve_noise_statistics, settings=selected_settings, calibration=calibration
+        )
+    gain_sweep_gain_results = fit_scurve_gain_results(
+        scurve_results[scurve_results["fit_status"].eq("ok")]
+    ) if not scurve_results.empty else pd.DataFrame()
+    gain_sweep_source_results = scurve_results.copy()
+    gain_sweep_source_results["window"] = store.metadata.get("window", "unknown")
+    gain_sweep_pixels, gain_sweep_summary = build_gain_sweep_metrics(
+        gain_sweep_source_results, gain_sweep_noise_fits, gain_sweep_gain_results
+    )
+    if not gain_sweep_pixels.empty:
+        for name, table in (
+            ("gain_sweep_pixel_metrics", gain_sweep_pixels),
+            ("gain_sweep_summary", gain_sweep_summary),
+        ):
+            outputs[name] = store.write_table(analysis_dir / f"{name}.csv", table)
+
     spatial_baseline_pixels, spatial_baseline_summary = analyze_spatial_baseline(
         noise_fits,
         scurve_results,
@@ -3897,6 +3921,14 @@ def analyze_saved_experiment(
             settings=selected_settings,
         )
         outputs["plots"] = plot_paths
+        if not gain_sweep_pixels.empty:
+            from .gain_sweep_plots import plot_gain_sweep
+
+            outputs["plots"].update(plot_gain_sweep(
+                gain_sweep_pixels,
+                directory=analysis_dir / "plots" / "gain_sweep",
+                settings=selected_settings,
+            ))
         outputs["plots"].update(plot_inactive_noise(inactive_noise, directory=analysis_dir / "plots", settings=selected_settings))
         from .plots import generate_recommendation_plots
 
@@ -3924,6 +3956,24 @@ def analyze_saved_experiment(
         scurve_gain_comparison=scurve_gain_comparison,
         target_voltage=selected_target,
     )
+
+    if not gain_sweep_pixels.empty:
+        gain_report = (
+            "\n## Покодовые карты амплитуды и усиления GAIN\n\n"
+            "[Метрики каждого пикселя](gain_sweep_pixel_metrics.csv) и "
+            "[сводка матрицы](gain_sweep_summary.csv) разделяют базу, амплитуду "
+            "A=V50-baseline и усиление G[мВ/кэ]=A[В]*10^6/Q[электроны]. "
+            "Усиление вычисляется также при одной ступеньке. Общая noise-база "
+            "помечается как предполагаемая независимой от GAIN; многоточечный "
+            "наклон и его свободный член сохраняются отдельно. Карты всех "
+            "измеренных кодов находятся в plots/gain_sweep.\n\n"
+            "Для индивидуального подбора кодов по уже измеренному свипу запустите "
+            "high_level/analyze_gain_sweep.py, задав GAIN_SWEEP_ANALYSIS_EXPERIMENT "
+            "и TARGET_GAIN. Результат является прогнозом, требующим проверки "
+            "повторным измерением после применения карты.\n"
+        )
+        report_path = outputs["report"]
+        atomic_write_text(report_path, report_path.read_text(encoding="utf-8") + gain_report)
 
     atomic_write_json(
         analysis_dir / "analysis_manifest.json",

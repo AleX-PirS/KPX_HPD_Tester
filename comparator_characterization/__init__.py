@@ -11,6 +11,12 @@ from .analysis import (
     analyze_saved_noise_statistics,
     analyze_spatial_baseline,
 )
+from .gain_sweep import (
+    GainEqualizationSettings,
+    analyze_gain_sweep,
+    build_gain_sweep_metrics,
+    propose_gain_equalization,
+)
 from .calibration import (
     ReferenceDacCalibration,
     ReferencePairPlan,
@@ -80,6 +86,10 @@ from .sweep import (
 )
 
 __all__ = [
+    "GainEqualizationSettings",
+    "analyze_gain_sweep",
+    "build_gain_sweep_metrics",
+    "propose_gain_equalization",
     "AnalysisSettings",
     "AllWindowCharacterizationResult",
     "AllWindowExposureChange",

@@ -23,6 +23,7 @@ python -m comparator_characterization.high_level.run_clock_noise
 python -m comparator_characterization.high_level.plot_characterization results/EXPERIMENT
 python -m comparator_characterization.high_level.run_plot_dashboard results/EXPERIMENT
 python -m comparator_characterization.high_level.analyze_all_windows results/PARENT_ALL
+python -m comparator_characterization.high_level.analyze_gain_sweep
 ```
 
 Допустим и прямой запуск файла, например:
@@ -145,6 +146,9 @@ MANUAL_REF2_CODE = 800
 MANUAL_REF_EQUIVALENT_STEP_MV = 100.0
 _UG = 4                                 # либо (4, 8, 12)
 UG_SWEEP_NOISE_REFERENCE_EXPERIMENT = None
+GAIN_SWEEP_ANALYSIS_EXPERIMENT = None     # путь к завершенному _UG-свипу
+TARGET_GAIN = [4, 10, 20]                 # эти коды должны быть измерены
+GAIN_EQUALIZATION_TARGET_STATISTIC = "median"  # либо "mean"
 NOISE_COARSE_START = 400     # пример, подберите по своему пилотному скану
 NOISE_COARSE_STOP = 900
 NOISE_COARSE_STEP = 4
@@ -168,6 +172,50 @@ PLOT_LANGUAGE = "ru"                    # или "en"
 сохраняются вместе с причиной в `inputs/reference_step_availability.csv`.
 Устаревшие common-mode параметры принимаются API только для совместимости и не
 участвуют в новом выборе.
+
+## Офлайн-анализ свипа GAIN и индивидуальные карты
+
+Укажите в `characterization_config.py`:
+
+```python
+GAIN_SWEEP_ANALYSIS_EXPERIMENT = PROJECT_ROOT / "results" / "завершенный_свип"
+TARGET_GAIN = [4, 10, 20]
+GAIN_EQUALIZATION_TARGET_STATISTIC = "median"
+```
+
+Затем запустите `python -m comparator_characterization.high_level.analyze_gain_sweep`.
+Альтернативно можно задать путь и цели в командной строке:
+
+```bash
+python -m comparator_characterization.high_level.analyze_gain_sweep results/EXPERIMENT --targets 4 10 20
+```
+
+УПО и приборы не открываются. Допустим путь к эксперименту, `analysis/vNNN` или
+родительскому ALL. Если исходные данные еще не анализировались, сначала запустите
+`plot_characterization.py`. Старый завершенный свип также подходит: новые
+метрики вычисляются из сохраненных S-curve результатов и noise reference.
+
+Для TARGET_GAIN=10 цель берется из матрицы, измеренной целиком с GAIN=10,
+а индивидуальные коды выбираются из всех пригодных измеренных GAIN. Отсутствие
+любого целевого кода проверяется во всех выбранных условиях до создания файлов.
+`--window AB` ограничивает анализ одним окном; по умолчанию обрабатываются все
+сохраненные окна независимо. Карты разных окон не смешиваются автоматически.
+
+В `gain_equalization/vNNN` создаются CSV-карты вида
+`AB/fclk_10_pattern_all/target_gain_10/gain_map.csv`, графики и `REPORT.md`.
+Файл можно передать в `GAIN_MAP_CSV` при скалярном `_UG`, задав `GAIN_MAP=None`.
+Для проверки нужен обычный S-curve тест с индивидуальной картой, не новый
+равномерный `_UG`-свип. Статусы unresolved надо проверить перед применением.
+Повторный офлайн-запуск создает новую версию, не перезаписывая предыдущую.
+
+При одной ступеньке усиление все равно вычисляется как A/Q. Настройка
+`GAIN_EQUALIZATION_ALLOW_SHARED_NOISE_BASELINE=True` разрешает общую noise-базу
+и явно отмечает предположение ее независимости от GAIN. Для отказа от такого
+переноса поставьте `False` и предоставьте GAIN-согласованные noise-данные либо
+>=3 пригодные ступеньки для регрессии каждого GAIN. Веса совместного критерия:
+`GAIN_EQUALIZATION_AMPLITUDE_WEIGHT` и `GAIN_EQUALIZATION_GAIN_WEIGHT`.
+Второй относится только к независимому многоточечному наклону; при одном Q
+амплитуда и A/Q эквивалентны и не учитываются дважды.
 
 ## Проверка REF осциллографом до теста
 

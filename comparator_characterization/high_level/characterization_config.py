@@ -336,6 +336,19 @@ NOISE_REFERENCE_EXPERIMENT: Path | None = None
 # повторно не выполняется.
 UG_SWEEP_NOISE_REFERENCE_EXPERIMENT: Path | None = None
 
+# Офлайн-анализ уже измеренного _UG-свипа: путь к эксперименту, ALL или analysis/vNNN.
+# Запуск: high_level/analyze_gain_sweep.py. УПО и приборы не открываются.
+GAIN_SWEEP_ANALYSIS_EXPERIMENT: Path | None = None
+TARGET_GAIN = [4, 10, 20]
+GAIN_EQUALIZATION_TARGET_STATISTIC = "median"  # либо "mean"
+GAIN_EQUALIZATION_AMPLITUDE_WEIGHT = 1.0
+GAIN_EQUALIZATION_GAIN_WEIGHT = 1.0
+GAIN_EQUALIZATION_MINIMUM_GAIN_FIT_R2 = 0.98
+GAIN_EQUALIZATION_INCLUDE_POOR_FITS = False
+# При одной ступени усиление = (V50 - noise baseline) / Q. Перенос общей
+# noise-базы предполагает, что база не зависит от GAIN; это отмечается в CSV.
+GAIN_EQUALIZATION_ALLOW_SHARED_NOISE_BASELINE = True
+
 # Пиксели для подробных графиков задаются физическими (column, row).
 # Пустой кортеж включает автоматический выбор типичных пикселей.
 PLOT_PIXELS: tuple[tuple[int, int], ...] = ()
