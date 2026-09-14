@@ -30,23 +30,23 @@ def main() -> None:
     parser.add_argument(
         "--port",
         type=int,
-        default=config.PLOT_DASHBOARD_PORT,
+        default=config.DASHBOARD.port,
         help="локальный TCP-порт, 0 означает выбрать свободный",
     )
     arguments = parser.parse_args()
-    source = arguments.path or config.PLOT_DASHBOARD_EXPERIMENT
+    source = arguments.path or config.PATHS.offline_source
     if source is None:
         parser.error(
-            "укажите путь аргументом или задайте PLOT_DASHBOARD_EXPERIMENT "
-            "в characterization_config.py"
+            "укажите путь аргументом или заполните OFFLINE_SOURCE в .env"
         )
+    config.validate_configuration("dashboard", source_override=Path(source))
     serve_plot_dashboard(
         source,
         port=arguments.port,
-        language=config.PLOT_LANGUAGE,
-        square_physical_pixels=config.PLOT_SQUARE_PHYSICAL_PIXELS,
+        language=config.PLOTS.language,
+        square_physical_pixels=(config.PLOTS.geometry == "pixel_square"),
         open_browser=(
-            config.PLOT_DASHBOARD_OPEN_BROWSER and not arguments.no_browser
+            config.DASHBOARD.open_browser and not arguments.no_browser
         ),
     )
 

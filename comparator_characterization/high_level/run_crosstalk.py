@@ -15,12 +15,7 @@ from comparator_characterization.high_level import characterization_config as co
 
 def main() -> None:
     config.configure_runtime_logging()
-    config.require_hardware_run_enabled()
-    if config.EO_PARAMETER_GRID or config.RESUME_SWEEP is not None:
-        raise ValueError(
-            "run_crosstalk.py использует одну noise reference и поэтому не запускает "
-            "EO-серию. Для каждой EO-комбинации сначала нужен собственный noise scan."
-        )
+    config.validate_configuration("crosstalk", require_hardware=True)
     settings = config.build_settings(
         injection_patterns=("all", "tile_2x2", "tile_4x4", "tile_8x8")
     )
@@ -32,19 +27,19 @@ def main() -> None:
         result = characterize_injection_crosstalk(
             client,
             config.threshold_calibration_files(),
-            noise_reference_experiment=config.noise_reference_path(
-                for_gain_sweep=config.gain_sweep_enabled()
-            ),
-            window=config.WINDOW,
-            pixels=config.PIXELS,
-            bad_pixel_map=config.BAD_PIXEL_MAP,
+            noise_reference_experiment=config.noise_reference_path(),
+            window=config.RUN.window,
+            pixels=config.RUN.pixels,
+            bad_pixel_map=config.PATHS.bad_pixel_mask,
             base_pixel_config=config.base_pixel_config(),
-            results_root=config.RESULTS_ROOT,
+            results_root=config.PATHS.results_dir,
             settings=settings,
-            initialization_fclk_mhz=config.ASIC_MAIN_FCLK_MHZ,
-            measurement_fclk_mhz=config.ASIC_MEASUREMENT_FCLK_MHZ,
-            eo_overrides=config.EO_OVERRIDES,
-            resume_experiment=config.RESUME_EXPERIMENT,
+            generate_analysis_plots=config.PLOTS.generate,
+            additional_metadata={"analysis_configuration_v2": config.configuration_snapshot("crosstalk")},
+            initialization_fclk_mhz=config.ACQUISITION.main_fclk_mhz,
+            measurement_fclk_mhz=config.ACQUISITION.measurement_fclk_mhz,
+            eo_overrides=config.RUN.eo_overrides,
+            resume_experiment=config.resume_experiment_path(),
             **config.reference_hardware_arguments(
                 oscilloscope, required_for_scurve=True
             ),

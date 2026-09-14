@@ -1312,6 +1312,7 @@ def analyze_all_windows(
     path: str | Path,
     *,
     settings: AnalysisSettings | None = None,
+    all_window_settings: AllWindowSettings | None = None,
     reanalyze_children: bool = False,
     generate_plots: bool = True,
 ) -> dict[str, Any]:
@@ -1322,7 +1323,7 @@ def analyze_all_windows(
     parent = ExperimentStore(path)
     if str(parent.metadata.get("window", "")).upper() != "ALL":
         raise ValueError("analyze_all_windows requires a parent WINDOW='ALL' experiment")
-    combined_settings = AllWindowSettings(
+    combined_settings = copy.deepcopy(all_window_settings) if all_window_settings is not None else AllWindowSettings(
         **parent.metadata.get("all_window_settings", {})
     )
     combined_settings.validate()
@@ -1387,6 +1388,7 @@ def analyze_all_windows(
         "created_utc": utc_now_text(),
         "analysis_framework_version": FRAMEWORK_VERSION,
         "settings": asdict(selected),
+        "all_window_settings": asdict(combined_settings),
         "reanalyzed_children": reanalyze_children,
         "generate_plots": generate_plots,
         "child_analysis_paths": {key: str(value) for key, value in analysis_paths.items()},
@@ -1677,7 +1679,7 @@ def _acquire_joint_ref_sweep(
         "availability_csv": availability_path.relative_to(parent.root).as_posix(),
         "distinct_ref_step_count": len(amplitudes),
         "repeats_per_charge": all_settings.final_ref_repeats,
-        "paired_background": True,
+        "background_mode": "paired",
         "intermediate_ref_verification": (
             "selected_from_measured_LUT; standard S-curve endpoints may have scope verification; "
             "intermediate points are not independently scope-verified"
@@ -1998,7 +2000,8 @@ def characterize_all_windows(
                 tuple(float(value) for value in kwargs["injection_voltage_steps_v"]),
             )
         parent.update_metadata(status="analysis_in_progress")
-        outputs = analyze_all_windows(parent.root, settings=settings.analysis)
+        outputs = analyze_all_windows(parent.root, settings=settings.analysis,
+                                      generate_plots=bool(kwargs.get("generate_analysis_plots", True)))
         analysis_path = Path(outputs["analysis_directory"])
         parent.update_metadata(
             status="complete", completed_utc=utc_now_text(),

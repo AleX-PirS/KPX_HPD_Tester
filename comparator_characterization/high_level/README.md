@@ -1,427 +1,234 @@
-# Верхнеуровневые запуски
+# Анализ компараторов, версия 2
 
-Все параметры пользователя собраны в `characterization_config.py`. Файлы
-`run_*.py` запускают конкретные измерения, `preview_ref_selection.py` проверяет
-выбор REF1/REF2 без стенда, `run_reference_verification.py` отдельно проверяет
-ступеньки осциллографом, `plot_characterization.py` повторно анализирует
-эксперимент, а `run_plot_dashboard.py` открывает локальную страницу графиков.
+Настройки старых версий больше не поддерживаются. Уже измеренные результаты
+по-прежнему можно анализировать и использовать как noise/trim/S-curve референсы.
+Аппаратное продолжение прерванного теста допускается только для тестов v2.
 
-Запускайте команды из корня проекта. Рекомендуемый вариант:
+## Где что задается
 
-```bash
-python -m comparator_characterization.high_level.preview_ref_selection
-python -m comparator_characterization.high_level.run_reference_verification
-python -m comparator_characterization.high_level.run_noise_scan
-python -m comparator_characterization.high_level.run_noise_equalization
-python -m comparator_characterization.high_level.run_full_trim_sweep
-python -m comparator_characterization.high_level.run_scurve
-python -m comparator_characterization.high_level.run_full_characterization
-python -m comparator_characterization.high_level.run_all_windows
-python -m comparator_characterization.high_level.run_eo_parameter_sweep
-python -m comparator_characterization.high_level.run_crosstalk
-python -m comparator_characterization.high_level.run_clock_noise
-python -m comparator_characterization.high_level.plot_characterization results/EXPERIMENT
-python -m comparator_characterization.high_level.run_plot_dashboard results/EXPERIMENT
-python -m comparator_characterization.high_level.analyze_all_windows results/PARENT_ALL
-python -m comparator_characterization.high_level.analyze_gain_sweep
+| Файл | Что редактировать |
+| --- | --- |
+| `.env` в корне проекта | Только пути: LUT, результаты, карты, референсы, источники анализа и resume |
+| `characterization_config.py` рядом с этим README | Основные блоки тестов: RUN, ACQUISITION, NOISE, SCURVE, REFERENCE, CLOCK_NOISE, GAIN_EQUALIZATION, ALL_WINDOWS, PLOTS |
+| `metadata.py` рядом с конфигом | Продвинутые параметры: fit, заряд/Cinj, trim-поиск, веса GAIN-подбора, адаптивный съем, ресурсы компьютера, протокол и scope |
+
+`config_runtime.py`, `config_schema.py`, `env_paths.py` являются реализацией,
+обычному пользователю их редактировать не нужно. Новых Python-зависимостей нет.
+
+## Запуск
+
+Из корня проекта:
+
+```shell
+python -m comparator_characterization --check-config
+python -m comparator_characterization
 ```
 
-Допустим и прямой запуск файла, например:
+Первая команда проверяет **выбранный** `RUN.test`, нужные ему пути и настройки,
+показывает активные ссылки и не открывает приборы. Вторая запускает этот тест.
+Аппаратные тесты требуют `RUN.hardware_enabled=True`; по умолчанию False.
 
-```bash
-python comparator_characterization/high_level/run_scurve.py
+Можно выбрать тест на один запуск, не меняя `RUN.test`:
+
+```shell
+python -m comparator_characterization --test scurve --check-config
+python -m comparator_characterization --test gain_equalization
+python -m comparator_characterization --test offline --no-plots
 ```
 
-Перед реальным измерением проверьте все пути и параметры, затем осознанно
-установите `ENABLE_HARDWARE_RUN = True`.
+Эквивалентный вход: `python comparator_characterization/high_level/run_test.py`.
+Отдельные `run_*.py` тоже используют новый конфиг и выполняют preflight.
+Старые плоские настройки и прежняя многофлаговая offline CLI удалены.
+`--check-config` проверяет условия запуска, но не гарантирует пригодность будущего
+fit и успешность связи с прибором. Для реальной GAIN-проверки все полученные
+карты дополнительно проверяются после офлайн-подбора, до открытия приборов.
 
-Для последовательной характеризации трех окон задайте `WINDOW = "ALL"`.
-`run_full_characterization.py` создаст один родительский каталог и три
-дочерних AB/BC/CD. Константы `ALL_WINDOW_FINAL_REF_STEP_COUNT` и
-`ALL_WINDOW_FINAL_REF_REPEATS` управляют дополнительным финальным sweep REF2
-при фиксированных и равномерно разнесенных по измеренному напряжению порогах
-D/C/B. Подробная физическая интерпретация и ограничения приведены в
-`COMPARATOR_CHARACTERIZATION.md`.
+## Какой референс нужен выбранному тесту
 
-Файл `run_all_windows.py` выполняет тот же связанный сценарий независимо от
-текущего значения `WINDOW`. Все остальные параметры, включая
-`RESUME_EXPERIMENT`, он берет из `characterization_config.py`.
+Все аппаратные тесты используют `THRESHOLD_LUT_A/B/C/D`.
+S-кривые используют `REF_LUT_1/2` только при `REFERENCE.mode="lut"`.
+При `REFERENCE.verify_with_scope=True` REF-настройки нужны и noise-тестам.
 
-Если все три окна и финальный REF sweep уже измерены, а ошибка возникла только
-на этапе общего анализа, повторять стенд не нужно:
+| `RUN.test` | Что выполняется | Окна | Дополнительная ссылка в `.env` |
+| --- | --- | --- | --- |
+| `full` | Свежий noise, trim equalization, затем S-кривые | AB/BC/CD/ALL | Не нужна; `SCURVE_NOISE_REFERENCE` игнорируется |
+| `all_windows` | Тот же полный тест, принудительно ALL | ALL | Не нужна |
+| `noise` | Пилотный noise scan без подбора trim | AB/BC/CD/ALL | Не нужна |
+| `equalize` | Noise + trim equalization 0/16/31 и уточнение | AB/BC/CD/ALL | Не нужна |
+| `trim_sweep` | Полные сканы всех 32 trim-кодов | AB/BC/CD/ALL | Не нужна |
+| `scurve` | Только S-кривые / равномерный GAIN-свип | AB/BC/CD/ALL | **SCURVE_NOISE_REFERENCE** |
+| `crosstalk` | S-кривые четырех patterns, неактивные фазы count-enabled | AB/BC/CD | **SCURVE_NOISE_REFERENCE** |
+| `clock_noise` | Ширина S-перехода и отклик по measurement FCLK | AB/BC/CD | CLOCK_TRIM_REFERENCE, необязательно, только trim-карта |
+| `gain_equalization` | Офлайн-подбор карт для target_codes, опционально реальная проверка | AB/BC/CD/ALL | **GAIN_SWEEP_SOURCE** |
+| `offline` | Повторный анализ результатов с текущим стилем | По данным | **OFFLINE_SOURCE** |
+| `dashboard` | Локальная страница пользовательских графиков | По данным | **OFFLINE_SOURCE** |
+| `ref_preview` | Расчет/показ реализуемых REF-ступенек без стенда | Не существенно | REF_LUT_1/2 только в LUT-режиме |
+| `reference_verification` | AMUX + scope проверка ступенек | AB/BC/CD | REF_LUT_1/2 только в LUT-режиме; включить verify_with_scope |
+| `eo_sweep` | Полные тесты декартова произведения EO_SWEEP.grid | AB/BC/CD | Не нужна; resume отдельно |
 
-```bash
-python -m comparator_characterization.high_level.analyze_all_windows results/PARENT_ALL
+Наличие ссылки в `.env` не меняет тип теста. У S-кривой и GAIN-свипа один
+noise-источник, больше нет общей ссылки плюс второго источника с приоритетом.
+Clock-тест не берет из него counts/шумовые границы: он переносит только trims
+из своей отдельной ссылки. GAIN-проверка переносит параметры из исходного свипа.
+
+## `.env`: правила путей
+
+Рабочий `.env` входит в архив. Если его нет, скопируйте `.env.example` в `.env`.
+Относительные пути считаются от корня проекта независимо от текущего каталога.
+Пути с пробелами можно заключать в одинарные или двойные кавычки. Обратный слеш
+не является escape-последовательностью, `r"..."` писать не нужно.
+
+```dotenv
+RESULTS_DIR=results
+SCURVE_NOISE_REFERENCE="C:\Users\Administrator\Desktop\MO testing\results\noise_eq"
+CLOCK_TRIM_REFERENCE="C:\tests\results\noise_eq"
+GAIN_SWEEP_SOURCE="C:\tests\results\ALL_gain_sweep"
+OFFLINE_SOURCE="C:\tests\results\ALL_gain_sweep"
 ```
 
-Команда создаст новый `analysis/vNNN` из сохраненных данных. Альтернативно
-можно указать родительский `PARENT_ALL` в `RESUME_EXPERIMENT` и снова запустить
-`run_all_windows.py`: завершенные окна и REF sweep будут пропущены, но этот
-вариант все равно открывает соединения с приборами.
+Пустое значение отключает необязательную ссылку:
 
-Для продолжения незавершенной S-кривой, созданной версией до `0.17.0`, сначала
-сохраните прежнюю схему съема:
+```dotenv
+CLOCK_TRIM_REFERENCE=
+# SCURVE_NOISE_REFERENCE="C:\tests\results\previous_reference"
+```
+
+Архивные ссылки храните комментариями. Два активных одинаковых ключа, неизвестный
+ключ или неправильные кавычки приводят к понятной ошибке с номером строки.
+Переменные окружения ОС не переопределяют `.env`. Подстановки `$VAR`, `%VAR%`
+и escape-преобразования не выполняются; указывайте сами пути.
+Встроенные пути не служат запасными источниками при пустом ключе.
+
+`BASE_PIXEL_CONFIG` и `BAD_PIXEL_MASK` необязательны. При отсутствии base config
+используется встроенная стандартная PX-конфигурация с trims=16.
+`GAIN_MAP_CSV` применяется только при `SCURVE.gain_source="csv"`. Оставшаяся
+ссылка на эту карту не мешает равномерному GAIN или свипу при gain_source="uniform".
+
+## Примеры основных сценариев
+
+В примерах изменяются поля уже созданных блоков в `characterization_config.py`.
+
+### Полный тест всех окон
 
 ```python
-SCURVE_BACKGROUND_MODE = "paired"
-SCURVE_ADAPTIVE_REPEATS = False
-# Только если использовался tile-режим:
-SCURVE_TILE_MODE = "tile_crosstalk"
+RUN.test = "full"
+RUN.window = "ALL"
+RUN.hardware_enabled = True
+RUN.resume = False
+SCURVE.gain_source = "uniform"
+SCURVE.gain = 10
+REFERENCE.mode = "lut"
 ```
 
-Старый tile-код оставлял неактивные пиксели в состоянии `MASK=1, TST_EN=0`.
-Для старого режима `all` tile-настройка не влияет на матрицу. Если параметры не
-совпадают, проверка resume завершится до инициализации тестовой матрицы и
-первого `GET_SHOT`, но после открытия соединений верхнеуровневым файлом, и
-покажет точные требуемые значения. Новые недостающие поля metadata
-интерпретируются явно и фиксируются в `resume_metadata_migrations`.
+В `.env` нужны LUT пороговых ЦАП, REF LUT и RESULTS_DIR. Старый noise-референс
+не используется. Noise и S-кривые используют времена из ACQUISITION. Если они
+одинаковы, Enter между этапами не ожидается. Установите эти времена в GUI УПО:
+Python не имеет readback реального shutter и не выставляет его автоматически.
 
-Визуализация карт по умолчанию сохраняет квадратную область изображения.
-`PLOT_SQUARE_PHYSICAL_PIXELS=True` показывает физически квадратные ячейки и
-прямоугольную половину 16x32. Для offline-запуска используйте
-`--square-pixels`.
+`ALL_WINDOWS.final_q_sweep` включает дополнительный совместный Q-sweep.
+При manual REF и GAIN-свипе он недоступен и явно отмечается как отключенный.
 
-`run_noise_scan.py` подходит для короткого пилота с ограниченной областью DAC:
-он не измеряет trim 0/31 и не проводит эквализацию, а сохраняет baseline noise
-при исходных trim (16 по умолчанию). Для подстроек нужны endpoint/full trim
-данные из `run_noise_equalization.py` или `run_full_trim_sweep.py`.
-
-Каждый аппаратный запуск автоматически устанавливает основной FCLK, global
-`EO_cfg.DEFAULT_REGISTERS` и PX-конфигурацию всей физической матрицы.
-В другой половине, Col 0..15, Row 0..31, все 512 слов равны `0x00000000`.
-Для вашей половины Col 16..31 сохраняется стандартная логика теста.
-Нулевая половина также заново загружается при reconnect и не участвует в
-измерениях. `PX_MASK=0` отключает цифровой счет, поэтому скрипт включает
-`PX_MASK=1` только для выбранных тестом пикселей, кроме `BAD_PIXEL_MAP`.
-Исключенные пиксели всегда имеют `MASK=0, TST_EN=0`, включая reconnect и cleanup.
-PX сначала полностью ставятся в виртуальную память УПО, затем скрипт явно
-вызывает `SET_PIXEL_CFG WRITE_TO_CHIP` и требует подтверждение до съемки.
-Команда применяется только к 32-битным конфигурациям пикселей и не вызывается
-для global DAC, EO-регистров, REF1/REF2 или FCLK. Непосредственно перед `GET_SHOT`
-выставляется измерительный FCLK. Сам `GET_SHOT` выполняется в основном потоке и
-полностью завершается, затем восстанавливается основной FCLK, и только после
-этого разрешен первый `GET_PIXEL`. В основном
-режиме CTRL также управляется последовательно через тот же канал УПО:
-`measurement FCLK -> PWM -> GET_SHOT -> CTRL=0 -> main FCLK -> GET_PIXEL`.
-Для background вместо PWM явно устанавливается `CTRL=0`. Во время теста не нажимайте команды в
-отдельном GUI УПО, поскольку межпроцессную конкуренцию Python заблокировать не может.
-
-Для AB свипируется B, A устанавливается на верхнюю границу по LUT,
-C и D получают код 1023. Аналогично для BC компараторы вне окна A/D получают
-1023, для CD это A/B. Фиксированные пороги также восстанавливаются при reconnect.
-
-Основные новые настройки в `characterization_config.py`:
+### S-кривые с перебором усилений, по уже пройденному noise
 
 ```python
-CTRL_INJECTION_SOURCE = "upo_pwm"
-ASIC_MAIN_FCLK_MHZ = 50
-ASIC_MEASUREMENT_FCLK_MHZ = 5
-UPO_CTRL_FREQUENCY_KHZ = 100
-UPO_CTRL_HIGH_TIME_NS = 5000
-SCURVE_SHUTTER_DURATION_S = 0.010
-SCURVE_BACKGROUND_MODE = "sparse"       # или "paired"
-SCURVE_SPARSE_BACKGROUND_INTERVAL_CODES = 8
-SCURVE_REPEATS = 4
-SCURVE_ADAPTIVE_REPEATS = True
-SCURVE_TILE_MODE = "tile_measurement"   # или "tile_crosstalk"
-SCURVE_SCAN_DESCENDING = True
-SCURVE_COARSE_HIGH_CODE = 1023
-SCURVE_COARSE_LOW_CODE = 0
-SCURVE_COARSE_STEP = 8
-SCURVE_FINE_STEP = 1
-SCURVE_FINE_MARGIN_CODES = 8
-
-SCURVE_BASELINE_NOISE_STOP_ENABLED = True
-SCURVE_BASELINE_NOISE_COUNT_MULTIPLIER = 1.0
-SCURVE_BASELINE_NOISE_PIXEL_FRACTION = 0.10
-SCURVE_COARSE_BASELINE_NOISE_CONSECUTIVE_CODES = 1
-SCURVE_BASELINE_NOISE_CONSECUTIVE_CODES = 2
-
-MINIMUM_REFERENCE_CODE = 401
-MAXIMUM_REFERENCE_CODE = 900
-MAXIMUM_REFERENCE_STEP_ERROR_V = 1e-3
-REFERENCE_MODE = "lut"                  # либо "manual"
-MANUAL_REF1_CODE = 600
-MANUAL_REF2_CODE = 800
-MANUAL_REF_EQUIVALENT_STEP_MV = 100.0
-_UG = 4                                 # либо (4, 8, 12)
-UG_SWEEP_NOISE_REFERENCE_EXPERIMENT = None
-GAIN_SWEEP_ANALYSIS_EXPERIMENT = None     # путь к завершенному _UG-свипу
-TARGET_GAIN = [4, 10, 20]                 # эти коды должны быть измерены
-GAIN_EQUALIZATION_TARGET_STATISTIC = "median"  # либо "mean"
-NOISE_COARSE_START = 400     # пример, подберите по своему пилотному скану
-NOISE_COARSE_STOP = 900
-NOISE_COARSE_STEP = 4
-NOISE_REPEATS = 4
-NOISE_EMPTY_MATRIX_REPEATS_TO_SKIP_REMAINING = 2
-BAD_PIXEL_MAP = [(16, 0), (20, 5)]  # либо путь CSV/JSON, либо None
-
-CLOCK_NOISE_MEASUREMENT_FCLK_MHZ = (1, 5, 10, 25, 50)
-CLOCK_NOISE_INJECTION_STEP_MV = 10.0
-CLOCK_NOISE_INJECTION_PATTERN = "all"
-CLOCK_NOISE_TRIM_REFERENCE_EXPERIMENT = None
-PLOT_LANGUAGE = "ru"                    # или "en"
+RUN.test = "scurve"
+RUN.window = "ALL"
+RUN.hardware_enabled = True
+SCURVE.gain_source = "uniform"
+SCURVE.gain = (4, 8, 10, 12, 20)
 ```
 
-Для полного набора амплитуд REF-пары выбираются совместно. Алгоритм находит один
-самый низкий по измеренному напряжению уровень REF1, на котором достижимо
-максимальное подмножество требуемых ступенек с заданной ошибкой. Этот REF1
-остается одинаковым во всех точках, меняется только REF2. Для каждой пары проверяется
-`V_REF1 > V_REF2`; сравнение выполняется по напряжению LUT, а не по коду.
-Недостижимые ступеньки печатаются до обращения к стенду, исключаются из съема и
-сохраняются вместе с причиной в `inputs/reference_step_availability.csv`.
-Устаревшие common-mode параметры принимаются API только для совместимости и не
-участвуют в новом выборе.
+В `.env` заполните SCURVE_NOISE_REFERENCE. Для ALL укажите родительский noise
+эксперимент со всеми тремя окнами. Свежий noise/trim тест здесь не выполняется.
+Коды сохраняются отдельно в gain_XX. Референс передает финальные comparator trims
+и шумовые границы, но старый background не подставляется вместо новых counts.
 
-## Офлайн-анализ свипа GAIN и индивидуальные карты
-
-Укажите в `characterization_config.py`:
+### Офлайн GAIN-подбор и его аппаратная проверка
 
 ```python
-GAIN_SWEEP_ANALYSIS_EXPERIMENT = PROJECT_ROOT / "results" / "завершенный_свип"
-TARGET_GAIN = [4, 10, 20]
-GAIN_EQUALIZATION_TARGET_STATISTIC = "median"
+RUN.test = "gain_equalization"
+RUN.window = "ALL"
+GAIN_EQUALIZATION.target_codes = [4, 10, 20]
+GAIN_EQUALIZATION.check_map = False
 ```
 
-Затем запустите `python -m comparator_characterization.high_level.analyze_gain_sweep`.
-Альтернативно можно задать путь и цели в командной строке:
-
-```bash
-python -m comparator_characterization.high_level.analyze_gain_sweep results/EXPERIMENT --targets 4 10 20
-```
-
-УПО и приборы не открываются. Допустим путь к эксперименту, `analysis/vNNN` или
-родительскому ALL. Если исходные данные еще не анализировались, сначала запустите
-`plot_characterization.py`. Старый завершенный свип также подходит: новые
-метрики вычисляются из сохраненных S-curve результатов и noise reference.
-
-Для TARGET_GAIN=10 цель берется из матрицы, измеренной целиком с GAIN=10,
-а индивидуальные коды выбираются из всех пригодных измеренных GAIN. Отсутствие
-любого целевого кода проверяется во всех выбранных условиях до создания файлов.
-`--window AB` ограничивает анализ одним окном; по умолчанию обрабатываются все
-сохраненные окна независимо. Карты разных окон не смешиваются автоматически.
-
-В `gain_equalization/vNNN` создаются CSV-карты вида
-`AB/fclk_10_pattern_all/target_gain_10/gain_map.csv`, графики и `REPORT.md`.
-Файл можно передать в `GAIN_MAP_CSV` при скалярном `_UG`, задав `GAIN_MAP=None`.
-Для проверки нужен обычный S-curve тест с индивидуальной картой, не новый
-равномерный `_UG`-свип. Статусы unresolved надо проверить перед применением.
-Повторный офлайн-запуск создает новую версию, не перезаписывая предыдущую.
-
-При одной ступеньке усиление все равно вычисляется как A/Q. Настройка
-`GAIN_EQUALIZATION_ALLOW_SHARED_NOISE_BASELINE=True` разрешает общую noise-базу
-и явно отмечает предположение ее независимости от GAIN. Для отказа от такого
-переноса поставьте `False` и предоставьте GAIN-согласованные noise-данные либо
->=3 пригодные ступеньки для регрессии каждого GAIN. Веса совместного критерия:
-`GAIN_EQUALIZATION_AMPLITUDE_WEIGHT` и `GAIN_EQUALIZATION_GAIN_WEIGHT`.
-Второй относится только к независимому многоточечному наклону; при одном Q
-амплитуда и A/Q эквивалентны и не учитываются дважды.
-
-## Реальная проверка полученной GAIN-карты
-
-Тот же `analyze_gain_sweep.py` после офлайн-подбора может продолжить тест:
+Заполните GAIN_SWEEP_SOURCE. Равномерные целевые коды должны реально
+присутствовать в исходном свипе. Веса и target statistic задаются в metadata.py:
 
 ```python
-CHECK_EQ_GAIN_MAP = True
-ENABLE_HARDWARE_RUN = True
-CHECK_EQ_GAIN_MAP_ALL_WINDOWS = False
-CHECK_EQ_GAIN_MAP_REFERENCE_WINDOW = None
-CHECK_EQ_GAIN_MAP_ALLOW_UNRESOLVED = False
-CHECK_EQ_GAIN_MAP_BACKGROUND_MODE = "paired"  # либо sparse
+GAIN_EQUALIZATION.target_statistic = "median"
+GAIN_EQUALIZATION.amplitude_weight = 1.0
+GAIN_EQUALIZATION.gain_weight = 1.0
 ```
 
-При False никакие приборы не открываются. При True после анализа для каждой
-карты и TARGET_GAIN реальные PX_GAIN задаются индивидуально, заново снимается
-noise scan, затем S-кривые. Для проверки не используются `_UG`, `GAIN_MAP_CSV`
-или EO-grid текущего конфига: карта берется из полученного анализа, EO и trims
-из исходного свипа. Аппаратная конфигурация проходит существующий WRITE_TO_CHIP.
+Этот последний фрагмент относится к `metadata.py`, не к основному конфигу.
+При одной ступеньке усиление вычисляется как A/Q. При переносе общей базы
+между GAIN это предположение явно отмечается в CSV.
 
-Верхнеуровневый запуск проверяет совпадение источника CTRL, main FCLK и PWM
-settings с исходным тестом. REF-пары повторяются точно, без нового LUT-подбора.
-Threshold LUT текущего конфига должны совпасть с сохраненными. Cinj, число
-импульсов для finite burst и экспозиция берутся из исходных settings. Для всех
-заданий нужна одна общая экспозиция. Noise и S-curve проверки используют ее
-одинаково, поэтому смены времени между ними и Enter нет. Установите указанное
-в логе shutter exposure в GUI УПО до запуска: Python не имеет его readback.
-Если текущий `SCURVE_SHUTTER_DURATION_S` отличается от source, аппаратный запуск
-отклоняется до открытия приборов. Укажите исходное время и в конфиге, и в GUI.
-Повторы, scan limits и графические настройки берутся из текущего конфига.
-По умолчанию проверка paired, даже если исходный свип был sparse.
-
-Предварительные проверки всех карт идут до открытия приборов. Если source
-изменился, нет корректных trim/REF/экспозиции либо есть unresolved без явного
-разрешения, аппаратный этап не запускается. Source sweep и прогноз не меняются.
-
-### Одна общая карта во всех AB/BC/CD
+Чтобы после офлайн-анализа реально применить полученные карты:
 
 ```python
-GAIN_SWEEP_ANALYSIS_EXPERIMENT = PROJECT_ROOT / "results" / "ALL_свип"
-TARGET_GAIN = [4, 10, 20]
-CHECK_EQ_GAIN_MAP = True
-CHECK_EQ_GAIN_MAP_ALL_WINDOWS = True
-CHECK_EQ_GAIN_MAP_REFERENCE_WINDOW = "AB"  # явный пример выбора, можно BC/CD
+RUN.hardware_enabled = True
+GAIN_EQUALIZATION.check_map = True
+GAIN_EQUALIZATION.check_all_windows = True
+GAIN_EQUALIZATION.map_reference_window = "AB"  # явный выбор общей карты
 ```
 
-Опорное окно выбирает только источник общей GAIN-карты, а не единственное окно
-измерения. Для каждого target эта карта проверяется последовательно во всех
-AB/BC/CD, при одних GAIN и совмещенных source trim-картах B/C/D. Исходные
-свипы всех трех окон должны присутствовать, иметь одинаковый состав пикселей,
-совместимые non-trim pixel settings и одинаковые FCLK/режимы/целевые коды.
-EO-параметры, main FCLK и tile mode также должны совпадать. Несовпадающие
-наборы REF-step или Cinj отклоняются при предварительной проверке, так что
-совместные метрики сравнивают одинаковые Q.
-Разные REF-пары при одной и той же ступени фиксируются в child metadata.
+В реальной проверке используются source trims, EO, REF-пары, Cinj и экспозиция,
+а не текущие GAIN/base-карты и новые REF-ступеньки. ACQUISITION.scurve_shutter_s
+и CTRL/PWM timing должны соответствовать исходному свипу. При несоответствии
+запуск отклоняется до открытия приборов. Noise повторяется с уже примененной
+индивидуальной GAIN-картой, после него снимаются S-кривые. Между ними Enter нет.
+Произвольного автоматического trim-уравнивания трех окон нет.
 
-### Выходные файлы
+Результаты находятся рядом с source-анализом в
+`gain_equalization/vNNN/hardware_verification/vMMM`, а не в новом RESULTS_DIR.
+Есть measured_gain_map.csv, реальные pixel metrics, сравнение до/прогноз/измерение,
+сводки разброса и совместные AB/BC/CD графики. Неудачные отклики остаются NaN
+с причиной, не становятся нулями. При сбое завершенные raw/CSV сохраняются.
 
-В `gain_equalization/vNNN/hardware_verification/vMMM`:
-
-- `gain_verification_pixel_metrics.csv`: реальный A/Q, амплитуда, база и sigma.
-- `gain_verification_comparison.csv`: до, прогноз и реальный отклик по пикселям.
-- `gain_verification_summary.csv`: одинаковые пиксели, СКО/RMS/q95 и ошибка прогноза.
-- `gain_verification_joint_window_metrics.csv`: только в общем ALL-режиме,
-  общие и дифференциальные признаки, взаимные соотношения AB/BC/CD.
-- Для каждого окна/FCLK/режима/target: raw experiment, CSV, plots и
-  `measured_gain_map.csv` со статусом пригодности измеренного отклика.
-- `gain_verification_manifest.json` и `REPORT.md`: история проходов и ссылки.
-
-Новые графики подписаны как реальное измерение. Все источники сравниваются в
-общем масштабе и на одинаковых пикселях; missing/invalid не становятся нулями.
-При сбое completed raw/CSV предыдущих окон остаются. Автоматического resume
-всей новой verification-серии пока нет; новый запуск создает новую версию.
-`--no-plots` отключает также графики дочерних проверочных экспериментов.
-
-Автоматическое изменение trims в этой версии не выполняется. Предложение
-финальной процедуры с локальной коррекцией находится в
-`COMPARATOR_CHARACTERIZATION.md`; сначала надо выбрать межоконные цели.
-
-## Проверка REF осциллографом до теста
-
-По умолчанию `VERIFY_REFERENCE_STEPS_BEFORE_TEST = True`, поэтому каждый
-аппаратный запуск, включая noise-only и resume, после стандартной инициализации
-ASIC, но до настройки окна и первого `GET_SHOT`, выполняет одинаковую проверку:
-
-1. `TST_SIG` выводится на AMUX, REF1/REF2 программируются из выбранной таблицы.
-2. Осциллограф: CH1 = TST_SIG, CH4 = CTRL, оба входа DC 1 МОм.
-3. Trigger: CH4, отрицательный фронт, 0.5 В; развертка 500 нс/дел.
-4. Для каждой ступеньки снимается raw-кадр при `FCLK=0`, затем при рабочей FCLK.
-5. Ступенька CH1 считается по медианам плато до и после фронта CH4.
-6. Проверяется ошибка относительно LUT, по умолчанию не более 1 мВ.
-7. Восстанавливаются `TEST_MUX`, REF1, REF2, CTRL=0 и рабочая FCLK.
-
-Raw CH1/CH4 сохраняются в
-`reference_verification/run_TIMESTAMP/waveforms/*.csv`; рядом находятся
-`capture_metrics.csv`, `clk_comparison.csv`, JSON результата и сводный PNG.
-В `clk_comparison.csv` отдельно записано изменение ступеньки и шума плато при
-включении CLK. При ошибке данные сохраняются, затем тест безопасно прерывается.
-Вертикальные масштабы, окна плато, число повторных попыток и допуск находятся в
-`characterization_config.py`. Если нужно только проверить ступеньки, запустите
-`run_reference_verification.py`.
-
-Серия по параметрам EO_CFG задается декартовым произведением:
+### Clock noise с сохраненными trims
 
 ```python
-EO_PARAMETER_GRID = {
-    "DAC_CMP_BIAS_LSB": [200, 500],
-    "DAC_CMP_VB5": [500, 1000],
-}
-EO_OVERRIDES = None
-RESUME_SWEEP = None
+RUN.test = "clock_noise"
+RUN.window = "AB"
+RUN.hardware_enabled = True
+CLOCK_NOISE.fclk_mhz = (5, 10, 25, 50, 100)
 ```
 
-Это четыре последовательных независимых эксперимента в папках
-`DAC_CMP_BIAS_LSB=.../DAC_CMP_VB5=...`, у каждого свои raw, графики и
-рекомендации. После сбоя укажите корневую папку серии в `RESUME_SWEEP`, не меняя
-grid и остальные входы. Завершенные комбинации будут проверены и пропущены,
-незавершенная продолжится с сохраненных acquisition. Для одного набора вместо
-grid используйте `EO_OVERRIDES`. Пороговые ЦАП и REF, которыми владеет внутренний
-scan, а также OMR/ICR/DCR через этот интерфейс свипировать нельзя.
+В `.env` необязательно заполните CLOCK_TRIM_REFERENCE. Если ссылка пуста,
+используются стандартные trims. Измеряется собственный S-отклик при каждом FCLK,
+старые шумовые counts не переносятся. В manual REF используется manual_step_mv;
+CLOCK_NOISE.step_mv относится только к LUT-режиму.
 
-При `upo_pwm` число импульсов отдельно не задается. Анализ вычисляет
-`N_nom=round(F_real*T_shutter)`: при 100 kHz и 0.010 s это 1000 отрицательных
-фронтов с неопределенностью границы +/-1. `N_INJECTIONS` в этом режиме
-игнорируется. Экспозицию 0.010 s нужно один раз указать в конфиге и вручную
-установить в GUI УПО как `10000 мкс`. PWM включается только для signal-shot.
-Background всегда выполняется при `CTRL=0`. После `GET_SHOT` PWM выключается до первого
-`GET_PIXEL`. В начале нового или возобновленного теста CTRL также принудительно
-переводится в 0 до конфигурации ASIC.
-
-Пороговый ЦАП S-curve по умолчанию сканируется от кода 1023 к коду 0. Цель
-такого направления: измерить полезную положительную инжекцию на отрицательном
-фронте CTRL и не продолжать проход далеко ниже шумовой базовой линии к отклику
-противоположной полярности от положительного фронта.
-
-В режиме `paired` каждый signal имеет собственный background. В стандартном
-`sparse` снимаются контрольные background: в начале, периодически, при первом
-отклике, около перехода и во всей шумовой области. Пропущенные B остаются NaN;
-для fit используется сигнал без вычитания фона. Пригодность проверяется по
-максимуму двух окружающих контрольных точек текущего запуска.
-
-Адаптивный проход идет от большого DAC к меньшему. В пустой области используется
-крупный шаг. При первом ненулевом отклике пропущенные коды заполняются с шагом 1.
-Переход V50 и шумовой колокол измеряются с шагом 1. Крупный шаг на чистом плато
-разрешается после его подтверждения. Для ступенек меньше 25 мВ шаг 1 сохраняется
-от первого отклика до шума. Пустые точки и плато измеряются одним повтором;
-переход 10-90% получает полное SCURVE_REPEATS. Невалидный отсчет не считается нулем.
-
-После обнаружения шума проход продолжается через максимум и спад к уровню N;
-защищенная область из noise scan проходится полностью. Raw-count графики
-сохраняют колокол и его левое плечо до N. Нормированные графики и fit используют
-пригодную физическую ветвь. Решения записываются в online/scurve_sampling_*.csv.
-В tile_crosstalk выполняются полные пары и повторы для статистики S-B неактивных
-пикселей, включая отрицательные изменения: inactive_noise_statistics.csv.
-
-Офлайн можно передать и каталог только с `noise_statistics.csv`. Будет создан
-`reanalysis/vNNN`; такой пересчет явно помечается как анализ без исходных raw.
-Дополнительная маска: `--bad-pixels configs/bad_pixels.json`. Полная инструкция
-на русском находится в `COMPARATOR_CHARACTERIZATION.md` в корне проекта.
-
-`run_clock_noise.py` после применения trim-карты выполняет новый noise scan,
-затем S-curve тест одной
-REF-ступеньки при массиве измерительных FCLK. Старый noise reference не нужен.
-Если задан `CLOCK_NOISE_TRIM_REFERENCE_EXPERIMENT`, из него копируется только
-финальная trim-карта нужного окна. Старые counts, границы и шумовая статистика
-не используются. Для tile-режима
-скрипт проходит все фазы подматрицы, поэтому каждый выбранный пиксель реально
-инжектируется. Итоги находятся в `measurement_clock_noise_*.csv`, графиках и
-`REPORT.md`.
-
-Краткий статус и проценты видны в консоли и сохраняются в
-`results/EXPERIMENT/experiment.log`. Noise scan всегда посещает весь заданный
-список DAC-кодов. После настроенного числа валидных нулевых снимков он пропускает
-лишь оставшиеся повторы текущего кода. Параметры оптимизации и переподключения
-УПО находятся в `characterization_config.py`.
-
-## Метрики и новые настройки
-
-Полный справочник формул, единиц, q90/q95, fit, FCLK, наводок и PCA:
-[METRICS.md](../METRICS.md).
-
-Настройки в characterization_config.py:
+### Ручные REF без LUT
 
 ```python
-SCURVE_BACKGROUND_MODE = "sparse"  # Или "paired".
-SCURVE_SPARSE_BACKGROUND_INTERVAL_CODES = 16
-SCURVE_REPEATS = 1
-SCURVE_ADAPTIVE_REPEATS = True
-SCURVE_WEAK_SIGNAL_STEP_THRESHOLD_V = 0.025
-SCURVE_TILE_MODE = "tile_measurement"  # Или "tile_crosstalk".
-PLOT_SQUARE_PHYSICAL_PIXELS = False
-PLOT_LANGUAGE = "ru"  # Или "en".
-CLOCK_NOISE_TRIM_REFERENCE_EXPERIMENT = None  # Каталог эквализации окна или ALL.
+REFERENCE.mode = "manual"
+REFERENCE.manual_ref1 = 600
+REFERENCE.manual_ref2 = 800
+REFERENCE.manual_step_mv = 100.0
 ```
 
-Сохранены экспозиции исходного архива: NOISE_SHUTTER_DURATION_S=0.001 и
-SCURVE_SHUTTER_DURATION_S=0.010 с. При равных значениях переходы между шумом,
-S-кривыми и окнами ALL не требуют Enter. Экспозицию УПО задайте перед стартом.
+Ровно одна ступенька, заряд считается по пользовательскому эквиваленту и Cinj.
+Это не измеренная LUT-ступенька и не доказательство физического порядка уровней.
 
-Графики одного физического пикселя для AB/CMP_B, BC/CMP_C, CD/CMP_D сохраняются
-в analysis/vNNN/plots/pixels: три панели подстройки, шума и сигнального счета;
-зависимости V50 от заряда накладываются. Выбор: PLOT_PIXELS или автоматическая
-выборка. Язык и геометрия локальной страницы берутся из указанных настроек.
+### Продолжение прерванного теста
 
-Для восстановления графиков уже измеренного ALL без новых снимков:
+В `.env` задайте RESUME_EXPERIMENT для одиночного/ALL теста либо EO_SWEEP_RESUME
+для eo_sweep. Затем установите RUN.resume=True. Не изменяйте физические параметры.
+Noise-reference и resume являются разными ролями, никакого взаимного fallback нет.
+При RUN.resume=False эти ссылки не используются, даже если заполнены.
+Resume старых версий отвергается; их завершенные результаты остаются доступны.
 
-```bash
-python -m comparator_characterization.high_level.analyze_all_windows "results/EXPERIMENT_ALL" --language ru
-```
+## Метаданные и сохранность
+
+Все raw повторы и непригодные точки сохраняются прежним измерительным workflow.
+Hardware metadata дополнены analysis_configuration_v2, офлайн результаты
+configuration_v2.json: выбранный тест, блоки настроек, advanced metadata,
+разрешенные пути и SHA256 исходного `.env`. Старые результаты не перезаписываются.
+В аппаратной GAIN-проверке дополнительно сохранены фактически повторенные
+source-настройки; configuration_v2 содержит пользовательские входные настройки.
+
+Полная методика: [COMPARATOR_CHARACTERIZATION.md](../../COMPARATOR_CHARACTERIZATION.md).
+Формулы и значения метрик: [METRICS.md](../METRICS.md).

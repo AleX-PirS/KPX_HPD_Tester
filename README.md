@@ -243,9 +243,29 @@ DCR and ICR are deliberately not changed by this Python pre-configuration.
 
 Простые запускаемые файлы для noise scan, эквализации, полного trim-sweep,
 S-кривых, сравнения режимов инжекции и повторного построения графиков находятся
-в `comparator_characterization/high_level/`. Все пользовательские пути и
-параметры собраны в
-`comparator_characterization/high_level/characterization_config.py`.
+в `comparator_characterization/high_level/`. Конфигурация анализа версии 2
+разделена на три файла:
+
+- `.env` в корне проекта: пути к LUT, маскам, референсам и результатам.
+- `comparator_characterization/high_level/characterization_config.py`: выбор
+  теста и основные параметры в именованных блоках.
+- `comparator_characterization/high_level/metadata.py`: тонкие параметры
+  алгоритмов, статистики, fit и эквализации GAIN.
+
+Старые настройки и CLI анализа удалены. Не переносите старый конфиг целиком.
+Готовые измерения остаются доступными для офлайн-анализа и как референсы;
+аппаратное resume поддерживается только для экспериментов версии 2.
+
+Начните с [краткой инструкции запуска v2](comparator_characterization/high_level/README.md).
+Единая точка входа, без выбора отдельного скрипта:
+
+```bash
+python comparator_characterization/high_level/run_test.py --check-config
+python comparator_characterization/high_level/run_test.py
+```
+
+Первая команда проверяет только нужные для выбранного теста ссылки, не открывая
+приборы. Реальный запуск требует явного `RUN.hardware_enabled=True`.
 
 Полное русскоязычное руководство находится в
 `COMPARATOR_CHARACTERIZATION.md`. Начните с команды
@@ -302,7 +322,7 @@ this icon instead of the generic Python process icon.
 
 Высокоуровневый пакет поддерживает AB/CMP_B, BC/CMP_C и CD/CMP_D, сохраняет
 отдельный raw CSV для каждого acquisition, допускает resume и изменяет только
-выбранное 5-битное trim-поле. Реализованы paired-background S-кривые,
+выбранное 5-битное trim-поле. Реализованы sparse и paired-background S-кривые,
 основной CTRL PWM через УПО, резервный burst Keysight 81150A/81160A и сравнение `all`, `tile_2x2`,
 `tile_4x4`, `tile_8x8`. Все таблицы и рисунки повторно строятся без стенда.
 

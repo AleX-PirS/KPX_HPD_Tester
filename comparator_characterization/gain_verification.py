@@ -228,7 +228,7 @@ def prepare_gain_verification(
             if requested_exposure is not None and not math.isclose(
                 float(requested_exposure), float(exposure), rel_tol=1e-9, abs_tol=1e-12
             ):
-                raise ValueError("SCURVE_SHUTTER_DURATION_S must match the source exposure; configure UPO likewise")
+                raise ValueError("ACQUISITION.scurve_shutter_s must match the source exposure; configure UPO likewise")
             prepared.scurve.tile_mode = stored_scurve.get("tile_mode", prepared.scurve.tile_mode)
             prepared.scurve.pulse_amplitudes = ()
             prepared.scurve.injection_patterns = (str(context[2]),)
@@ -403,7 +403,7 @@ def joint_window_diagnostics(comparison: pd.DataFrame) -> pd.DataFrame:
 def verify_gain_equalization(
     client: Any, threshold_calibration_files: Mapping, *,
     prepared: tuple[Path, list[GainVerificationJob]], hardware_arguments: Mapping | None = None,
-    generate_plots: bool = True,
+    generate_plots: bool = True, configuration_metadata: Mapping | None = None,
 ) -> dict:
     """Programs real pixel maps through the existing characterization workflow."""
     source, jobs = prepared
@@ -434,6 +434,8 @@ def verify_gain_equalization(
     directory = parent / f"v{version:03d}"
     manifest = {"framework_version": FRAMEWORK_VERSION, "created_utc": utc_now_text(),
                 "source_gain_analysis": str(source), "status": "in_progress", "runs": {}}
+    if configuration_metadata is not None:
+        manifest["analysis_configuration_v2"] = dict(configuration_metadata)
     atomic_write_json(directory / "gain_verification_manifest.json", manifest)
     outputs = {"verification_directory": directory, "runs": {}, "plots": {}}
     comparisons, actual_tables = [], []
@@ -455,7 +457,8 @@ def verify_gain_equalization(
                 replay_reference_selections=job.reference_pairs,
                 initialization_fclk_mhz=main_clock, measurement_fclk_mhz=job.clock,
                 upper_non_limiting_code=upper, eo_overrides=job.metadata.get("eo_overrides"),
-                additional_metadata={"gain_equalization_verification": {
+                additional_metadata={**({"analysis_configuration_v2": dict(configuration_metadata)} if configuration_metadata is not None else {}),
+                    "gain_equalization_verification": {
                     "source_analysis": str(source), "target_gain_code": job.target,
                     "gain_map_source_window": job.map_window, "proposed_gain_map_sha256": file_sha256(map_path),
                     "configuration_mode": "mixed_gain_map", "fresh_noise_baseline": True,

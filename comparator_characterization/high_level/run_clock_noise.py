@@ -14,14 +14,9 @@ from comparator_characterization.high_level import characterization_config as co
 
 def main() -> None:
     config.configure_runtime_logging()
-    config.require_hardware_run_enabled()
-    if config.EO_PARAMETER_GRID or config.RESUME_SWEEP is not None:
-        raise ValueError(
-            "run_clock_noise.py выполняет один быстрый FCLK-sweep; "
-            "EO_PARAMETER_GRID и RESUME_SWEEP должны быть None"
-        )
+    config.validate_configuration("clock_noise", require_hardware=True)
     settings = config.build_settings(
-        injection_patterns=(config.CLOCK_NOISE_INJECTION_PATTERN,)
+        injection_patterns=(config.CLOCK_NOISE.pattern,)
     )
     with (
         config.build_generator() as generator,
@@ -32,26 +27,28 @@ def main() -> None:
             client,
             config.threshold_calibration_files(),
             measurement_fclk_values_mhz=(
-                config.CLOCK_NOISE_MEASUREMENT_FCLK_MHZ
+                config.CLOCK_NOISE.fclk_mhz
             ),
-            injection_pattern=config.CLOCK_NOISE_INJECTION_PATTERN,
+            injection_pattern=config.CLOCK_NOISE.pattern,
             trim_reference_experiment=(
-                config.CLOCK_NOISE_TRIM_REFERENCE_EXPERIMENT
+                config.PATHS.clock_trim_reference
             ),
-            window=config.WINDOW,
-            pixels=config.PIXELS,
-            bad_pixel_map=config.BAD_PIXEL_MAP,
+            window=config.RUN.window,
+            pixels=config.RUN.pixels,
+            bad_pixel_map=config.PATHS.bad_pixel_mask,
             base_pixel_config=config.base_pixel_config(),
-            results_root=config.RESULTS_ROOT,
+            results_root=config.PATHS.results_dir,
             settings=settings,
-            initialization_fclk_mhz=config.ASIC_MAIN_FCLK_MHZ,
-            measurement_fclk_mhz=config.ASIC_MEASUREMENT_FCLK_MHZ,
-            eo_overrides=config.EO_OVERRIDES,
-            resume_experiment=config.RESUME_EXPERIMENT,
+            generate_analysis_plots=config.PLOTS.generate,
+            additional_metadata={"analysis_configuration_v2": config.configuration_snapshot("clock_noise")},
+            initialization_fclk_mhz=config.ACQUISITION.main_fclk_mhz,
+            measurement_fclk_mhz=config.ACQUISITION.measurement_fclk_mhz,
+            eo_overrides=config.RUN.eo_overrides,
+            resume_experiment=config.resume_experiment_path(),
             **config.reference_hardware_arguments(
                 oscilloscope,
                 required_for_scurve=True,
-                injection_steps_mv=(config.CLOCK_NOISE_INJECTION_STEP_MV,),
+                injection_steps_mv=(config.CLOCK_NOISE.step_mv,),
             ),
             **config.gain_hardware_arguments(),
             **config.injection_hardware_arguments(generator),

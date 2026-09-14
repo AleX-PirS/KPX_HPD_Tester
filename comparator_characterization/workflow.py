@@ -169,127 +169,6 @@ def _normalized_document(value: Any) -> Any:
     return json.loads(json.dumps(convert(value), sort_keys=True, ensure_ascii=True))
 
 
-# These fields first appeared after experiments made by older framework
-# versions had already been saved.  A missing field is not an operator change:
-# it only means that the old metadata could not record the new default.  An
-# existing stored value is never replaced here, so a real settings mismatch is
-# still rejected by the strict comparison below.
-_RESUME_DEFAULT_MIGRATION_PATHS: tuple[tuple[str, ...], ...] = (
-    ("noise", "empty_matrix_repeats_to_skip_remaining"),
-    ("equalization", "trim_reference"),
-    ("scurve", "coarse_baseline_noise_consecutive_codes"),
-    ("scurve", "reference_common_mode_step_error_slack_v"),
-    ("scurve", "sparse_background_interval_codes"),
-    ("scurve", "transition_repeat_low_fraction"),
-    ("scurve", "transition_repeat_high_fraction"),
-    ("scurve", "weak_signal_dense_scan_below_v"),
-    ("scurve", "signal_detection_fraction_of_n"),
-    ("scurve", "signal_detection_pixel_fraction"),
-    ("analysis", "infer_upo_pwm_plateau_denominator"),
-    ("analysis", "scurve_plateau_min_codes"),
-    ("analysis", "scurve_fit_core_low_fraction"),
-    ("analysis", "scurve_fit_core_high_fraction"),
-    ("analysis", "scurve_plot_zero_tail_points"),
-    ("analysis", "scurve_plot_code_margin"),
-    ("analysis", "scurve_plot_noise_peak_search_codes"),
-    ("analysis", "scurve_plot_noise_peak_support_fraction"),
-)
-
-
-def _backfill_new_resume_defaults(
-    stored: dict[str, Any], requested: Mapping[str, Any]
-) -> tuple[dict[str, Any], ...]:
-    """Interpret fields absent from older metadata without hiding real changes.
-
-    Frameworks through 0.16 only supported paired backgrounds, acquired every
-    configured repeat and left non-injected tile pixels count-enabled.  Those
-    three facts are reconstructed explicitly.  For an ``all`` injection group
-    the tile policy is physically irrelevant, so the requested value is safe.
-    Remaining newly recorded thresholds are copied from the request and still
-    participate in the strict document comparison below.
-    """
-
-    migrations: list[dict[str, Any]] = []
-
-    def assign(path: tuple[str, ...], value: Any, source: str) -> None:
-        cursor: dict[str, Any] = stored
-        for name in path[:-1]:
-            child = cursor.get(name)
-            if child is None:
-                child = {}
-                cursor[name] = child
-            if not isinstance(child, dict):
-                return
-            cursor = child
-        leaf = path[-1]
-        if leaf in cursor:
-            return
-        cursor[leaf] = copy.deepcopy(value)
-        migrations.append(
-            {"path": ".".join(path), "value": copy.deepcopy(value), "source": source}
-        )
-
-    stored_scurve = stored.get("scurve")
-    requested_scurve = requested.get("scurve")
-    if isinstance(stored_scurve, dict) and isinstance(requested_scurve, Mapping):
-        if "background_mode" not in stored_scurve:
-            paired = stored_scurve.get("paired_background")
-            mode = (
-                "paired"
-                if bool(paired)
-                else str(requested_scurve.get("background_mode", "sparse"))
-            )
-            assign(
-                ("scurve", "background_mode"),
-                mode,
-                "legacy paired_background compatibility",
-            )
-        assign(
-            ("scurve", "adaptive_repeats"),
-            False,
-            "legacy full-repeat acquisition compatibility",
-        )
-        legacy_patterns = tuple(
-            str(value).strip().lower()
-            for value in stored_scurve.get("injection_patterns", ())
-        )
-        legacy_tile_mode = (
-            requested_scurve.get("tile_mode", "tile_measurement")
-            if set(legacy_patterns).issubset({"all"})
-            else "tile_crosstalk"
-        )
-        assign(
-            ("scurve", "tile_mode"),
-            legacy_tile_mode,
-            (
-                "tile policy is physically equivalent for pattern all"
-                if set(legacy_patterns).issubset({"all"})
-                else "legacy inactive tile pixels used MASK=1 and TST_EN=0"
-            ),
-        )
-
-    for path in _RESUME_DEFAULT_MIGRATION_PATHS:
-        stored_cursor: dict[str, Any] = stored
-        requested_cursor: Mapping[str, Any] = requested
-        for name in path[:-1]:
-            requested_child = requested_cursor.get(name)
-            if not isinstance(requested_child, Mapping):
-                break
-            stored_child = stored_cursor.get(name)
-            if stored_child is None:
-                stored_child = {}
-                stored_cursor[name] = stored_child
-            if not isinstance(stored_child, dict):
-                break
-            stored_cursor = stored_child
-            requested_cursor = requested_child
-        else:
-            leaf = path[-1]
-            if leaf not in stored_cursor and leaf in requested_cursor:
-                assign(path, requested_cursor[leaf], "field absent from older metadata")
-    return tuple(migrations)
-
-
 def _validate_resume_inputs(
     store: ExperimentStore,
     *,
@@ -301,42 +180,20 @@ def _validate_resume_inputs(
     base_configs: Mapping[tuple[int, int], int],
     pixels: Sequence[tuple[int, int]],
     bad_pixels: Sequence[tuple[int, int]] = (),
-) -> tuple[dict[str, Any], ...]:
+) -> None:
+    if store.metadata.get("comparator_characterization_version") != FRAMEWORK_VERSION:
+        raise ValueError("hardware resume requires version 2; older results remain available as references/offline data")
     stored_bad_pixels = normalize_bad_pixel_map(store.metadata.get("bad_pixel_mask"))
     if set(stored_bad_pixels) != set(bad_pixels):
         raise ValueError("resume bad_pixel_map differs; start a new physical experiment")
     stored_settings = copy.deepcopy(store.metadata.get("settings", {}))
     requested_settings = settings.to_dict()
-    migrations = _backfill_new_resume_defaults(stored_settings, requested_settings)
     # Analysis and plotting settings never alter physical acquisition. They may
     # therefore change between framework versions without blocking a hardware
     # resume; every completed analysis records its own settings separately.
     for document in (stored_settings, requested_settings):
         document.pop("analysis", None)
-        # This field used to truncate the DAC tail. It is retained only so old
-        # metadata can be read; framework 0.13 always visits every requested
-        # code and may shorten only the repeats within one empty code.
-        noise_document = document.get("noise")
-        if isinstance(noise_document, dict):
-            noise_document.pop("stop_after_consecutive_empty_codes", None)
     if _normalized_document(stored_settings) != _normalized_document(requested_settings):
-        migrated_paths = {str(item["path"]) for item in migrations}
-        legacy_strategy = {
-            "scurve.background_mode",
-            "scurve.adaptive_repeats",
-            "scurve.tile_mode",
-        } & migrated_paths
-        if legacy_strategy:
-            expected = stored_settings.get("scurve", {})
-            raise ValueError(
-                "resume старой S-кривой требует сохранить ее стратегию: "
-                f"SCURVE_BACKGROUND_MODE={expected.get('background_mode')!r}, "
-                f"SCURVE_ADAPTIVE_REPEATS={expected.get('adaptive_repeats')!r}, "
-                f"SCURVE_TILE_MODE={expected.get('tile_mode')!r}. "
-                "Измените эти три значения в characterization_config.py либо "
-                "начните новый физический эксперимент; старые данные доступны "
-                "для offline-анализа."
-            )
         raise ValueError(
             "resume settings differ from metadata; re-analyze offline for analysis-only changes "
             "or start a new physical experiment"
@@ -393,7 +250,6 @@ def _validate_resume_inputs(
                 f"resume base pixel configuration differs at Col={coordinate[0]} "
                 f"Row={coordinate[1]}"
             )
-    return migrations
 
 
 def _save_calibrations(
@@ -1378,12 +1234,6 @@ def characterize_comparator(
             minimum_reference_voltage_v=(
                 selected_settings.scurve.minimum_reference_voltage_v
             ),
-            preferred_reference_common_mode_v=(
-                selected_settings.scurve.preferred_reference_common_mode_v
-            ),
-            common_mode_step_error_slack_v=(
-                selected_settings.scurve.reference_common_mode_step_error_slack_v
-            ),
             maximum_reference_step_error_v=(
                 selected_settings.scurve.maximum_reference_step_error_v
             ),
@@ -1630,7 +1480,7 @@ def characterize_comparator(
             if stored_injection.get("ctrl_source") != expected_ctrl_source:
                 raise ValueError(
                     "resume CTRL injection source differs or was not recorded; "
-                    "reuse the old noise experiment as NOISE_REFERENCE_EXPERIMENT "
+                    "reuse the old noise experiment as SCURVE_NOISE_REFERENCE in .env "
                     "and start a new S-curve experiment"
                 )
             if isinstance(shot_executor, UpoPwmShotExecutor) and (
@@ -1679,7 +1529,7 @@ def characterize_comparator(
         }
         if stored_pixels != set(selected_pixels):
             raise ValueError("resume experiment pixel selection does not match")
-        resume_migrations = _validate_resume_inputs(
+        _validate_resume_inputs(
             store,
             settings=selected_settings,
             counter_key=counter_key,
@@ -1720,21 +1570,6 @@ def characterize_comparator(
             "status": "in_progress",
             "resumed_utc": utc_now_text(),
         }
-        if resume_migrations:
-            history = list(store.metadata.get("resume_metadata_migrations", []))
-            migration_record = {
-                "source_framework_version": store.metadata.get(
-                    "comparator_characterization_version"
-                ),
-                "interpreted_by_framework_version": FRAMEWORK_VERSION,
-                "fields": list(resume_migrations),
-            }
-            signature = _normalized_document(migration_record)
-            if not any(
-                _normalized_document(item) == signature for item in history
-            ):
-                history.append(migration_record)
-            resume_update["resume_metadata_migrations"] = history
         store.update_metadata(**resume_update)
     else:
         metadata = {
@@ -1920,12 +1755,6 @@ def characterize_comparator(
                     ),
                     "minimum_reference_voltage_v": (
                         selected_settings.scurve.minimum_reference_voltage_v
-                    ),
-                    "preferred_reference_common_mode_v": (
-                        selected_settings.scurve.preferred_reference_common_mode_v
-                    ),
-                    "reference_common_mode_step_error_slack_v": (
-                        selected_settings.scurve.reference_common_mode_step_error_slack_v
                     ),
                     "maximum_reference_step_error_v": (
                         selected_settings.scurve.maximum_reference_step_error_v

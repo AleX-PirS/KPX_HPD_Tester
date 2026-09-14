@@ -453,8 +453,6 @@ def select_reference_dac_pairs(
     minimum_reference_code: int = 401,
     maximum_reference_code: int = 1023,
     minimum_reference_voltage_v: float | None = None,
-    preferred_reference_common_mode_v: float | None = None,
-    common_mode_step_error_slack_v: float = 0.0,
     maximum_reference_step_error_v: float | None = 1e-3,
 ) -> tuple[ReferencePairSelection, ...]:
     """Select one fixed low REF1 and a separate REF2 for every positive step.
@@ -465,9 +463,6 @@ def select_reference_dac_pairs(
     then chooses the lowest *measured voltage* REF1. REF2 alone changes between
     amplitudes. Distinct requested steps receive distinct REF2 codes.
 
-    ``preferred_reference_common_mode_v`` and
-    ``common_mode_step_error_slack_v`` remain accepted for source compatibility,
-    but common-mode optimization is deliberately not used by this policy.
     """
 
     if not isinstance(minimum_reference_code, int) or isinstance(
@@ -484,18 +479,6 @@ def select_reference_dac_pairs(
         minimum_reference_voltage_v = float(minimum_reference_voltage_v)
         if not math.isfinite(minimum_reference_voltage_v):
             raise ValueError("minimum_reference_voltage_v must be finite")
-    if preferred_reference_common_mode_v is not None:
-        preferred_reference_common_mode_v = float(preferred_reference_common_mode_v)
-        if not math.isfinite(preferred_reference_common_mode_v):
-            raise ValueError("preferred_reference_common_mode_v must be finite")
-    common_mode_step_error_slack_v = float(common_mode_step_error_slack_v)
-    if (
-        not math.isfinite(common_mode_step_error_slack_v)
-        or common_mode_step_error_slack_v < 0
-    ):
-        raise ValueError(
-            "common_mode_step_error_slack_v must be finite and >= 0"
-        )
     if maximum_reference_step_error_v is not None:
         maximum_reference_step_error_v = float(maximum_reference_step_error_v)
         if not math.isfinite(maximum_reference_step_error_v) or maximum_reference_step_error_v < 0:
@@ -692,8 +675,6 @@ def plan_reference_dac_pairs(
     minimum_reference_code: int = 401,
     maximum_reference_code: int = 1023,
     minimum_reference_voltage_v: float | None = None,
-    preferred_reference_common_mode_v: float | None = None,
-    common_mode_step_error_slack_v: float = 0.0,
     maximum_reference_step_error_v: float | None = 1e-3,
 ) -> ReferencePairPlan:
     """Return the largest realizable step subset for one fixed low REF1.
@@ -737,9 +718,6 @@ def plan_reference_dac_pairs(
             or maximum_reference_step_error_v < 0
         ):
             raise ValueError("maximum_reference_step_error_v must be finite and >= 0")
-    # Accepted only for API compatibility.  The project policy deliberately
-    # fixes the lowest feasible REF1 rather than optimizing common mode.
-    del preferred_reference_common_mode_v, common_mode_step_error_slack_v
 
     def empty_plan(reason):
         return ReferencePairPlan(selections=(), availability=tuple(

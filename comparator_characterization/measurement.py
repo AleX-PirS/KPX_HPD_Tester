@@ -731,7 +731,6 @@ def run_noise_scan(
             ),
             "empty_repeat_shortcut_events": repeat_shortcuts,
             "empty_repeat_shortcut_event_count": len(repeat_shortcuts),
-            "legacy_dac_tail_early_stop_disabled": True,
             "fine_range_diagnostics": fine_diagnostics,
         }
     )

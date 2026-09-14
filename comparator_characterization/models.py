@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "0.22.0"
+FRAMEWORK_VERSION = "2.0.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -149,9 +149,6 @@ class NoiseScanSettings:
     mode_read: int = 0b010
     crw_mode: int = 0
     continue_after_pixel_read_error: bool = True
-    # Retained only for compatibility with older saved settings. Version 0.13
-    # never truncates the requested DAC-code range.
-    stop_after_consecutive_empty_codes: int | None = None
     # Skip only the remaining repeats of one DAC point after this many
     # consecutive, fully valid, all-pixel-zero acquisitions.
     empty_matrix_repeats_to_skip_remaining: int | None = 2
@@ -197,15 +194,6 @@ class NoiseScanSettings:
             raise ValueError("mode_read must be in 0..7")
         if self.crw_mode not in (0, 1):
             raise ValueError("crw_mode must be 0 or 1")
-        if self.stop_after_consecutive_empty_codes is not None:
-            if (
-                not isinstance(self.stop_after_consecutive_empty_codes, int)
-                or isinstance(self.stop_after_consecutive_empty_codes, bool)
-                or self.stop_after_consecutive_empty_codes < 2
-            ):
-                raise ValueError(
-                    "stop_after_consecutive_empty_codes must be None or an integer >= 2"
-                )
         if self.empty_matrix_repeats_to_skip_remaining is not None:
             if (
                 not isinstance(self.empty_matrix_repeats_to_skip_remaining, int)
@@ -287,10 +275,6 @@ class ScurveSettings:
     # Inclusive upper bound for BOTH REF DACs, independent of voltage polarity.
     maximum_reference_code: int = 1023
     minimum_reference_voltage_v: float | None = None
-    # Deprecated compatibility inputs. The current selector deliberately uses
-    # one fixed, lowest feasible REF1 and changes only REF2.
-    preferred_reference_common_mode_v: float | None = None
-    reference_common_mode_step_error_slack_v: float = 0.0
     # The selected measured LUT step must normally be within 1 mV of request.
     maximum_reference_step_error_v: float | None = 1e-3
     # Positive injected pulses go upward from the baseline. Scan the threshold
@@ -310,18 +294,12 @@ class ScurveSettings:
     baseline_noise_stop_enabled: bool = True
     baseline_noise_count_multiplier: float = 1.0
     baseline_noise_pixel_fraction: float = 0.10
-    # Coarse needs one post-lobe return point; fine uses two adjacent step-1
-    # return points. The measured lobe itself is always handed to the fine scan.
-    coarse_baseline_noise_consecutive_codes: int = 1
     baseline_noise_consecutive_codes: int = 2
     # Background acquisition policy. ``paired`` measures background before
     # every signal repeat. ``sparse`` measures periodic control backgrounds
     # and uses bracketing checkpoints for eligibility without subtraction.
     background_mode: str = "sparse"
     sparse_background_interval_codes: int = 16
-    # Legacy mirror retained in metadata/API compatibility. Validation keeps
-    # it synchronized with ``background_mode``.
-    paired_background: bool = False
     # Only the first repeat is acquired outside the observed 10-90% signal
     # transition. Every requested repeat is retained around V50.
     adaptive_repeats: bool = True
@@ -381,17 +359,9 @@ class ScurveSettings:
             raise ValueError("minimum_reference_code must not exceed maximum_reference_code")
         for name, value in (
             ("minimum_reference_voltage_v", self.minimum_reference_voltage_v),
-            ("preferred_reference_common_mode_v", self.preferred_reference_common_mode_v),
         ):
             if value is not None and not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite when supplied")
-        if (
-            not math.isfinite(float(self.reference_common_mode_step_error_slack_v))
-            or float(self.reference_common_mode_step_error_slack_v) < 0
-        ):
-            raise ValueError(
-                "reference_common_mode_step_error_slack_v must be finite and >= 0"
-            )
         if self.maximum_reference_step_error_v is not None and (
             not math.isfinite(float(self.maximum_reference_step_error_v))
             or float(self.maximum_reference_step_error_v) < 0
@@ -433,14 +403,6 @@ class ScurveSettings:
         if not 0 < float(self.baseline_noise_pixel_fraction) <= 1:
             raise ValueError("baseline_noise_pixel_fraction must be in (0, 1]")
         if (
-            not isinstance(self.coarse_baseline_noise_consecutive_codes, int)
-            or isinstance(self.coarse_baseline_noise_consecutive_codes, bool)
-            or self.coarse_baseline_noise_consecutive_codes < 1
-        ):
-            raise ValueError(
-                "coarse_baseline_noise_consecutive_codes must be a positive integer"
-            )
-        if (
             not isinstance(self.baseline_noise_consecutive_codes, int)
             or isinstance(self.baseline_noise_consecutive_codes, bool)
             or self.baseline_noise_consecutive_codes < 1
@@ -450,7 +412,6 @@ class ScurveSettings:
         if normalized_background_mode not in {"paired", "sparse"}:
             raise ValueError("S-curve background_mode must be paired or sparse")
         self.background_mode = normalized_background_mode
-        self.paired_background = normalized_background_mode == "paired"
         if (
             not isinstance(self.sparse_background_interval_codes, int)
             or isinstance(self.sparse_background_interval_codes, bool)

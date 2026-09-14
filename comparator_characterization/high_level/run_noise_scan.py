@@ -14,20 +14,21 @@ from comparator_characterization.high_level import characterization_config as co
 
 def main() -> None:
     config.configure_runtime_logging()
-    config.require_hardware_run_enabled()
+    config.validate_configuration("noise", require_hardware=True)
     with (
         config.build_oscilloscope() as oscilloscope,
         config.build_upo_client() as client,
     ):
         result = config.run_characterization(
             client, config.threshold_calibration_files(),
-            window=config.WINDOW, pixels=config.PIXELS,
-            bad_pixel_map=config.BAD_PIXEL_MAP,
+            test_mode="noise",
+            window=config.RUN.window, pixels=config.RUN.pixels,
+            bad_pixel_map=config.PATHS.bad_pixel_mask,
             base_pixel_config=config.base_pixel_config(),
-            results_root=config.RESULTS_ROOT, settings=config.build_settings(),
+            results_root=config.PATHS.results_dir, settings=config.build_settings(),
             run_noise_scan=True, run_equalization=False, run_scurve=False,
-            initialization_fclk_mhz=config.ASIC_MAIN_FCLK_MHZ,
-            measurement_fclk_mhz=config.ASIC_MEASUREMENT_FCLK_MHZ,
+            initialization_fclk_mhz=config.ACQUISITION.main_fclk_mhz,
+            measurement_fclk_mhz=config.ACQUISITION.measurement_fclk_mhz,
             **config.reference_hardware_arguments(
                 oscilloscope, required_for_scurve=False
             ),

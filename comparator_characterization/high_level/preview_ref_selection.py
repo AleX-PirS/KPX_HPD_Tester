@@ -19,15 +19,16 @@ from comparator_characterization.high_level import characterization_config as co
 
 
 def main() -> None:
-    mode = str(config.REFERENCE_MODE).strip().lower()
+    config.validate_configuration("ref_preview")
+    mode = str(config.REFERENCE.mode).strip().lower()
     if mode == "manual":
         table = pd.DataFrame(
             [
                 {
                     "mode": "manual",
-                    "equivalent_step_mV": config.MANUAL_REF_EQUIVALENT_STEP_MV,
-                    "REF1_code": config.MANUAL_REF1_CODE,
-                    "REF2_code": config.MANUAL_REF2_CODE,
+                    "equivalent_step_mV": config.REFERENCE.manual_step_mv,
+                    "REF1_code": config.REFERENCE.manual_ref1,
+                    "REF2_code": config.REFERENCE.manual_ref2,
                     "REF_LUT_used": False,
                 }
             ]
@@ -38,20 +39,16 @@ def main() -> None:
         raise ValueError("REFERENCE_MODE must be 'lut' or 'manual'")
     calibrations = load_reference_dac_calibrations(
         config.reference_calibration_files(),
-        voltage_unit=config.REFERENCE_LUT_VOLTAGE_UNIT,
+        voltage_unit=config.REFERENCE.lut_voltage_unit,
     )
     plan = plan_reference_dac_pairs(
         calibrations["DAC_TST_REF1"],
         calibrations["DAC_TST_REF2"],
         config.injection_voltage_steps_v(),
-        minimum_reference_code=config.MINIMUM_REFERENCE_CODE,
-        maximum_reference_code=config.MAXIMUM_REFERENCE_CODE,
-        minimum_reference_voltage_v=config.MINIMUM_REFERENCE_VOLTAGE_V,
-        preferred_reference_common_mode_v=config.PREFERRED_REFERENCE_COMMON_MODE_V,
-        common_mode_step_error_slack_v=(
-            config.REFERENCE_COMMON_MODE_STEP_ERROR_SLACK_V
-        ),
-        maximum_reference_step_error_v=config.MAXIMUM_REFERENCE_STEP_ERROR_V,
+        minimum_reference_code=config.REFERENCE.code_limits[0],
+        maximum_reference_code=config.REFERENCE.code_limits[1],
+        minimum_reference_voltage_v=config.metadata.SCURVE.minimum_reference_voltage_v,
+        maximum_reference_step_error_v=config.metadata.SCURVE.maximum_reference_step_error_v,
     )
     selections = plan.selections
     table = pd.DataFrame(

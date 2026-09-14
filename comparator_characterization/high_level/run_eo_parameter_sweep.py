@@ -15,11 +15,7 @@ from comparator_characterization.high_level.run_full_characterization import (
 
 
 def main() -> None:
-    if not config.EO_PARAMETER_GRID and config.RESUME_SWEEP is None:
-        raise ValueError(
-            "Задайте EO_PARAMETER_GRID или RESUME_SWEEP в characterization_config.py"
-        )
-    run_full_characterization()
+    run_full_characterization(eo_sweep=True)
 
 
 if __name__ == "__main__":

@@ -141,9 +141,9 @@ def characterize_parameter_sweep(
 
     The first mapping key changes slowest. Results are nested as
     PARAM1=value/PARAM2=value/<experiment>/raw, analysis, inputs, metadata.json.
-    None/empty grid gives one standard combination. For the legacy flat folder
-    layout call characterize_comparator directly (the high-level launcher does
-    this automatically when EO_PARAMETER_GRID and RESUME_SWEEP are None).
+    At the low-level API, None/empty grid gives one standard combination.
+    The v2 high-level launcher uses this function only for the explicit
+    eo_sweep test with a nonempty EO_SWEEP.grid; other tests use their own workflow.
     """
     if characterization_kwargs.get("resume_experiment") is not None:
         raise ValueError("use resume_sweep for a batch, not resume_experiment")
@@ -168,6 +168,7 @@ def characterize_parameter_sweep(
         "shot_executor",
         "before_scurve",
         "reference_step_oscilloscope",
+        "additional_metadata",
     }
     contract = {
         "framework_version": FRAMEWORK_VERSION,
