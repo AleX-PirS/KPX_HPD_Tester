@@ -154,7 +154,7 @@ MANUAL_REF_EQUIVALENT_STEP_MV = 100.0
 # Пользователь задает только требуемые положительные ступеньки REF1-REF2.
 # Единица здесь mV. Скрипт выбирает измеренные LUT-точки и всегда требует
 # физическое условие V_REF1 > V_REF2.
-INJECTION_STEPS_MV = (5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 75.0, 100.0, 150.0, 250.0)
+INJECTION_STEPS_MV = (10.0, 20.0, 40.0, 50.0, 100.0, 200.0)
 
 # Быстрый автономный тест шума по измерительному FCLK. Для полноценного sweep
 # задайте, например, (1, 5, 10, 25, 50). Безопасный исходный default содержит
@@ -348,6 +348,17 @@ GAIN_EQUALIZATION_INCLUDE_POOR_FITS = False
 # При одной ступени усиление = (V50 - noise baseline) / Q. Перенос общей
 # noise-базы предполагает, что база не зависит от GAIN; это отмечается в CSV.
 GAIN_EQUALIZATION_ALLOW_SHARED_NOISE_BASELINE = True
+
+# Продолжение analyze_gain_sweep.py: реальная проверка полученных смешанных карт.
+# False сохраняет полностью офлайн-режим, никаких подключений к приборам.
+CHECK_EQ_GAIN_MAP = False
+# False: каждая карта в своем исходном окне. True: одна карта во всех AB/BC/CD.
+CHECK_EQ_GAIN_MAP_ALL_WINDOWS = False
+# Для ALL обязательно явно выбрать AB, BC или CD. Автовыбора общей карты нет.
+CHECK_EQ_GAIN_MAP_REFERENCE_WINDOW: str | None = None
+CHECK_EQ_GAIN_MAP_ALLOW_UNRESOLVED = False
+# Финальная проверка по умолчанию paired; можно явно выбрать sparse.
+CHECK_EQ_GAIN_MAP_BACKGROUND_MODE = "paired"
 
 # Пиксели для подробных графиков задаются физическими (column, row).
 # Пустой кортеж включает автоматический выбор типичных пикселей.

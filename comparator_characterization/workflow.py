@@ -1120,6 +1120,7 @@ def characterize_comparator(
     ] | None = None,
     injection_voltage_steps_v: Sequence[float] | None = None,
     manual_reference_configuration: Mapping[str, Any] | None = None,
+    replay_reference_selections: Sequence[ReferencePairSelection] | None = None,
     reference_calibration_voltage_unit: str = "auto",
     reference_step_oscilloscope: Any | None = None,
     reference_step_verification_settings: (
@@ -1146,6 +1147,7 @@ def characterize_comparator(
     scurve_measurement_fclk_values_mhz: Sequence[int] | None = None,
     allow_scurve_without_noise_reference: bool = False,
     eo_overrides: Mapping[str, int] | None = None,
+    generate_analysis_plots: bool = True,
 ) -> CharacterizationResult:
     """Characterize one AB, BC or CD counting window.
 
@@ -1260,7 +1262,22 @@ def characterize_comparator(
     reference_calibrations: dict[str, ReferenceDacCalibration] = {}
     reference_pair_selections: tuple[Any, ...] = ()
     reference_pair_availability: tuple[dict[str, Any], ...] = ()
-    if manual_reference_configuration is not None:
+    if replay_reference_selections is not None:
+        if any(value is not None for value in (
+            manual_reference_configuration, injection_voltage_steps_v, reference_calibration_files
+        )) or selected_settings.scurve.pulse_amplitudes:
+            raise ValueError("REF replay cannot be combined with another amplitude/REF specification")
+        if not run_scurve:
+            raise ValueError("REF replay requires run_scurve=True")
+        from .reference_replay import replay_reference_amplitudes
+        reference_pair_selections = tuple(replay_reference_selections)
+        selected_settings.scurve.pulse_amplitudes = replay_reference_amplitudes(reference_pair_selections)
+        reference_pair_availability = tuple({
+            "requested_voltage_step_v": pair.requested_voltage_step_v, "realizable": True,
+            "status": "exact_source_REF_pair_replay", "selected_ref1_code": pair.ref1_code,
+            "selected_ref2_code": pair.ref2_code,
+        } for pair in reference_pair_selections)
+    elif manual_reference_configuration is not None:
         if injection_voltage_steps_v is not None or reference_calibration_files is not None:
             raise ValueError(
                 "manual_reference_configuration cannot be combined with REF LUTs "
@@ -1816,6 +1833,8 @@ def characterize_comparator(
                 "pwm_high_time_ns": reference_verification_pwm_high_time_ns,
                 "amux_signal": "TST_SIG",
                 "physical_ref_order": (
+                    "stored_levels_or_user_equivalent_exact_source_replay"
+                    if replay_reference_selections is not None else
                     "not_derived_from_LUT_manual_equivalent_step"
                     if manual_reference_configuration is not None
                     else "V_REF1 > V_REF2"
@@ -1872,6 +1891,8 @@ def characterize_comparator(
                 "upo_pwm_count_derivation": upo_pwm_count_metadata,
                 "reference_pair_selection": {
                     "source": (
+                        "exact_source_REF_pair_replay"
+                        if replay_reference_selections is not None else
                         "explicit_manual_REF_codes_and_equivalent_step"
                         if manual_reference_configuration is not None
                         else "measured_REF1_REF2_LUTs"
@@ -1910,21 +1931,29 @@ def characterize_comparator(
                         selected_settings.scurve.maximum_reference_step_error_v
                     ),
                     "physical_order": (
+                        "stored_REF_levels_or_user_equivalent_source_replay"
+                        if replay_reference_selections is not None else
                         "not_derived_from_LUT_manual_equivalent_step"
                         if manual_reference_configuration is not None
                         else "V_REF1 > V_REF2"
                     ),
                     "candidate_codes": (
+                        "exact_source_pairs_not_reselected"
+                        if replay_reference_selections is not None else
                         "one_explicit_manual_pair"
                         if manual_reference_configuration is not None
                         else "measured_LUT_rows_only"
                     ),
                     "ref1_policy": (
+                        "stored_source_REF1"
+                        if replay_reference_selections is not None else
                         "one_explicit_manual_REF1_code"
                         if manual_reference_configuration is not None
                         else "one_fixed_lowest_feasible_measured_voltage_for_all_amplitudes"
                     ),
                     "varying_reference": (
+                        "stored_source_pairs"
+                        if replay_reference_selections is not None else
                         "none_single_manual_pair"
                         if manual_reference_configuration is not None
                         else "REF2_only"
@@ -3077,7 +3106,7 @@ def characterize_comparator(
             n_injections=(
                 selected_settings.scurve.n_injections if run_scurve else None
             ),
-            generate_plots=True,
+            generate_plots=generate_analysis_plots,
         )
         analysis_path = Path(analysis_outputs["analysis_directory"])
         store.log_status(

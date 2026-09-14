@@ -17,6 +17,7 @@ from .gain_sweep import (
     build_gain_sweep_metrics,
     propose_gain_equalization,
 )
+from .gain_verification import prepare_gain_verification, verify_gain_equalization
 from .calibration import (
     ReferenceDacCalibration,
     ReferencePairPlan,
@@ -87,6 +88,8 @@ from .sweep import (
 
 __all__ = [
     "GainEqualizationSettings",
+    "prepare_gain_verification",
+    "verify_gain_equalization",
     "analyze_gain_sweep",
     "build_gain_sweep_metrics",
     "propose_gain_equalization",

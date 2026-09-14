@@ -1,6 +1,6 @@
 # Метрики характеризации компараторов
 
-Справочник соответствует версии 0.21.0. Формулы относятся к сохраненным CSV. Имена столбцов остаются английскими при любом языке графиков.
+Справочник соответствует версии 0.22.0. Формулы относятся к сохраненным CSV. Имена столбцов остаются английскими при любом языке графиков.
 
 ## Координаты, группировка и единицы
 
@@ -266,6 +266,72 @@ row,gain, changed, objective_score, candidate_code_count и recommendation_statu
 Улучшение суммарного критерия не гарантирует улучшение каждой отдельной
 ступеньки в совместном многоточечном подборе. Подтверждение результата требует
 повторного S-curve измерения с индивидуальной картой.
+
+## Реальная проверка mixed GAIN-карты
+
+`gain_verification_pixel_metrics.csv`: поля амплитуды, базы, A/Q, slope и
+пригодности имеют те же формулы, но вычислены по новому аппаратному тесту.
+`target_gain_code` обозначает задачу, не равномерный физический код.
+`applied_gain_code` задает фактический индивидуальный код; `configuration_mode`
+равен measured_mixed_gain_map. `baseline_source=mixed_map_fresh_noise_center`
+означает noise-центр текущей карты; mixed_map_zero_charge_intercept означает
+пригодную многоточечную регрессию текущего пикселя/карты. Предположение о
+GAIN-инвариантной старой базе здесь не применяется. `sigma_v` относится к
+ширине нового S-перехода, не к наклону gain-кривой и не к спектральной плотности.
+
+В `gain_verification_comparison.csv` поля before_* и predicted_* взяты из
+исходного равномерного свипа, actual_* из нового теста. При ALL с опорной картой
+прогноз пересчитывается из измерений именно выбранных кодов для каждого окна;
+если код там не измерялся, прогноз остается NaN, но реальное измерение возможно.
+`actual_amplitude_residual_v`=A_actual-A_target;
+`prediction_error_v`=A_actual-A_predicted. Missing/invalid actual остается NaN
+с actual_metric_status, не заменяется нулем.
+
+`gain_verification_summary.csv` сохраняет все pixel counts и число invalid.
+before/predicted/actual paired СКО, RMS до цели и q95 abs residual считаются
+по одной и той же тройке физических пикселей с пригодными всеми тремя откликами.
+`paired_prediction_error_rms_v`=sqrt(mean((A_actual-A_predicted)^2)).
+Отсутствующий прогноз может исключить пиксель из paired-сводки, но не из общей
+карты или real valid_pixel_count. СКО gain в мВ/кэ имеет ddof=1.
+
+В `measured_gain_map.csv` column,row,gain совместимы с GAIN_MAP_CSV.
+measured_in_mixed_gain_matrix=True означает факт завершенного аппаратного
+прохода. valid_amplitude_step_count/required_step_count сообщают пригодность;
+all_response_steps_valid требует пригодного A на каждой целевой ступеньке.
+Никакой допуск к target и автоматический equalization pass/fail не добавлен.
+Исходное verified_in_mixed_gain_matrix=False в предложении не перезаписывается.
+
+## Согласованные AB/BC/CD после GAIN
+
+`gain_verification_joint_window_metrics.csv` создается только для общего
+ALL-режима: один физический GAIN и одинаковые source trim B/C/D между окнами.
+Строки относятся к одному пикселю, TARGET_GAIN, FCLK, режиму и REF-step/Q.
+Полная структура содержит и непригодные строки, complete_response=False.
+Общие составляющие таких строк остаются NaN. Разные GAIN-коды между окнами
+не дают совместного результата.
+
+Для каждого окна w:
+
+- `relative_gain_deviation_w`=A_actual,w/A_target,w-1. При одинаковом Q это
+  также относительное отклонение A/Q. Нормирование по собственной цели окна
+  не показывает общий абсолютный сдвиг всей матрицы данного окна; для этого
+  сохранены actual_amplitude_w_v и actual_gain_w_mv_per_ke.
+- `baseline_offset_w_v`=baseline_actual,w-median(baseline_actual,w по пригодным
+  пикселям окна). Абсолютные базы также сохраняются отдельно.
+- `sigma_w_v`: ширина соответствующей новой S-кривой.
+
+`common_gain_deviation`=median трех relative_gain_deviation;
+`differential_gain_range`=max-minus-min тех же трех величин.
+`common_baseline_shift_v`=median трех baseline_offset;
+`differential_baseline_range_v`=max-minus-min этих baseline_offset.
+На графиках относительные gain величины умножаются на 100 для процентов,
+baseline на 1000 для мВ.
+
+Общая составляющая совместима с общей аналоговой/инжекционной причиной;
+дифференциальная с comparator/window/calibration effects. Однозначное
+разделение причины по этим метрикам не выполняется, categorical fault labels
+и произвольные пороги диагноза не вводятся. При одной ступени A/Q определен,
+но зависимость gain от Q и самостоятельный многоточечный slope неизвестны.
 
 ## Пространственные метрики и ALL
 

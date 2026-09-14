@@ -217,6 +217,84 @@ python -m comparator_characterization.high_level.analyze_gain_sweep results/EXPE
 Второй относится только к независимому многоточечному наклону; при одном Q
 амплитуда и A/Q эквивалентны и не учитываются дважды.
 
+## Реальная проверка полученной GAIN-карты
+
+Тот же `analyze_gain_sweep.py` после офлайн-подбора может продолжить тест:
+
+```python
+CHECK_EQ_GAIN_MAP = True
+ENABLE_HARDWARE_RUN = True
+CHECK_EQ_GAIN_MAP_ALL_WINDOWS = False
+CHECK_EQ_GAIN_MAP_REFERENCE_WINDOW = None
+CHECK_EQ_GAIN_MAP_ALLOW_UNRESOLVED = False
+CHECK_EQ_GAIN_MAP_BACKGROUND_MODE = "paired"  # либо sparse
+```
+
+При False никакие приборы не открываются. При True после анализа для каждой
+карты и TARGET_GAIN реальные PX_GAIN задаются индивидуально, заново снимается
+noise scan, затем S-кривые. Для проверки не используются `_UG`, `GAIN_MAP_CSV`
+или EO-grid текущего конфига: карта берется из полученного анализа, EO и trims
+из исходного свипа. Аппаратная конфигурация проходит существующий WRITE_TO_CHIP.
+
+Верхнеуровневый запуск проверяет совпадение источника CTRL, main FCLK и PWM
+settings с исходным тестом. REF-пары повторяются точно, без нового LUT-подбора.
+Threshold LUT текущего конфига должны совпасть с сохраненными. Cinj, число
+импульсов для finite burst и экспозиция берутся из исходных settings. Для всех
+заданий нужна одна общая экспозиция. Noise и S-curve проверки используют ее
+одинаково, поэтому смены времени между ними и Enter нет. Установите указанное
+в логе shutter exposure в GUI УПО до запуска: Python не имеет его readback.
+Если текущий `SCURVE_SHUTTER_DURATION_S` отличается от source, аппаратный запуск
+отклоняется до открытия приборов. Укажите исходное время и в конфиге, и в GUI.
+Повторы, scan limits и графические настройки берутся из текущего конфига.
+По умолчанию проверка paired, даже если исходный свип был sparse.
+
+Предварительные проверки всех карт идут до открытия приборов. Если source
+изменился, нет корректных trim/REF/экспозиции либо есть unresolved без явного
+разрешения, аппаратный этап не запускается. Source sweep и прогноз не меняются.
+
+### Одна общая карта во всех AB/BC/CD
+
+```python
+GAIN_SWEEP_ANALYSIS_EXPERIMENT = PROJECT_ROOT / "results" / "ALL_свип"
+TARGET_GAIN = [4, 10, 20]
+CHECK_EQ_GAIN_MAP = True
+CHECK_EQ_GAIN_MAP_ALL_WINDOWS = True
+CHECK_EQ_GAIN_MAP_REFERENCE_WINDOW = "AB"  # явный пример выбора, можно BC/CD
+```
+
+Опорное окно выбирает только источник общей GAIN-карты, а не единственное окно
+измерения. Для каждого target эта карта проверяется последовательно во всех
+AB/BC/CD, при одних GAIN и совмещенных source trim-картах B/C/D. Исходные
+свипы всех трех окон должны присутствовать, иметь одинаковый состав пикселей,
+совместимые non-trim pixel settings и одинаковые FCLK/режимы/целевые коды.
+EO-параметры, main FCLK и tile mode также должны совпадать. Несовпадающие
+наборы REF-step или Cinj отклоняются при предварительной проверке, так что
+совместные метрики сравнивают одинаковые Q.
+Разные REF-пары при одной и той же ступени фиксируются в child metadata.
+
+### Выходные файлы
+
+В `gain_equalization/vNNN/hardware_verification/vMMM`:
+
+- `gain_verification_pixel_metrics.csv`: реальный A/Q, амплитуда, база и sigma.
+- `gain_verification_comparison.csv`: до, прогноз и реальный отклик по пикселям.
+- `gain_verification_summary.csv`: одинаковые пиксели, СКО/RMS/q95 и ошибка прогноза.
+- `gain_verification_joint_window_metrics.csv`: только в общем ALL-режиме,
+  общие и дифференциальные признаки, взаимные соотношения AB/BC/CD.
+- Для каждого окна/FCLK/режима/target: raw experiment, CSV, plots и
+  `measured_gain_map.csv` со статусом пригодности измеренного отклика.
+- `gain_verification_manifest.json` и `REPORT.md`: история проходов и ссылки.
+
+Новые графики подписаны как реальное измерение. Все источники сравниваются в
+общем масштабе и на одинаковых пикселях; missing/invalid не становятся нулями.
+При сбое completed raw/CSV предыдущих окон остаются. Автоматического resume
+всей новой verification-серии пока нет; новый запуск создает новую версию.
+`--no-plots` отключает также графики дочерних проверочных экспериментов.
+
+Автоматическое изменение trims в этой версии не выполняется. Предложение
+финальной процедуры с локальной коррекцией находится в
+`COMPARATOR_CHARACTERIZATION.md`; сначала надо выбрать межоконные цели.
+
 ## Проверка REF осциллографом до теста
 
 По умолчанию `VERIFY_REFERENCE_STEPS_BEFORE_TEST = True`, поэтому каждый

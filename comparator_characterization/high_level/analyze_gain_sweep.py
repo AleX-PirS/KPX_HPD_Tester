@@ -1,4 +1,4 @@
-"""Офлайн-карты усиления и индивидуальных GAIN-кодов по завершенному свипу."""
+"""GAIN-карты по завершенному свипу и опциональная аппаратная проверка."""
 
 from __future__ import annotations
 
@@ -43,6 +43,48 @@ def main() -> None:
     for target, path in result["gain_maps"].items():
         print(f"GAIN-карта {target}: {path}")
     print(f"Отчет: {result['report']}")
+    if config.CHECK_EQ_GAIN_MAP:
+        config.require_hardware_run_enabled()
+        from comparator_characterization.gain_verification import prepare_gain_verification, verify_gain_equalization
+        calibration_files = config.threshold_calibration_files()
+        prepared = prepare_gain_verification(
+            result, calibration_files, settings=config.build_settings(),
+            all_windows=config.CHECK_EQ_GAIN_MAP_ALL_WINDOWS,
+            reference_window=config.CHECK_EQ_GAIN_MAP_REFERENCE_WINDOW,
+            allow_unresolved=config.CHECK_EQ_GAIN_MAP_ALLOW_UNRESOLVED,
+            background_mode=config.CHECK_EQ_GAIN_MAP_BACKGROUND_MODE,
+        )
+        # Reject acquisition timing changes BEFORE any device is opened.
+        for job in prepared[1]:
+            source = job.metadata.get("test_injection_configuration", {})
+            expected_ctrl = "MGPDLab_UPO_PWM" if config._normalized_ctrl_source() == "upo_pwm" else "Keysight_or_custom_executor"
+            if source.get("ctrl_source") != expected_ctrl:
+                raise ValueError("Источник CTRL проверки должен совпадать с исходным свипом")
+            if job.metadata["run_options"]["initialization_fclk_mhz"] != config.ASIC_MAIN_FCLK_MHZ:
+                raise ValueError("ASIC_MAIN_FCLK_MHZ проверки должен совпадать с исходным свипом")
+            if config._normalized_ctrl_source() == "upo_pwm":
+                saved = job.metadata.get("acquisition_sequence", {}).get("upo_pwm_settings", {})
+                current = config.build_upo_pwm_settings()
+                if saved.get("frequency_khz") != current.frequency_khz or saved.get("high_time_ns") != current.high_time_ns:
+                    raise ValueError("Частота/длительность PWM проверки должны совпадать с исходным свипом")
+        exposure = prepared[1][0].settings.scurve.shutter_duration_s
+        print(f"Реальная проверка: {len(prepared[1])} проходов, УПО shutter={exposure:g} с для noise и S-кривых")
+        with (config.build_generator() as generator, config.build_oscilloscope() as oscilloscope,
+              config.build_upo_client() as client):
+            hardware = config.injection_hardware_arguments(generator)
+            if config.VERIFY_REFERENCE_STEPS_BEFORE_TEST:
+                hardware.update(
+                    reference_step_oscilloscope=oscilloscope,
+                    reference_step_verification_settings=config.build_reference_verification_settings(),
+                    reference_verification_pwm_frequency_khz=config.UPO_CTRL_FREQUENCY_KHZ,
+                    reference_verification_pwm_high_time_ns=config.UPO_CTRL_HIGH_TIME_NS,
+                )
+            checked = verify_gain_equalization(
+                client, calibration_files, prepared=prepared, hardware_arguments=hardware,
+                generate_plots=not arguments.no_plots,
+            )
+        print(f"Реальная проверка GAIN: {checked['verification_directory']}")
+        print(f"Отчет измерений: {checked['report']}")
 
 
 if __name__ == "__main__":

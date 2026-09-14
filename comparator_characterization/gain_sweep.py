@@ -544,6 +544,9 @@ def analyze_gain_sweep(
         pixel_tables.append(pixels)
         summaries.append(summary)
         files = [analysis / "scurve_results.csv", analysis / "noise_fit_results.csv", gain_path, root / "metadata.json"]
+        base_configuration = metadata.get("base_pixel_configuration", {}).get("normalized_selected_pixels_csv")
+        if base_configuration:
+            files.append(root / base_configuration)
         if reference:
             files.append(root / reference)
         lineage.extend({"path": str(file), "sha256": file_sha256(file)} for file in files if file.is_file())
