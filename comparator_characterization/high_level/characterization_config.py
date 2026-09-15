@@ -67,7 +67,7 @@ SCURVE = ScurveConfig(
 # 6. Инжекция и REF. Наличие пути LUT не меняет явно выбранный режим.
 REFERENCE = ReferenceConfig(
     mode="manual",                        # lut / manual
-    steps_mv=(5, 10, 20, 30, 40, 50, 75, 100, 150, 250),
+    steps_mv=(10, 20, 50, 100, 200),
     manual_ref1=600, manual_ref2=800, manual_step_mv=100.0,
     code_limits=(500, 900),            # только LUT, оба кода включительно
     lut_voltage_unit="auto",           # auto / V / mV / uV

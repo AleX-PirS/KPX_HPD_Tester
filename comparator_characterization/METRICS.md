@@ -62,7 +62,7 @@ configuration_v2.json, включая разрешенные пути и SHA256 
 
 ## Шум: noise_statistics.csv и noise_fit_results.csv
 
-`repeat_count_total/valid/invalid` содержат число всех, пригодных и непригодных повторов. `repeat_count_saturated` и `repeat_fraction_saturated` описывают насыщение. `mean_count`, `median_count`, `std_count`, `sem_count`, `min_count`, `max_count`, `mad_count` считаются по пригодным повторам при одном пороге. `points` и `nonzero_points` описывают число точек кривой и число ненулевых точек.
+`repeat_count_total/valid/invalid` содержат число всех, пригодных и непригодных повторов. `repeat_count_saturated` и `repeat_fraction_saturated` описывают насыщение. `mean_count`, `median_count`, `std_count`, `sem_count`, `min_count`, `max_count`, `mad_count` считаются по пригодным повторам при одном пороге. `points` и `nonzero_points` описывают число пригодных числовых точек кривой и число ненулевых точек.
 
 | Поле | Расчет и интерпретация |
 |---|---|
@@ -75,6 +75,8 @@ configuration_v2.json, включая разрешенные пути и SHA256 
 | `candidate_center_fit_v`, `candidate_sigma_fit_v` | Пробная модель, сохраняемая и при ее последующей отбраковке. |
 | `centroid_applicable`, `maximum_estimator_applicable` | Применимость соответствующих оценивателей. |
 | `curve_shape`, `diagnostic_flags` | Форма кривой и ограничения: обрезанный пик, асимметрия, насыщение и другие признаки. |
+| `invalid_numeric_points` | Число исключенных точек с пустым или нечисловым порогом, кодом ЦАП либо средним счетом. Исходные CSV не изменяются. |
+| `sem_unavailable_points` | Число пригодных точек без конечного положительного SEM. При одном повторе это ожидаемо. Для весов используется медиана пригодных относительных SEM данной кривой, а если их нет, одинаковые веса. |
 | `scan_min_voltage_v`, `scan_max_voltage_v` | Реально измеренный диапазон данной кривой. |
 
 Для колокола C(V)=C0+A*exp(-(V-V0)^2/(2*sigma^2)); C0 оценивается через q10(C). Положительная часть выше 3% динамического диапазона аппроксимируется квадратичной функцией логарифма счета с весами, связанными с SEM. Для одностороннего отклика используется probit-модель края. Ширина этого колокола и sigma сигнальной S-кривой являются разными величинами.

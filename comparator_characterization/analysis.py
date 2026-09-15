@@ -343,15 +343,38 @@ def _edge_probit_fit(voltage: np.ndarray, counts: np.ndarray) -> dict[str, float
 
 
 def fit_noise_curve(group: pd.DataFrame, settings: AnalysisSettings) -> dict[str, Any]:
-    data = group.sort_values("threshold_voltage_v").copy()
+    data = group.copy()
+    for column in ("threshold_voltage_v", "threshold_dac_code", "mean_count"):
+        if column not in data:
+            raise ValueError(f"noise curve is missing required column: {column}")
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    if "sem_count" in data:
+        data["sem_count"] = pd.to_numeric(data["sem_count"], errors="coerce")
+    else:
+        data["sem_count"] = np.nan
+    required_finite = (
+        np.isfinite(data["threshold_voltage_v"])
+        & np.isfinite(data["threshold_dac_code"])
+        & np.isfinite(data["mean_count"])
+    )
+    invalid_numeric_points = int((~required_finite).sum())
+    data = data.loc[required_finite].sort_values("threshold_voltage_v").copy()
     voltage = data["threshold_voltage_v"].to_numpy(dtype=float)
     codes = data["threshold_dac_code"].to_numpy(dtype=float)
     counts = data["mean_count"].to_numpy(dtype=float)
     sem = data["sem_count"].to_numpy(dtype=float)
-    finite = np.isfinite(voltage) & np.isfinite(counts)
-    voltage, codes, counts, sem = voltage[finite], codes[finite], counts[finite], sem[finite]
+    sem_unavailable_points = int((~np.isfinite(sem) | (sem <= 0)).sum())
+    initial_flags: list[str] = []
+    if invalid_numeric_points:
+        initial_flags.append(f"invalid_numeric_curve_points_excluded:{invalid_numeric_points}")
+    if sem_unavailable_points:
+        initial_flags.append(
+            f"sem_unavailable_fallback_weight_used:{sem_unavailable_points}"
+        )
     result: dict[str, Any] = {
         "points": int(len(voltage)),
+        "invalid_numeric_points": invalid_numeric_points,
+        "sem_unavailable_points": sem_unavailable_points,
         "center_fit_v": float("nan"),
         "center_fit_uncertainty_v": float("nan"),
         "sigma_fit_v": float("nan"),
@@ -372,7 +395,7 @@ def fit_noise_curve(group: pd.DataFrame, settings: AnalysisSettings) -> dict[str
         "maximum_estimator_applicable": False,
         "center_selected_v": float("nan"),
         "center_selected_method": "none",
-        "diagnostic_flags": "[]",
+        "diagnostic_flags": json.dumps(initial_flags),
         "scan_min_voltage_v": float(np.min(voltage)) if len(voltage) else float("nan"),
         "scan_max_voltage_v": float(np.max(voltage)) if len(voltage) else float("nan"),
         "nonzero_points": int(np.sum(counts > 0)),
@@ -383,7 +406,7 @@ def fit_noise_curve(group: pd.DataFrame, settings: AnalysisSettings) -> dict[str
     if len(voltage) < settings.noise_min_points:
         return result
 
-    flags: list[str] = []
+    flags = initial_flags
     if "repeat_count_saturated" in data and (
         pd.to_numeric(data["repeat_count_saturated"], errors="coerce").fillna(0) > 0
     ).any():
@@ -569,12 +592,29 @@ def fit_noise_statistics(
         "row",
     ]
     settings.validate()
+    required = set(group_columns) | {
+        "threshold_voltage_v", "threshold_dac_code", "mean_count"
+    }
+    missing = sorted(required - set(statistics.columns))
+    if missing:
+        raise ValueError(
+            "noise statistics are missing required column(s): " + ", ".join(missing)
+        )
+    prepared = statistics.copy()
+    for name in (
+        "threshold_voltage_v", "threshold_dac_code", "mean_count", "sem_count",
+        "repeat_count_saturated",
+    ):
+        if name in prepared:
+            prepared[name] = pd.to_numeric(prepared[name], errors="coerce")
+    if "sem_count" not in prepared:
+        prepared["sem_count"] = np.nan
     # Workers need only the numeric curve, not all raw/metadata columns.
     needed = [name for name in (
         "threshold_voltage_v", "threshold_dac_code", "mean_count", "sem_count",
         "repeat_count_saturated",
-    ) if name in statistics]
-    groups = statistics[group_columns + needed].groupby(group_columns, dropna=False, sort=True)
+    ) if name in prepared]
+    groups = prepared[group_columns + needed].groupby(group_columns, dropna=False, sort=True)
 
     def jobs():
         for keys, group in groups:
