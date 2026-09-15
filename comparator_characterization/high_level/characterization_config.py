@@ -106,7 +106,7 @@ from .config_runtime import (
     base_pixel_config, build_all_window_settings, build_analysis_settings, build_burst_settings, build_generator, build_oscilloscope,
     build_reference_verification_settings, build_settings, build_upo_client,
     build_upo_pwm_settings, configuration_snapshot, configure_runtime_logging,
-    gain_hardware_arguments, gain_sweep_enabled, injection_hardware_arguments,
+    gain_check_results_root, gain_hardware_arguments, gain_sweep_enabled, injection_hardware_arguments,
     injection_voltage_steps_v, noise_reference_path, normalized_ctrl_source,
     print_recommendation_paths, print_result_paths, reference_calibration_files,
     reference_hardware_arguments, require_hardware_run_enabled,
