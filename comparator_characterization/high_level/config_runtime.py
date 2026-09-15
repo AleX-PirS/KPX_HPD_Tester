@@ -52,6 +52,14 @@ def base_pixel_config() -> Path | None:
     return cfg.PATHS.require("base_pixel_config", kind="file") if cfg.PATHS.base_pixel_config is not None else None
 
 
+def gain_check_results_root() -> Path:
+    if cfg.PATHS.results_dir is None:
+        raise ValueError("Заполните RESULTS_DIR в .env")
+    if cfg.PATHS.results_dir.exists() and cfg.PATHS.results_dir.is_file():
+        raise ValueError("RESULTS_DIR должен быть каталогом, не файлом")
+    return cfg.PATHS.results_dir / "gain_check"
+
+
 def noise_reference_path() -> Path:
     path = cfg.PATHS.require("scurve_noise_reference", kind="directory")
     if not (path / "metadata.json").is_file():

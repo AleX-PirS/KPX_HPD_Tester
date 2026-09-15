@@ -5,7 +5,8 @@ import copy
 from dataclasses import dataclass
 import json
 import math
-from pathlib import Path
+import os
+from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping
 
 import numpy as np
@@ -26,6 +27,8 @@ from .workflow import _ordered_scurve_codes, _preflight_scan_coverage, character
 
 WINDOWS = ("AB", "BC", "CD")
 RESPONSE_KEY = CONTEXT + ["target_gain_code", "column", "row", "injection_voltage_step_v"]
+WINDOWS_MAX_FILE_PATH = 259
+WINDOWS_MAX_DIRECTORY_PATH = 247
 
 
 @dataclass
@@ -49,6 +52,70 @@ class GainVerificationJob:
     def name(self) -> str:
         return gain_context_name({"window": self.window, "measurement_fclk_mhz": self.clock,
                                   "injection_pattern": self.pattern}) + f"/target_gain_{self.target:02d}"
+
+
+def _verification_run_id(index: int, job: GainVerificationJob) -> str:
+    return f"r{index:03d}_{job.window}_g{job.target:02d}"
+
+
+def gain_verification_windows_path_budget(
+    verification_root: str | Path, jobs: list[GainVerificationJob]
+) -> dict[str, int | str]:
+    """Conservative legacy Win32 path estimate for the deepest temporary raw file."""
+    root_text = str(verification_root)
+    root = PureWindowsPath(root_text)
+    if not root.is_absolute():
+        root = PureWindowsPath(str(Path(verification_root).resolve()))
+    longest_file = PureWindowsPath()
+    longest_directory = PureWindowsPath()
+    for index, job in enumerate(jobs, 1):
+        experiment = (
+            root / "v9999" / _verification_run_id(index, job) / "x"
+            / f"20991231T235959Z_{job.window}_99"
+        )
+        stage = f"pulse_amplitude_999_pattern_{job.pattern}"
+        directory = (
+            experiment / "raw" / "scurve" / stage / "adaptive" / "dac_1023"
+        )
+        temporary = directory / (
+            ".background_amp_12345678_repeat_999999_1234567890abcdef.csv.abcdefgh.tmp"
+        )
+        if len(str(temporary)) > len(str(longest_file)):
+            longest_file = temporary
+        if len(str(directory)) > len(str(longest_directory)):
+            longest_directory = directory
+    return {
+        "max_file_path_length": len(str(longest_file)),
+        "max_directory_path_length": len(str(longest_directory)),
+        "example_path": str(longest_file),
+    }
+
+
+def validate_gain_verification_storage(
+    verification_root: str | Path,
+    jobs: list[GainVerificationJob],
+    *,
+    enforce_windows_limit: bool | None = None,
+) -> dict[str, int | str]:
+    """Reject an unsafe Windows output root before any instrument is opened."""
+    if not jobs:
+        raise ValueError("GAIN verification has no prepared jobs")
+    root = Path(verification_root)
+    if root.exists() and not root.is_dir():
+        raise ValueError(f"GAIN verification output must be a directory: {root}")
+    budget = gain_verification_windows_path_budget(verification_root, jobs)
+    enforce = os.name == "nt" if enforce_windows_limit is None else enforce_windows_limit
+    if enforce and (
+        int(budget["max_file_path_length"]) > WINDOWS_MAX_FILE_PATH
+        or int(budget["max_directory_path_length"]) > WINDOWS_MAX_DIRECTORY_PATH
+    ):
+        raise ValueError(
+            "GAIN verification output path is too long for Windows: "
+            f"estimated file path {budget['max_file_path_length']} characters, "
+            f"directory {budget['max_directory_path_length']}. "
+            "Shorten RESULTS_DIR in .env; the check ran before opening instruments."
+        )
+    return budget
 
 
 def _select(frame: pd.DataFrame, context: tuple) -> pd.DataFrame:
@@ -144,6 +211,7 @@ def prepare_gain_verification(
     *, settings: CharacterizationSettings | None = None,
     all_windows: bool = False, reference_window: str | None = None,
     allow_unresolved: bool = False, background_mode: str = "paired",
+    verification_root: str | Path | None = None,
 ) -> tuple[Path, list[GainVerificationJob]]:
     """Read-only preflight of ALL jobs; call before opening instruments."""
     directory = Path(gain_analysis["analysis_directory"] if isinstance(gain_analysis, Mapping) else gain_analysis).resolve()
@@ -283,6 +351,8 @@ def prepare_gain_verification(
             for job in related:
                 job.base_configs = dict(common_base)
                 job.common_window_configuration = True
+    if verification_root is not None:
+        validate_gain_verification_storage(verification_root, jobs)
     return directory, jobs
 
 
@@ -404,6 +474,7 @@ def verify_gain_equalization(
     client: Any, threshold_calibration_files: Mapping, *,
     prepared: tuple[Path, list[GainVerificationJob]], hardware_arguments: Mapping | None = None,
     generate_plots: bool = True, configuration_metadata: Mapping | None = None,
+    verification_root: str | Path | None = None,
 ) -> dict:
     """Programs real pixel maps through the existing characterization workflow."""
     source, jobs = prepared
@@ -427,7 +498,8 @@ def verify_gain_equalization(
             saved = job.metadata.get("acquisition_sequence", {}).get("upo_pwm_settings", {})
             if any(saved.get(name) != getattr(executor.settings, name) for name in ("frequency_khz", "high_time_ns")):
                 raise ValueError("verification PWM timing differs from the source sweep")
-    parent = source / "hardware_verification"
+    parent = Path(verification_root).resolve() if verification_root is not None else source / "hardware_verification"
+    validate_gain_verification_storage(parent, jobs)
     version = 1
     while (parent / f"v{version:03d}").exists():
         version += 1
@@ -440,8 +512,15 @@ def verify_gain_equalization(
     outputs = {"verification_directory": directory, "runs": {}, "plots": {}}
     comparisons, actual_tables = [], []
     try:
-        for job in jobs:
-            run_root = directory / job.name
+        for run_index, job in enumerate(jobs, 1):
+            run_id = _verification_run_id(run_index, job)
+            run_root = directory / run_id
+            manifest["runs"][job.name] = {
+                "status": "prepared", "run_id": run_id, "window": job.window,
+                "measurement_fclk_mhz": job.clock, "injection_pattern": job.pattern,
+                "target_gain_code": job.target, "map_source_window": job.map_window,
+            }
+            atomic_write_json(directory / "gain_verification_manifest.json", manifest)
             map_path = atomic_write_table(run_root / "inputs" / "proposed_gain_map.csv", job.gain_map)
             atomic_write_table(run_root / "inputs" / "expected_response.csv", job.expected)
             main_clock = int(job.metadata["run_options"]["initialization_fclk_mhz"])
@@ -451,7 +530,7 @@ def verify_gain_equalization(
                 pixels=list(zip(job.gain_map.column.astype(int), job.gain_map.row.astype(int))),
                 bad_pixel_map=job.metadata.get("bad_pixel_mask"), base_pixel_config=job.base_configs,
                 gain_map={(int(row.column), int(row.row)): int(row.gain) for row in job.gain_map.itertuples(index=False)},
-                results_root=run_root / "experiments", settings=job.settings,
+                results_root=run_root / "x", settings=job.settings,
                 run_noise_scan=True, run_equalization=False, run_scurve=True,
                 generate_analysis_plots=generate_plots,
                 replay_reference_selections=job.reference_pairs,
@@ -467,8 +546,10 @@ def verify_gain_equalization(
             )
             if result.status != "complete" or result.analysis_path is None:
                 raise RuntimeError("hardware characterization did not finish with saved analysis")
-            manifest["runs"][job.name] = {"status": "measurement_complete", "experiment_path": str(result.experiment_path),
-                                          "analysis_path": str(result.analysis_path), "map_source_window": job.map_window}
+            manifest["runs"][job.name].update(
+                status="measurement_complete", experiment_path=str(result.experiment_path),
+                analysis_path=str(result.analysis_path), map_source_window=job.map_window,
+            )
             atomic_write_json(directory / "gain_verification_manifest.json", manifest)
             actual = measured_gain_response(job, Path(result.analysis_path))
             comparison, summary = compare_gain_response(job.expected, actual)
@@ -482,14 +563,18 @@ def verify_gain_equalization(
             verified_map = verified_map.merge(counts.rename(columns={"sum": "valid_amplitude_step_count", "size": "required_step_count"}), on=["column", "row"], how="left", validate="one_to_one")
             verified_map["measured_in_mixed_gain_matrix"] = True
             verified_map["all_response_steps_valid"] = verified_map.valid_amplitude_step_count == verified_map.required_step_count
-            paths["measured_gain_map"] = atomic_write_table(run_root / "measured_gain_map.csv", verified_map)
+            paths["measured_gain_map"] = atomic_write_table(
+                run_root / "measured_gain_map.csv", verified_map
+            )
             paths["experiment_path"] = result.experiment_path
             outputs["runs"][job.name] = paths
             if generate_plots:
                 from .gain_verification_plots import plot_gain_verification
                 outputs["plots"].update(plot_gain_verification(comparison, directory=run_root / "plots", settings=job.settings.analysis))
-            manifest["runs"][job.name] = {"status": "complete", "experiment_path": str(result.experiment_path),
-                                          "analysis_path": str(result.analysis_path), "map_source_window": job.map_window}
+            manifest["runs"][job.name].update(
+                status="complete", experiment_path=str(result.experiment_path),
+                analysis_path=str(result.analysis_path), map_source_window=job.map_window,
+            )
             atomic_write_json(directory / "gain_verification_manifest.json", manifest)
         combined = pd.concat(comparisons, ignore_index=True)
         outputs["comparison"] = atomic_write_table(directory / "gain_verification_comparison.csv", combined)

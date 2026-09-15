@@ -48,12 +48,14 @@ def main() -> None:
         config.require_hardware_run_enabled()
         from comparator_characterization.gain_verification import prepare_gain_verification, verify_gain_equalization
         calibration_files = config.threshold_calibration_files()
+        verification_root = config.gain_check_results_root()
         prepared = prepare_gain_verification(
             result, calibration_files, settings=config.build_settings(),
             all_windows=config.GAIN_EQUALIZATION.check_all_windows,
             reference_window=config.GAIN_EQUALIZATION.map_reference_window,
             allow_unresolved=config.metadata.GAIN_CHECK_ALLOW_UNRESOLVED,
             background_mode=config.metadata.GAIN_CHECK_BACKGROUND_MODE,
+            verification_root=verification_root,
         )
         # Reject acquisition timing changes BEFORE any device is opened.
         for job in prepared[1]:
@@ -84,6 +86,7 @@ def main() -> None:
                 client, calibration_files, prepared=prepared, hardware_arguments=hardware,
                 generate_plots=config.PLOTS.generate and not arguments.no_plots,
                 configuration_metadata=snapshot,
+                verification_root=verification_root,
             )
         print(f"Реальная проверка GAIN: {checked['verification_directory']}")
         print(f"Отчет измерений: {checked['report']}")
