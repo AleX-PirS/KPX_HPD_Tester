@@ -1004,6 +1004,8 @@ def characterize_comparator(
     allow_scurve_without_noise_reference: bool = False,
     eo_overrides: Mapping[str, int] | None = None,
     generate_analysis_plots: bool = True,
+    analyze_result: bool = True,
+    upper_threshold_role: str = "non_limiting",
 ) -> CharacterizationResult:
     """Characterize one AB, BC or CD counting window.
 
@@ -1025,6 +1027,12 @@ def characterize_comparator(
     oscilloscope before any noise or S-curve acquisition.
     """
 
+    if upper_threshold_role not in {"non_limiting", "operating"}:
+        raise ValueError("upper_threshold_role must be non_limiting or operating")
+    if upper_threshold_role == "operating" and analyze_result:
+        raise ValueError("operating-window scans require analyze_result=False; use count-response grid analysis")
+    if not isinstance(analyze_result, bool):
+        raise TypeError("analyze_result must be bool")
     if (
         noise_reference_experiment is not None
         and trim_reference_experiment is not None
@@ -1438,6 +1446,8 @@ def characterize_comparator(
             ),
             "calibration_direction": upper_calibration.direction,
         }
+    if upper_threshold_role == "operating":
+        upper_selection["selection_method"] = "explicit_operating_upper_boundary"
 
     # Reject an incompatible external noise reference before creating a new
     # experiment or sending any command to UPO. The complete raw-data check and
@@ -1578,6 +1588,7 @@ def characterize_comparator(
             "window": spec.name,
             "comparator_under_test": spec.comparator,
             "upper_comparator": spec.upper_comparator,
+            "upper_threshold_role": upper_threshold_role,
             "threshold_dac": spec.threshold_dac,
             "upper_threshold_dac": spec.upper_threshold_dac,
             "upper_non_limiting_selection": upper_selection,
@@ -2928,6 +2939,11 @@ def characterize_comparator(
             overall_percent_estimate=97.0,
         )
         store.set_status("complete")
+        if not analyze_result:
+            store.log_status("Raw-измерения сохранены; стандартный однокраевой анализ отключен",
+                             overall_percent_estimate=100.0)
+            return CharacterizationResult(store.root, None, target_voltage,
+                                          dict(final_trim_map), "complete")
         analysis_outputs = analyze_saved_experiment(
             store.root,
             settings=selected_settings.analysis,

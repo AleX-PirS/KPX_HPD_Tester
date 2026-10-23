@@ -53,6 +53,7 @@ class ScurveConfig:
     background_mode: str
     tile_mode: str
     dac_range: tuple[int | None, int | None]
+    scan_coverage: str = "positive"
 
 
 @dataclass
@@ -111,3 +112,8 @@ class PlotConfig:
 class DashboardConfig:
     port: int
     open_browser: bool
+
+
+@dataclass
+class MethodVerificationConfig:
+    repeat_scans: int = 3

@@ -18,10 +18,10 @@ from comparator_characterization.models import MATRIX_ROWS, OWNED_COLUMNS, get_w
 from . import characterization_config as cfg
 
 TESTS = ("full", "noise", "equalize", "trim_sweep", "scurve", "clock_noise", "crosstalk",
-         "gain_equalization", "offline", "all_windows", "ref_preview", "reference_verification", "dashboard", "eo_sweep")
+         "gain_equalization", "offline", "all_windows", "ref_preview", "reference_verification", "dashboard", "eo_sweep", "method_verification")
 HARDWARE_TESTS = set(TESTS) - {"gain_equalization", "offline", "ref_preview", "dashboard"}
-SCURVE_TESTS = {"full", "all_windows", "scurve", "clock_noise", "crosstalk", "eo_sweep"}
-NOISE_TESTS = {"full", "all_windows", "noise", "equalize", "trim_sweep", "eo_sweep"}
+SCURVE_TESTS = {"full", "all_windows", "scurve", "clock_noise", "crosstalk", "eo_sweep", "method_verification"}
+NOISE_TESTS = {"full", "all_windows", "noise", "equalize", "trim_sweep", "eo_sweep", "method_verification"}
 
 
 def configure_runtime_logging() -> None:
@@ -152,6 +152,7 @@ def build_settings(*, injection_patterns=None, scan_all_trim_codes: bool = False
     settings.scurve.repeats = cfg.SCURVE.repeats
     settings.scurve.background_mode = cfg.SCURVE.background_mode
     settings.scurve.tile_mode = cfg.SCURVE.tile_mode
+    settings.scurve.scan_coverage = cfg.SCURVE.scan_coverage
     settings.scurve.coarse_low_code, settings.scurve.coarse_high_code = cfg.SCURVE.dac_range
     settings.scurve.minimum_reference_code, settings.scurve.maximum_reference_code = cfg.REFERENCE.code_limits
     settings.validate()
@@ -248,12 +249,12 @@ def injection_hardware_arguments(generator: Any) -> dict:
 
 def configuration_snapshot(test: str | None = None) -> dict:
     blocks = ("RUN", "CONNECTION", "ACQUISITION", "NOISE", "SCURVE", "REFERENCE", "CLOCK_NOISE",
-              "GAIN_EQUALIZATION", "ALL_WINDOWS", "EO_SWEEP", "PLOTS", "DASHBOARD")
+              "GAIN_EQUALIZATION", "ALL_WINDOWS", "EO_SWEEP", "PLOTS", "DASHBOARD", "METHOD_VERIFICATION")
     return {"configuration_version": 2, "selected_test": test or cfg.RUN.test,
             **cfg.PATHS.snapshot(), "blocks": {name: asdict(getattr(cfg, name)) for name in blocks},
             "metadata": {name: asdict(getattr(cfg.metadata, name)) for name in (
                 "NOISE", "EQUALIZATION", "SCURVE", "ANALYSIS", "GAIN_EQUALIZATION", "ALL_WINDOWS",
-                "REFERENCE_VERIFICATION", "BURST")},
+                "REFERENCE_VERIFICATION", "BURST", "METHOD_VERIFICATION")},
             "gain_check": {"allow_unresolved": cfg.metadata.GAIN_CHECK_ALLOW_UNRESOLVED,
                            "background_mode": cfg.metadata.GAIN_CHECK_BACKGROUND_MODE},
             "instrument_metadata": {"oscilloscope_timeout_ms": cfg.metadata.OSCILLOSCOPE_TIMEOUT_MS,
@@ -327,6 +328,35 @@ def validate_configuration(test: str | None = None, *, check_paths: bool = True,
     if selected == "reference_verification" and not cfg.REFERENCE.verify_with_scope:
         raise ValueError("reference_verification: включите REFERENCE.verify_with_scope")
     active, warnings = {}, []
+    if selected == "method_verification":
+        from comparator_characterization.method_verification import validate_method_storage
+        if cfg.PATHS.results_dir is None:
+            raise ValueError("Заполните RESULTS_DIR в .env")
+        validate_method_storage(cfg.PATHS.results_dir)
+        options = copy.deepcopy(cfg.metadata.METHOD_VERIFICATION)
+        options.repeat_scans = cfg.METHOD_VERIFICATION.repeat_scans
+        options.validate()
+        method_windows = ("AB","BC","CD") if window=="ALL" else (window,)
+        if set(options.upper_threshold_codes)-set(method_windows):
+            raise ValueError("Рабочие верхние пороги заданы для невыбранных окон")
+        if gain_sweep_enabled():
+            raise ValueError("method_verification: нужен один SCURVE.gain или gain_source='csv'")
+        if cfg.RUN.resume:
+            raise ValueError("method_verification: RUN.resume=False; завершенные серии доступны через offline")
+        if cfg.PATHS.method_trim_reference is not None:
+            active["METHOD_TRIM_REFERENCE"] = cfg.PATHS.method_trim_reference
+            if check_paths:
+                reference = cfg.PATHS.require("method_trim_reference", kind="directory")
+                from comparator_characterization.method_verification import prepare_frozen_maps
+                from comparator_characterization.pixel_masks import normalize_bad_pixel_map
+                bad = set(normalize_bad_pixel_map(cfg.PATHS.bad_pixel_mask))
+                prepare_frozen_maps(reference, ("AB","BC","CD") if window=="ALL" else (window,),
+                    tuple(p for p in resolve_pixels(cfg.RUN.pixels) if p not in bad),
+                    base_pixel_config=base_pixel_config(),
+                    calibrations=load_threshold_dac_calibrations(threshold_calibration_files()))
+        warnings.append("method_verification: paired background, шаг 1 во всем заданном S-диапазоне; финальный Q-sweep не запускается")
+        if options.threshold_tolerance_v is None or options.systematic_error_bound_v is None:
+            warnings.append("Допуск/систематическая граница не заданы: будут метрики без подтверждения допуска")
     if selected in SCURVE_TESTS:
         if check_paths or cfg.SCURVE.gain_source == "uniform":
             gain_hardware_arguments()
@@ -384,6 +414,10 @@ def validate_configuration(test: str | None = None, *, check_paths: bool = True,
     if physical:
         if check_paths:
             calibrations = load_threshold_dac_calibrations(threshold_calibration_files())
+            if selected=="method_verification":
+                for child,codes in cfg.metadata.METHOD_VERIFICATION.upper_threshold_codes.items():
+                    for code in codes:
+                        calibrations[get_window_spec(child).upper_threshold_dac].lookup(code)
             for child in ("AB", "BC", "CD") if window == "ALL" else (window,):
                 calibration = calibrations[get_window_spec(child).threshold_dac]
                 if selected in NOISE_TESTS:

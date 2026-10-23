@@ -81,12 +81,16 @@ from .multi_window import (
     characterize_all_windows,
     interactive_all_window_noise_pause,
 )
+from .method_verification import (
+    MethodVerificationSettings, run_method_verification, analyze_method_verification,
+)
 from .sweep import (
     ParameterSweepResult, SweepNoiseExposure, characterize_parameter_sweep,
     interactive_noise_exposure_pause,
 )
 
 __all__ = [
+    "MethodVerificationSettings", "run_method_verification", "analyze_method_verification",
     "GainEqualizationSettings",
     "prepare_gain_verification",
     "verify_gain_equalization",

@@ -9,7 +9,7 @@ from pathlib import Path
 from .config_schema import (
     AcquisitionConfig, AllWindowsConfig, ClockNoiseConfig, ConnectionConfig,
     DashboardConfig, EoSweepConfig, GainEqualizationConfig, NoiseConfig,
-    PlotConfig, ReferenceConfig, RunConfig, ScurveConfig,
+    PlotConfig, ReferenceConfig, RunConfig, ScurveConfig, MethodVerificationConfig,
 )
 from .env_paths import load_paths
 from . import metadata
@@ -20,9 +20,9 @@ PATHS = load_paths(PROJECT_ROOT / ".env", project_root=PROJECT_ROOT)
 # 1. Какой тест запустить. Нужные ссылки для каждого теста: README.md рядом.
 # full / noise / equalize / trim_sweep / scurve / clock_noise / crosstalk /
 # gain_equalization / offline / all_windows / ref_preview / reference_verification /
-# dashboard / eo_sweep
+# dashboard / eo_sweep / method_verification
 RUN = RunConfig(
-    test="full", window="CD",         # окно AB / BC / CD / ALL
+    test="method_verification", window="ALL",         # окно AB / BC / CD / ALL
     pixels="all",                     # либо [(16, 0), (20, 7)]
     hardware_enabled=True,            # True разрешает реальный стенд
     resume=False,                      # True активирует resume-ссылку из .env
@@ -62,14 +62,15 @@ SCURVE = ScurveConfig(
     background_mode="sparse",          # sparse / paired
     tile_mode="tile_crosstalk",         # tile_measurement / tile_crosstalk
     dac_range=(100, 900),              # low, high; (None, None): весь LUT
+    scan_coverage="positive",         # positive / full_bipolar (все коды, оба края)
 )
 
 # 6. Инжекция и REF. Наличие пути LUT не меняет явно выбранный режим.
 REFERENCE = ReferenceConfig(
-    mode="manual",                        # lut / manual
-    steps_mv=(10, 20, 50, 100, 200),
+    mode="lut",                        # lut / manual
+    steps_mv=(5, 10, 20, 30, 40, 50, 75, 100, 150, 250),
     manual_ref1=600, manual_ref2=800, manual_step_mv=100.0,
-    code_limits=(500, 900),            # только LUT, оба кода включительно
+    code_limits=(401, 900),            # только LUT, оба кода включительно
     lut_voltage_unit="auto",           # auto / V / mV / uV
     verify_with_scope=False,
 )
@@ -80,7 +81,7 @@ CLOCK_NOISE = ClockNoiseConfig(fclk_mhz=(5, 10, 25, 50, 75, 100, 125, 150), step
 # 8. Офлайн-подбор GAIN + опциональная реальная проверка полученных карт.
 # Источник: .env GAIN_SWEEP_SOURCE. Веса/статистика/fit quality в metadata.py.
 GAIN_EQUALIZATION = GainEqualizationConfig(
-    target_codes=[4, 10, 22], check_map=False, check_all_windows=False,
+    target_codes=[4, 10, 20], check_map=False, check_all_windows=False,
     map_reference_window=None,        # для check_all_windows=True задайте AB / BC / CD
 )
 
@@ -100,6 +101,13 @@ PLOTS = PlotConfig(
     dpi=300, save_pdf=True, generate=True,
 )
 DASHBOARD = DashboardConfig(port=0, open_browser=True)
+
+# 12. Проверка методики: все карты фиксируются, затем новые независимые сканы.
+# Ссылка на готовый ALL/noise тест: METHOD_TRIM_REFERENCE в .env.
+# Пустая ссылка: сначала однократная эквализация каждого выбранного окна.
+# Используются один GAIN/GAIN-map и текущий диапазон SCURVE.dac_range.
+METHOD_VERIFICATION = MethodVerificationConfig(repeat_scans=3)
+# Допуски, систематические границы и рабочие верхние пороги: metadata.py.
 
 # Реализация сборки/проверки отделена от пользовательских настроек.
 from .config_runtime import (

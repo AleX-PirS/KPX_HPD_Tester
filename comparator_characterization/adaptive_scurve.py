@@ -52,6 +52,7 @@ def acquire_adaptive_scurve(*, backend, store, calibration, spec, pixels, trim_m
         configuration_directory = configuration_directory/f'gain_{int(gain_sweep_code):02d}'
     store.write_table(configuration_directory/f'{stage}_{group.group_id}.csv', pd.DataFrame(rows))
     descending = settings.scan_descending
+    full_coverage = settings.scan_coverage == 'full_bipolar'
     direction = -1 if descending else 1
     planned = tuple(sorted(set(int(c) for c in codes), reverse=descending))
     if not planned:
@@ -135,7 +136,7 @@ def acquire_adaptive_scurve(*, backend, store, calibration, spec, pixels, trim_m
         for pixel, value in zip(active, bg):
             if np.isfinite(value) and value>effective_n*settings.baseline_noise_count_multiplier:
                 noise_seen_pixels.add(pixel)
-        repeats = settings.repeats if crosstalk or not settings.adaptive_repeats or not all_valid or transition else 1
+        repeats = settings.repeats if full_coverage or crosstalk or not settings.adaptive_repeats or not all_valid or transition else 1
         for repeat in range(1, repeats):
             if settings.background_mode=='paired' or crosstalk:
                 shot(code, repeat, 'background')
@@ -151,7 +152,7 @@ def acquire_adaptive_scurve(*, backend, store, calibration, spec, pixels, trim_m
         gap = abs(code-previous_code) if previous_code is not None else 1
         origin = last_zero_code if response and not seen_response and last_zero_code is not None else previous_code
         origin_gap = abs(code-origin) if origin is not None else 1
-        backfill = fresh and origin_gap>1 and (response and not seen_response or transition or contaminated)
+        backfill = not full_coverage and fresh and origin_gap>1 and (response and not seen_response or transition or contaminated)
         seen_response |= response
         visited.add(code)
         if fresh:
@@ -165,12 +166,12 @@ def acquire_adaptive_scurve(*, backend, store, calibration, spec, pixels, trim_m
             'transition_10_90':transition,'noise_reference_band':near_noise,'noise_started':noise_started,
             'effective_plateau_count_online':effective_n,'weak_signal_dense':weak,
             'backfill_coarse_gap':backfill,'noise_tail_streak':tail_streak})
-        if settings.baseline_noise_stop_enabled and not backfill and tail_streak>=settings.baseline_noise_consecutive_codes:
+        if not full_coverage and settings.baseline_noise_stop_enabled and not backfill and tail_streak>=settings.baseline_noise_consecutive_codes:
             stop_event = {'stage':stage,'scan_phase':scan_phase,'injection_group_id':group.group_id,
                 'measurement_fclk_mhz':measurement_fclk_mhz,'stop_code':code,
                 'reason':'noise_bell_descended_to_measured_plateau_N','timestamp_utc':utc_now_text()}
             break
-        if (searching_high_zero and all_valid and response and code==high
+        if (not full_coverage and searching_high_zero and all_valid and response and code==high
                 and expansion_rounds<settings.max_expand_rounds and high<calibration.max_code):
             next_code = min(calibration.max_code, high+settings.expand_codes)
             high = next_code
@@ -183,7 +184,7 @@ def acquire_adaptive_scurve(*, backend, store, calibration, spec, pixels, trim_m
             next_code = origin+direction
         else:
             dense = not all_valid or near_noise or noise_started or transition or seen_response and (weak or full_plateau_streak<3)
-            next_code = code+direction*(1 if dense else settings.coarse_step)
+            next_code = code+direction*(1 if full_coverage or dense else settings.coarse_step)
             if band is not None:
                 edge = band[1] if descending else band[0]
                 if min(code,next_code)<edge<max(code,next_code):

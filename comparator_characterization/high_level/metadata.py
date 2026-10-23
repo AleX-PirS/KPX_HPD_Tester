@@ -62,7 +62,7 @@ GAIN_EQUALIZATION = GainEqualizationSettings(
     minimum_gain_fit_r2=0.98, include_poor_fits=False, allow_shared_noise_baseline=True,
 )
 GAIN_CHECK_ALLOW_UNRESOLVED = False
-GAIN_CHECK_BACKGROUND_MODE = "sparse"
+GAIN_CHECK_BACKGROUND_MODE = "paired"
 
 ALL_WINDOWS = AllWindowSettings(
     common_shift_z_threshold=3.0, common_shift_max_differential_z=1.0,
@@ -83,6 +83,20 @@ REFERENCE_VERIFICATION = ReferenceStepVerificationSettings(
 )
 OSCILLOSCOPE_TIMEOUT_MS = 5_000
 UPO_PWM_EDGE_COUNT_UNCERTAINTY = 1
+
+# Проверка методики. None сохраняет результаты, но НЕ подтверждает допуск.
+from comparator_characterization.method_verification import MethodVerificationSettings
+METHOD_VERIFICATION = MethodVerificationSettings(
+    alternate_directions=True,
+    threshold_tolerance_v=None,
+    systematic_error_bound_v=None,
+    confidence_alpha=0.05,
+    counter_operator_validated=False,
+    normal_repeat_estimates_validated=False,
+    # Заполнить реальными рабочими кодами, например {"BC": (код1, код2)}.
+    # Коды не выбираются автоматически из представления о полярности ЦАП.
+    upper_threshold_codes={},
+)
 
 # Резервный CTRL. Задержка от GET_SHOT, а не от реального shutter.
 BURST = KeysightBurstSettings(channel=1, shutter_start_delay_s=0.8, post_burst_guard_s=0.1)

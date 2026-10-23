@@ -18,6 +18,7 @@ MODULES = {
     "all_windows": "run_all_windows", "ref_preview": "preview_ref_selection",
     "reference_verification": "run_reference_verification", "dashboard": "run_plot_dashboard",
     "eo_sweep": "run_eo_parameter_sweep",
+    "method_verification": "run_method_verification",
 }
 
 

@@ -16,6 +16,7 @@ KEYS = {
     "CLOCK_TRIM_REFERENCE": "clock_trim_reference", "GAIN_SWEEP_SOURCE": "gain_sweep_source",
     "OFFLINE_SOURCE": "offline_source", "RESUME_EXPERIMENT": "resume_experiment",
     "EO_SWEEP_RESUME": "eo_sweep_resume",
+    "METHOD_TRIM_REFERENCE": "method_trim_reference",
 }
 
 
@@ -39,6 +40,7 @@ class ExperimentPaths:
     offline_source: Path | None = None
     resume_experiment: Path | None = None
     eo_sweep_resume: Path | None = None
+    method_trim_reference: Path | None = None
 
     def key(self, attribute: str) -> str:
         return next(key for key, value in KEYS.items() if value == attribute)

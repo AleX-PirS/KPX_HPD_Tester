@@ -28,7 +28,11 @@ def main():
     settings = config.build_analysis_settings()
     generate = config.PLOTS.generate and not arguments.no_plots
     metadata = root / "metadata.json"
-    if metadata.is_file():
+    if (root/"method_manifest.json").is_file():
+        from comparator_characterization.method_verification import analyze_method_verification
+        # Scientific settings come from the saved manifest; plot style is current.
+        result = analyze_method_verification(root, plot_settings=settings, generate_plots=generate)
+    elif metadata.is_file():
         document = json.loads(metadata.read_text(encoding="utf-8"))
         if str(document.get("window", "")).upper() == "ALL":
             result = analyze_all_windows(root, settings=settings,

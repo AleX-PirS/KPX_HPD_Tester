@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pixel_matrix import MATRIX_ROWS, OWNED_COLUMNS
 
 
-FRAMEWORK_VERSION = "2.0.0"
+FRAMEWORK_VERSION = "2.1.0"
 
 COMPARATOR_THRESHOLD_DACS = ("DAC_CMP_A", "DAC_CMP_B", "DAC_CMP_C", "DAC_CMP_D")
 INACTIVE_COMPARATOR_THRESHOLD_CODE = 1023
@@ -129,6 +129,7 @@ def resolve_pixels(
 
 @dataclass
 class NoiseScanSettings:
+    scan_descending: bool = False
     noise_repeats: int = 10
     settling_time_s: float = 0.1
     # MGPDLab/UPO controls the real exposure. This value is metadata and must
@@ -159,6 +160,8 @@ class NoiseScanSettings:
     def validate(self) -> None:
         if self.noise_repeats < 2:
             raise ValueError("noise_repeats must be at least 2")
+        if not isinstance(self.scan_descending, bool):
+            raise TypeError("noise scan_descending must be bool")
         if self.settling_time_s < 0:
             raise ValueError("settling_time_s must be >= 0")
         if self.shutter_duration_s is not None and self.shutter_duration_s <= 0:
@@ -260,6 +263,9 @@ class EqualizationSettings:
 
 @dataclass
 class ScurveSettings:
+    # Full coverage preserves both measured outer edges. It never reflects a
+    # branch and uses step 1 plus all requested repeats throughout the interval.
+    scan_coverage: str = "positive"
     # One SQU period produces one falling CTRL edge and one requested event.
     n_injections: int = 1000
     repeats: int = 1
@@ -317,6 +323,8 @@ class ScurveSettings:
     def validate(self) -> None:
         if self.n_injections <= 0:
             raise ValueError("n_injections must be positive")
+        if self.scan_coverage not in {"positive", "full_bipolar"}:
+            raise ValueError("scan_coverage must be positive or full_bipolar")
         if self.repeats <= 0:
             raise ValueError("S-curve repeats must be positive")
         if self.shutter_duration_s is not None and self.shutter_duration_s <= 0:

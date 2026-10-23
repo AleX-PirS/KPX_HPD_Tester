@@ -256,6 +256,8 @@ def _raw_rows(
                 "scurve_tile_mode": descriptor.get(
                     "scurve_tile_mode", "tile_measurement"
                 ),
+                "scurve_scan_coverage": store.metadata.get("settings", {}).get("scurve", {}).get("scan_coverage", "positive"),
+                "upper_threshold_role": store.metadata.get("upper_threshold_role", "non_limiting"),
                 "injection_pattern": (
                     injection_group.pattern if injection_group is not None else ""
                 ),
@@ -435,7 +437,7 @@ def _run_noise_phase(
     overall_progress_start: float | None = None,
     overall_progress_end: float | None = None,
 ) -> tuple[int, tuple[int, ...], tuple[dict[str, Any], ...]]:
-    planned_codes = tuple(dict.fromkeys(int(code) for code in codes))
+    planned_codes = tuple(sorted(set(int(code) for code in codes), reverse=settings.scan_descending))
     saved_outcomes = _saved_noise_outcomes(
         store,
         stage=stage,

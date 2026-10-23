@@ -236,3 +236,25 @@ source-настройки; configuration_v2 содержит пользоват�
 
 Полная методика: [COMPARATOR_CHARACTERIZATION.md](../../COMPARATOR_CHARACTERIZATION.md).
 Формулы и значения метрик: [METRICS.md](../METRICS.md).
+
+## Верификация методики калибровки (2.1.0)
+
+Новый сценарий `RUN.test="method_verification"`. Подробности экспериментов,
+формул и ограничений находятся в [METHOD_VERIFICATION.md](../METHOD_VERIFICATION.md).
+
+1. Выберите `RUN.window="ALL"` или одно окно, один `SCURVE.gain` (либо CSV карту),
+   `SCURVE.dac_range` и нужные `REFERENCE.steps_mv`/manual REF.
+2. В `.env` задайте `METHOD_TRIM_REFERENCE` на готовую эквализацию ALL или выбранного
+   окна. Пустое значение запускает обучение один раз перед верификацией.
+   `SCURVE_NOISE_REFERENCE` и `CLOCK_TRIM_REFERENCE` этим сценарием не используются.
+3. Число новых полных сканов: `METHOD_VERIFICATION.repeat_scans`. Допуски и границы
+   систематической ошибки задаются только в `metadata.METHOD_VERIFICATION`.
+4. Проверьте `python -m comparator_characterization --test method_verification --check-config`.
+   Для реального запуска установите `RUN.hardware_enabled=True` и уберите `--check-config`.
+
+После серии задайте `OFFLINE_SOURCE` на каталог с `method_manifest.json` и запустите
+`python -m comparator_characterization --test offline`. Офлайн-проверка повторяет
+сохраненные научные настройки, применяя текущий стиль графиков. Новые научные
+допуски без повторного сбора можно передать явно через Python API
+`analyze_method_verification(path, settings=MethodVerificationSettings(...))`;
+они сохраняются в новой версии анализа и не меняют исходный manifest.

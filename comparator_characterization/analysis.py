@@ -3714,6 +3714,7 @@ def analyze_saved_experiment(
     outputs["measurement_coverage"] = analysis_dir / "measurement_coverage.json"
 
     raw_scurve = exclude_bad_pixel_rows(store.load_raw("scurve", workers=selected_settings.read_workers), bad_pixels)
+    bipolar_plot_paths = {}
     scurve_efficiency = pd.DataFrame()
     scurve_results = pd.DataFrame()
     scurve_amplitude_summary = pd.DataFrame()
@@ -3785,6 +3786,22 @@ def analyze_saved_experiment(
                 saved_scurve_settings.get("baseline_noise_pixel_fraction", 0.10)
             ),
         )
+        if saved_scurve_settings.get("scan_coverage") == "full_bipolar" and calibration is not None:
+            from .bipolar import analyze_bipolar, save_bipolar_plots
+            baseline_fits = noise_fits
+            if baseline_fits.empty and not scurve_noise_statistics.empty:
+                baseline_fits = fit_noise_statistics(scurve_noise_statistics,
+                    settings=selected_settings, calibration=calibration)
+            points, bipolar_results = analyze_bipolar(
+                raw_scurve, baseline_fits, calibration=calibration,
+                settings=selected_settings, max_background_fraction=max_background_fraction,
+                counter_operator_validated=bool(store.metadata.get("method_protocol", {}).get(
+                    "counter_operator_validated", False)))
+            outputs["bipolar_points"] = store.write_table(analysis_dir/"bipolar_points.csv", points)
+            outputs["bipolar_results"] = store.write_table(analysis_dir/"bipolar_results.csv", bipolar_results)
+            if generate_plots:
+                bipolar_plot_paths = save_bipolar_plots(points, bipolar_results,
+                    analysis_dir/"plots"/"bipolar", selected_settings)
         del raw_scurve
         store.write_table(analysis_dir / "scurve_efficiency.csv", scurve_efficiency)
         if calibration is not None:
@@ -3961,6 +3978,7 @@ def analyze_saved_experiment(
             settings=selected_settings,
         )
         outputs["plots"] = plot_paths
+        outputs["plots"].update(bipolar_plot_paths)
         if not gain_sweep_pixels.empty:
             from .gain_sweep_plots import plot_gain_sweep
 
@@ -4014,6 +4032,15 @@ def analyze_saved_experiment(
         )
         report_path = outputs["report"]
         atomic_write_text(report_path, report_path.read_text(encoding="utf-8") + gain_report)
+
+    if "bipolar_results" in outputs and outputs.get("report"):
+        report_path = outputs["report"]
+        note = ("\n## Два измеренных края\n\n"
+            "[Полные точки](bipolar_points.csv), [раздельные fit краев](bipolar_results.csv), "
+            "графики в plots/bipolar. Отсутствующий край не достраивается отражением. "
+            "Шумовой центр относится к выключенной инжекции. Полуразмах и A/Q не "
+            "являются доказательством активной базовой линии или адаптивности ЗЧУ.\n")
+        atomic_write_text(report_path, report_path.read_text(encoding="utf-8")+note)
 
     atomic_write_json(
         analysis_dir / "analysis_manifest.json",
