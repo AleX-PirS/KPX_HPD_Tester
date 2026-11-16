@@ -328,3 +328,16 @@ this icon instead of the generic Python process icon.
 
 Настройка, порядок запуска и описание выходных данных приведены в
 [COMPARATOR_CHARACTERIZATION.md](COMPARATOR_CHARACTERIZATION.md).
+
+
+## Сравнение калибровки CD: один запуск
+
+Готовый независимый сценарий: `python run_calibration_comparison.py`.
+Автоматически сравнивает P1 (шум + положительный край) и P2 (шум + оба края)
+при LSB 250/500/750 для 512 пикселей. Полный исходный noise scan 0..1023,
+чекпоинт после каждого считывания, автоматическое продолжение, локальный отчет
+и `analysis_for_chat.zip` без сырых данных.
+
+Условия стенда, алгоритм и команды возобновления описаны в
+[calibration_comparison/README.md](calibration_comparison/README.md).
+Этот сценарий не использует прежний RUN.test и не требует править старый конфиг.
